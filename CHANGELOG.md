@@ -2,6 +2,20 @@
 
 本项目遵循语义化版本。每次 BLoader 行为、ABI、安全协议或发布格式发生变化时，必须更新版本号或本文件。
 
+## [0.2.5] - 2026-07-31
+
+### Changed
+
+- 未检测到当前 Minecraft PID 对应的 BMCBL 安全一次性管道时，明确记录“不安装 `QueryApiImpl` Hook，继续使用微软官方 XUser 登录”。
+- BMCBL 安全会话验证失败或 Hook 安装失败时，明确记录官方登录回退状态，避免用户误判为账号注入失败后仍在接管官方 Runtime。
+- 安全会话接收并成功安装 Hook 后，仅记录经过控制字符过滤和 64 字符长度限制的公开 Xbox Gamertag。
+- BLoader 版本更新为 `0.2.5`。
+
+### Security
+
+- 无有效 BMCBL 会话时仍保持零 Hook、零自定义 XUser 状态，不修改微软官方 `QueryApiImpl`。
+- 日志继续禁止输出 XUID、Token、私钥、Authorization、Signature、完整请求正文和原始管道载荷。
+
 ## [0.2.4] - 2026-07-31
 
 ### Added
