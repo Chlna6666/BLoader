@@ -16,38 +16,66 @@ mod xuser;
 
 use core::ffi::c_void;
 use minhook::MinHook;
-use std::{mem, ptr, sync::OnceLock};
+use std::{
+    mem,
+    path::{Path, PathBuf},
+    ptr,
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use abi::{CLSID_XUSER_IMPL, E_POINTER, Guid, HResult, QueryApiImplFn};
 use ipc::Session;
 
 use crate::runtime::foundation::logging;
 
+const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+const XUSER_BRIDGE_PROTOCOL: u32 = 1;
+
 static SESSION: OnceLock<Session> = OnceLock::new();
 static ORIGINAL_QUERY_API: OnceLock<usize> = OnceLock::new();
+static QUERY_HOOK_FIRST_CALL: AtomicBool = AtomicBool::new(false);
+static XUSER_QUERY_FIRST_CALL: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug)]
+struct HookInstallReport {
+    runtime_path: String,
+    runtime_source: &'static str,
+    query_api_address: usize,
+    trampoline_address: usize,
+}
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleW(module_name: *const u16) -> *mut c_void;
+    fn LoadLibraryExW(file_name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    fn GetModuleFileNameW(module: *mut c_void, file_name: *mut u16, size: u32) -> u32;
+    fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
 }
 
 pub fn initialize_before_mods() {
+    bridge_info(&format!(
+        "XUser Bridge 入口已执行 | protocol={} | mode=pipe-gated | hook=QueryApiImpl-only",
+        XUSER_BRIDGE_PROTOCOL
+    ));
+
     if SESSION.get().is_some() {
+        bridge_warn("XUser Bridge 已存在活动会话；跳过重复初始化");
         return;
     }
 
     let candidate = match ipc::receive_session() {
         Ok(Some(session)) => session,
         Ok(None) => {
-            bridge_info(
-                "未检测到 BMCBL 安全一次性管道；不安装 QueryApiImpl Hook，继续使用微软官方 XUser 登录",
-            );
+            bridge_info(&official_runtime_passthrough_message());
             return;
         }
         Err(error) => {
             bridge_warn(&format!(
-                "BMCBL 安全会话验证失败；不安装 QueryApiImpl Hook，继续使用微软官方 XUser 登录 | reason={error}"
+                "BMCBL 安全会话验证失败；不安装 QueryApiImpl Hook；系统原生 xgameruntime.dll 将按游戏正常流程启动，继续使用微软官方 XUser 登录 | reason={error}"
             ));
             return;
         }
@@ -57,30 +85,66 @@ pub fn initialize_before_mods() {
     // delivered the intended account. Remove control characters and bound the
     // length before it reaches any text log to prevent log injection.
     let gamertag = sanitize_gamertag(&candidate.gamertag);
+    bridge_info(&format!(
+        "已从 BMCBL 安全一次性管道接收并验证 Xbox 会话 | xbox_gamertag={gamertag} | next=load-official-runtime-and-hook"
+    ));
 
     match install_hook(candidate) {
-        Ok(()) => bridge_info(&format!(
-            "已接收 BMCBL 安全一次性管道会话；仅接管官方 QueryApiImpl | xbox_gamertag={gamertag}"
+        Ok(report) => bridge_info(&format!(
+            "XUser Bridge 已启用；仅接管官方 QueryApiImpl | xbox_gamertag={gamertag} | native_runtime_source={} | native_runtime_path={} | QueryApiImpl=0x{:X} | trampoline=0x{:X}",
+            report.runtime_source,
+            report.runtime_path,
+            report.query_api_address,
+            report.trampoline_address,
         )),
         Err(error) => bridge_error(&format!(
-            "QueryApiImpl Hook 安装失败；自定义 XUser 已停用，继续使用微软官方 XUser 登录 | reason={error}"
+            "QueryApiImpl Hook 安装失败；自定义 XUser 已停用；系统原生 xgameruntime.dll 保持原样，继续使用微软官方 XUser 登录 | reason={error}"
         )),
     }
 }
 
-fn install_hook(session: Session) -> Result<(), String> {
-    // BLoader and xgameruntime are both static imports of the Win32 game. Do
-    // not LoadLibrary from DllMain: if the official runtime has not already
-    // been mapped, fail closed and leave the original login path untouched.
+fn install_hook(session: Session) -> Result<HookInstallReport, String> {
     let module_name = wide("xgameruntime.dll");
-    let module = unsafe { GetModuleHandleW(module_name.as_ptr()) };
-    if module.is_null() {
-        return Err("official xgameruntime.dll is not mapped yet".to_string());
-    }
+    let mut module = unsafe { GetModuleHandleW(module_name.as_ptr()) };
+    let runtime_source = if module.is_null() {
+        // This path is reached only after a process-scoped BMCBL session has
+        // been authenticated. Loading exclusively from System32 ensures the
+        // official runtime is present before the executable can resolve or call
+        // QueryApiImpl. No-session launches never execute this load.
+        bridge_info(
+            "已认证 BMCBL 会话，但系统原生 xgameruntime.dll 尚未映射；正在从 System32 同步加载官方 Runtime",
+        );
+        module = unsafe {
+            LoadLibraryExW(
+                module_name.as_ptr(),
+                ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
+        if module.is_null() {
+            return Err("failed to load official xgameruntime.dll from System32".to_string());
+        }
+        "bloader-system32-preload"
+    } else {
+        "host-preloaded"
+    };
+
+    let runtime_path = module_path(module)?;
+    verify_system_runtime_path(&runtime_path)?;
+    bridge_info(&format!(
+        "系统原生 xgameruntime.dll 已就绪 | source={runtime_source} | path={runtime_path}"
+    ));
+
     let target = unsafe { GetProcAddress(module, b"QueryApiImpl\0".as_ptr()) };
     if target.is_null() {
-        return Err("official xgameruntime.dll does not export QueryApiImpl".to_string());
+        return Err(format!(
+            "official xgameruntime.dll does not export QueryApiImpl | path={runtime_path}"
+        ));
     }
+    bridge_info(&format!(
+        "已定位系统原生 QueryApiImpl | address=0x{:X}",
+        target as usize
+    ));
 
     let trampoline = unsafe {
         MinHook::create_hook(target, query_api_hook as *const () as *mut c_void)
@@ -94,7 +158,13 @@ fn install_hook(session: Session) -> Result<(), String> {
         .map_err(|_| "XUser session was already installed".to_string())?;
     unsafe { MinHook::enable_all_hooks() }
         .map_err(|status| format!("MinHook enable failed: {status:?}"))?;
-    Ok(())
+
+    Ok(HookInstallReport {
+        runtime_path,
+        runtime_source,
+        query_api_address: target as usize,
+        trampoline_address: trampoline as usize,
+    })
 }
 
 pub(crate) fn session() -> Option<&'static Session> {
@@ -118,6 +188,10 @@ unsafe extern "system" fn query_api_hook(
     interface_id: *const Guid,
     out: *mut *mut c_void,
 ) -> HResult {
+    if !QUERY_HOOK_FIRST_CALL.swap(true, Ordering::AcqRel) {
+        bridge_info("QueryApiImpl Hook 已首次命中；BLoader 拦截链路正在工作");
+    }
+
     if runtime_class_id.is_null() || interface_id.is_null() || out.is_null() {
         return E_POINTER;
     }
@@ -126,9 +200,72 @@ unsafe extern "system" fn query_api_hook(
     }
 
     if unsafe { *runtime_class_id } == CLSID_XUSER_IMPL {
+        if !XUSER_QUERY_FIRST_CALL.swap(true, Ordering::AcqRel) {
+            let gamertag = session()
+                .map(|session| sanitize_gamertag(&session.gamertag))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            bridge_info(&format!(
+                "QueryApiImpl 已请求 CLSID_XUserImpl；返回 BLoader 内置 Rust XUser | xbox_gamertag={gamertag}"
+            ));
+        }
         return unsafe { xuser::query_interface(interface_id, out) };
     }
+
     unsafe { call_original_query(runtime_class_id, interface_id, out) }
+}
+
+fn official_runtime_passthrough_message() -> String {
+    let module_name = wide("xgameruntime.dll");
+    let module = unsafe { GetModuleHandleW(module_name.as_ptr()) };
+    if module.is_null() {
+        "XUser Bridge 入口已执行；未检测到 BMCBL 安全一次性管道；不主动加载系统 Runtime、不安装 QueryApiImpl Hook；系统原生 xgameruntime.dll 将由游戏按微软正常流程启动，继续使用官方 XUser 登录".to_string()
+    } else {
+        let path = module_path(module).unwrap_or_else(|_| "<path-unavailable>".to_string());
+        format!(
+            "XUser Bridge 入口已执行；未检测到 BMCBL 安全一次性管道；不安装 QueryApiImpl Hook；系统原生 xgameruntime.dll 已由宿主加载并保持原样，继续使用官方 XUser 登录 | path={path}"
+        )
+    }
+}
+
+fn module_path(module: *mut c_void) -> Result<String, String> {
+    let mut buffer = vec![0u16; 32_768];
+    let written = unsafe { GetModuleFileNameW(module, buffer.as_mut_ptr(), buffer.len() as u32) };
+    if written == 0 || written as usize >= buffer.len() {
+        return Err("unable to resolve official xgameruntime.dll path".to_string());
+    }
+    buffer.truncate(written as usize);
+    Ok(String::from_utf16_lossy(&buffer))
+}
+
+fn verify_system_runtime_path(actual: &str) -> Result<(), String> {
+    let expected = system_runtime_path()?;
+    if !same_windows_path(Path::new(actual), &expected) {
+        return Err(format!(
+            "refusing to hook a non-System32 xgameruntime.dll | actual={actual} | expected={}",
+            expected.display()
+        ));
+    }
+    Ok(())
+}
+
+fn system_runtime_path() -> Result<PathBuf, String> {
+    let mut buffer = vec![0u16; 32_768];
+    let written = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    if written == 0 || written as usize >= buffer.len() {
+        return Err("unable to resolve Windows System32 directory".to_string());
+    }
+    buffer.truncate(written as usize);
+    Ok(PathBuf::from(String::from_utf16_lossy(&buffer)).join("xgameruntime.dll"))
+}
+
+fn same_windows_path(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .eq_ignore_ascii_case(
+            right
+                .to_string_lossy()
+                .trim_start_matches(r"\\?\"),
+        )
 }
 
 fn sanitize_gamertag(value: &str) -> String {
@@ -175,7 +312,9 @@ fn wide(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_gamertag;
+    use std::path::Path;
+
+    use super::{same_windows_path, sanitize_gamertag};
 
     #[test]
     fn gamertag_log_value_removes_control_characters() {
@@ -185,5 +324,21 @@ mod tests {
     #[test]
     fn gamertag_log_value_is_bounded() {
         assert_eq!(sanitize_gamertag(&"a".repeat(80)).len(), 64);
+    }
+
+    #[test]
+    fn system_runtime_path_comparison_is_case_insensitive() {
+        assert!(same_windows_path(
+            Path::new(r"C:\Windows\System32\xgameruntime.dll"),
+            Path::new(r"c:\windows\system32\XGameRuntime.DLL"),
+        ));
+    }
+
+    #[test]
+    fn system_runtime_path_comparison_accepts_extended_prefix() {
+        assert!(same_windows_path(
+            Path::new(r"\\?\C:\Windows\System32\xgameruntime.dll"),
+            Path::new(r"C:\Windows\System32\xgameruntime.dll"),
+        ));
     }
 }
