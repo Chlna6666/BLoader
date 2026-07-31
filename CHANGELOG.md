@@ -18,6 +18,7 @@
 - 添加 Windows Release 构建、测试、导出检查、打包和标签发布工作流。
 - 发布 ZIP 新增 `manifest.json`、`BLoader.dll.sha256`，并在 ZIP 外生成独立 `.zip.sha256` 文件。
 - README 新增完整架构、安全边界、GDK 支持范围、Signature、CI 和发布产物说明。
+- XUser Bridge 成功日志记录经过控制字符过滤和长度限制的公开 Gamertag，便于确认启动账号。
 
 ### Changed
 
@@ -34,14 +35,15 @@
 - 修复 `windows-2025` Runner 使用新版 Visual Studio 时找不到 `dumpbin.exe` 导致的发布验证失败。
 - 修复 PowerShell 兜底搜索 `dumpbin.exe` 时的空管道语法错误。
 - 修复发布阶段只有 Rust 编译成功、但导出验证和 Artifact 打包失败的问题。
+- 修复 PR Artifact 清单记录临时 merge commit 而非真实源码 head SHA 的问题。
 
 ### Security
 
 - 登录 Token、设备私钥和启用开关不再通过 Minecraft 环境变量、命令行、注册表或临时 JSON 文件传递。
 - 管道拒绝远程客户端，使用受限 DACL，并双向校验 BMCBL 父进程 PID 与 Minecraft 客户端 PID。
 - 传输载荷、私钥 Blob、请求正文、Authorization 和 Signature 临时缓冲区在使用后清零。
-- BMCBL 可记录公开 Gamertag 用于启动诊断；BLoader 不记录 XUID、Token、私钥、Authorization、Signature、完整请求正文或原始管道载荷。
-- 发布清单记录 DLL 大小、SHA-256、构建提交和 XUser Bridge 安全能力，便于 BMCBL 部署前校验。
+- 日志只允许输出经过清理的公开 Gamertag；不记录 XUID、Token、私钥、Authorization、Signature、完整请求正文或原始管道载荷。
+- 发布清单记录 DLL 大小、SHA-256、源码提交、工作流提交和 XUser Bridge 安全能力，便于 BMCBL 部署前校验。
 
 ## [0.2.3] - 2026-07-31
 
