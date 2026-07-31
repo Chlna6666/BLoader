@@ -48,8 +48,13 @@ jobs:
           $size = (Get-Item $dll).Length
           if ($size -lt 65536) { throw "BLoader.dll is unexpectedly small: $size" }
 
-          $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
-          if (-not $dumpbin) {
+          $dumpbinPath = $null
+          $dumpbinCommand = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+          if ($dumpbinCommand) {
+            $dumpbinPath = $dumpbinCommand.Source
+          }
+
+          if (-not $dumpbinPath) {
             $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
             if (Test-Path $vswhere) {
               $installationPath = & $vswhere `
@@ -59,29 +64,30 @@ jobs:
                 -property installationPath
               if ($installationPath) {
                 $msvcRoot = Join-Path $installationPath "VC\Tools\MSVC"
-                $dumpbin = Get-ChildItem $msvcRoot -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+                $dumpbinPath = Get-ChildItem $msvcRoot -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
                   Where-Object { $_.FullName -match '\\Hostx64\\x64\\dumpbin\.exe$' } |
-                  Select-Object -First 1
+                  Select-Object -ExpandProperty FullName -First 1
               }
             }
           }
-          if (-not $dumpbin) {
+
+          if (-not $dumpbinPath) {
             $visualStudioRoots = @(
               "${env:ProgramFiles}\Microsoft Visual Studio",
               "${env:ProgramFiles(x86)}\Microsoft Visual Studio"
             ) | Where-Object { Test-Path $_ }
-            $dumpbin = foreach ($root in $visualStudioRoots) {
-              Get-ChildItem $root -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
-                Where-Object { $_.FullName -match '\\Hostx64\\x64\\dumpbin\.exe$' }
-            } | Select-Object -First 1
+            foreach ($root in $visualStudioRoots) {
+              $candidate = Get-ChildItem $root -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match '\\Hostx64\\x64\\dumpbin\.exe$' } |
+                Select-Object -First 1
+              if ($candidate) {
+                $dumpbinPath = $candidate.FullName
+                break
+              }
+            }
           }
-          if (-not $dumpbin) { throw "dumpbin.exe not found in PATH or installed Visual Studio instances" }
 
-          $dumpbinPath = if ($dumpbin -is [System.Management.Automation.CommandInfo]) {
-            $dumpbin.Source
-          } else {
-            $dumpbin.FullName
-          }
+          if (-not $dumpbinPath) { throw "dumpbin.exe not found in PATH or installed Visual Studio instances" }
           Write-Host "Using dumpbin: $dumpbinPath"
           $exports = & $dumpbinPath /exports $dll | Out-String
           if ($LASTEXITCODE -ne 0) { throw "dumpbin failed with exit code $LASTEXITCODE" }
