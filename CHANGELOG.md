@@ -2,6 +2,30 @@
 
 本项目遵循语义化版本。每次 BLoader 行为、ABI、安全协议或发布格式发生变化时，必须更新版本号或本文件。
 
+## [0.2.6] - 2026-07-31
+
+### Added
+
+- XUser Bridge 在 `DllMain` 最早阶段输出明确入口标记，包括协议版本、管道门控模式和仅接管 `QueryApiImpl` 的范围。
+- 有效 BMCBL 会话存在时，记录系统原生 `xgameruntime.dll` 的实际来源、完整路径、`QueryApiImpl` 地址和 MinHook trampoline 地址。
+- 首次命中 `QueryApiImpl` Hook 和首次请求 `CLSID_XUserImpl` 时输出一次性诊断日志，便于区分“Hook 已安装”和“游戏实际调用了 Hook”。
+- 无安全管道时明确记录系统原生 `xgameruntime.dll` 当前是否已由宿主映射，以及游戏将继续使用微软官方 XUser 登录。
+
+### Changed
+
+- 仅在 BMCBL 安全会话已通过 PID、时效和摘要验证后，若官方 Runtime 尚未映射，才从 `System32` 同步加载微软原生 `xgameruntime.dll` 并安装 Hook。
+- 无会话启动仍保持零主动 Runtime 加载、零 MinHook 和零自定义 XUser 状态。
+- 拒绝对非 `System32` 路径的 `xgameruntime.dll` 安装 Hook，防止本地同名 DLL 劫持。
+- BLoader 版本更新为 `0.2.6`。
+
+### Fixed
+
+- 修复只有“安全管道传输完成”但缺少 BLoader 端 Runtime/Hook 状态，导致无法判断桥接入口、原生 Runtime 和 Hook 是否实际工作的诊断缺口。
+
+### Security
+
+- 新增日志只输出公开 Gamertag、系统 DLL 路径和函数地址，不输出 XUID、Token、私钥、Authorization、Signature、请求正文或管道原始载荷。
+
 ## [0.2.5] - 2026-07-31
 
 ### Changed
