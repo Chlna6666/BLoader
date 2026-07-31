@@ -47,9 +47,44 @@ jobs:
           if (-not (Test-Path $dll)) { throw "Missing $dll" }
           $size = (Get-Item $dll).Length
           if ($size -lt 65536) { throw "BLoader.dll is unexpectedly small: $size" }
-          $dumpbin = Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio\2022" -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $dumpbin) { throw "dumpbin.exe not found" }
-          $exports = & $dumpbin.FullName /exports $dll | Out-String
+
+          $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+          if (-not $dumpbin) {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            if (Test-Path $vswhere) {
+              $installationPath = & $vswhere `
+                -latest `
+                -products * `
+                -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                -property installationPath
+              if ($installationPath) {
+                $msvcRoot = Join-Path $installationPath "VC\Tools\MSVC"
+                $dumpbin = Get-ChildItem $msvcRoot -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -match '\\Hostx64\\x64\\dumpbin\.exe$' } |
+                  Select-Object -First 1
+              }
+            }
+          }
+          if (-not $dumpbin) {
+            $visualStudioRoots = @(
+              "${env:ProgramFiles}\Microsoft Visual Studio",
+              "${env:ProgramFiles(x86)}\Microsoft Visual Studio"
+            ) | Where-Object { Test-Path $_ }
+            $dumpbin = foreach ($root in $visualStudioRoots) {
+              Get-ChildItem $root -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match '\\Hostx64\\x64\\dumpbin\.exe$' }
+            } | Select-Object -First 1
+          }
+          if (-not $dumpbin) { throw "dumpbin.exe not found in PATH or installed Visual Studio instances" }
+
+          $dumpbinPath = if ($dumpbin -is [System.Management.Automation.CommandInfo]) {
+            $dumpbin.Source
+          } else {
+            $dumpbin.FullName
+          }
+          Write-Host "Using dumpbin: $dumpbinPath"
+          $exports = & $dumpbinPath /exports $dll | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin failed with exit code $LASTEXITCODE" }
           foreach ($name in @("DllMain", "bl_i18n_current_locale", "bl_register_d3d12_render_callback")) {
             if ($exports -notmatch [regex]::Escape($name)) { throw "Missing export: $name" }
           }
