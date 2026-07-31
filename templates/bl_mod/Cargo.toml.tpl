@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["{{author}}"]
 description = "{{mod_name}} BL mod"
+license = "GPL-3.0-or-later"
 homepage = "https://example.invalid/{{crate_name}}"
 
 [package.metadata.bl]

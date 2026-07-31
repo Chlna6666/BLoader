@@ -38,32 +38,29 @@ BLoader 是一个开源的 **我的世界基岩版（Minecraft Bedrock）** Mod 
 | Minecraft 外部符号包加载器 | `mc-symbols` | 下文详述。 |
 | `blgen` 命令行工具 | `blgen` | 打包 `.blsym` 用；默认不构建 `[[bin]]`。 |
 
-### Minecraft 符号加载：当前不支持
+### Minecraft 符号加载：无法实现（请勿尝试）
 
-**BLoader 默认不加载任何 Minecraft 内部符号。** 与符号相关的 Rust 源码（
-`src/core/symbols.rs`、`src/core/sig_scan.rs`、`src/core/native_hud_discovery.rs`、
-`src/core/symbol_diagnostics.rs`、`src/core/symbols_tests.rs`、`src/mc/*`、
-`templates/symbol-packs/*`、`tools/pack_symbol_pack.py` 等）**仍保留在仓库中**，但其模块
-声明被 `#[cfg(feature = "mc-symbols")]` 包裹（见 `src/core/mod.rs`）。这意味着：
+请明确：**BLoader 无法以通用方式加载 Minecraft 内部符号**，启用 `mc-symbols` feature
+在主分支上不会得到任何支持，请不要把它当作可用的功能开关。这不是配置选项，而是一个**实现上不可能通用化**的子系统。
 
-- 在默认 `default = []` 构建中，符号子系统**完全不进入产物**，没有解除 hook、没有
-  解析游戏内部地址、没有把任何地址暴露给 MOD，也不会触发 `.blsym` 文件 IO。
-- `bootstrap()` 里仅写一行提示
-  `Minecraft symbol subsystem: disabled (not compiled in lightweight build).`，
-  不在运行期寻找符号包。
-- BL Mod 的 `requires_symbol_pack` / `required_symbols` 字段在轻量化构建里一律判定为
-  不满足，相关 Mod 会被跳过。
+**为什么做不到：**
 
-如果你希望恢复符号加载能力，需要自行开启 feature：
+- Minecraft Bedrock 没有公开符号表或导出表，每个版本的可执行文件结构、内联位移、字节模式（pattern）都不同。要解析任何内部地址，都必须**为每一个具体游戏版本**单独逆向工程，并通过 `tools/pack_symbol_pack.py` 编译出一份精确匹配的 `.blsym` 包（详见 `src/core/symbols.rs` 的 SHA-256 + RVA/pattern 校验链路）。
+- .blsym 包是基于版本特征的产物，**BLoader 项目本身不会也无法替你预先生成**这些包。在没有任何匹配包的运行时上，符号系统只会报告
+  `no external symbol pack matches this game build`，不会暴露任何游戏内部地址给 MOD。
+- 即便开启 `mc-symbols`（或 `panel-ui`，会连带启用 `mc-symbols`），代码也只是被编译进来；**真正能不能工作，完全取决于你是否手动维护了对应版本的 `.blsym`**，并自行承担相应的法律与维护责任。
+- 对游戏可执行文件做特征码扫描、地址校验乃至远端 hook，在很多司法管辖区存在法律风险。BLoader 项目不会替任何人维护这类产物。
 
-```powershell
-cargo build --release --features panel-ui   # 同时启用 mc-symbols
-# 或
-cargo build --release --features mc-symbols # 仅开启符号子系统，不开 ArcUI 面板
-```
+**因此主分支上的策略：**
 
-代价：DLL 体积明显增大，并对每个游戏版本维护一份 `.blsym` 包（见
-`templates/symbol-packs/README.md`）。
+- 默认的 `default = []` 构建把 `mc-symbols` 子系统整体排除。`bootstrap()` 里只写一行提示
+  `Minecraft symbol subsystem: disabled (not compiled in lightweight build).`，不在运行期寻找符号包，也不读 `.blsym` 文件。
+- BL Mod 的 `requires_symbol_pack` / `required_symbols` 字段一律判定为不满足，相关 Mod 会被跳过并写日志告知原因。
+- 仓库中保留的 `src/core/symbols.rs`、`src/core/sig_scan.rs`、`src/core/native_hud_discovery.rs`、
+  `src/core/symbol_diagnostics.rs`、`src/core/symbols_tests.rs`、`src/mc/*`、
+  `templates/symbol-packs/*`、`tools/pack_symbol_pack.py` 等**仅作为代码保留**，让你理解历史设计或自行分叉扩展 —— 但绝不应该期待它们在主分支上能直接工作。
+
+如果你只是想加载 MOD，不需要任何符号能力，使用默认 `default = []` 构建即可，所有 BL Mod 编程接口都会照常工作。
 
 ## 目录结构
 
@@ -158,5 +155,11 @@ BLoader 在 `BLoader.dll` 所在目录查找 `config.json`；不存在时自动�
 
 ## 许可证
 
-本仓库目前未附带 LICENSE 文件，著作权归贡献者所有。如需二次分发或商用，请自行联系维护者
-或在你的 fork 中补充许可证声明。
+BLoader 以 **GNU 通用公共许可证第 3 版或更高版本（GPL-3.0-or-later）** 发布。完整文本见仓库根目录的
+`LICENSE` 文件。
+
+- 所有提交到本仓库的代码自动适用 GPL-3.0-or-later。在 `Cargo.toml` 中已声明 `license = "GPL-3.0-or-later"`。
+- 因为 `bl-sdk`（编写 BL Mod 引用）以同样许可证发布，所有**静态或动态链接** `bl-sdk` 的 BL Mod
+  产物**必须**遵循兼容的开源许可证（推荐同样使用 `GPL-3.0-or-later`，模板 `templates/bl_mod/Cargo.toml.tpl` 中已默认填入）。
+- 仓库内 `vendor/` 下的第三方代码（如 `imgui-windows-d3d12-renderer`）保留其各自的原始许可证，BLoader 不对其主张版权。
+- **无任何担保**：在适用法律允许的最大范围内，本程序按 "AS IS" 提供，著作权人不承担任何明示或默示的担保与责任。
