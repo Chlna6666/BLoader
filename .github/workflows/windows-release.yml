@@ -2,7 +2,7 @@ name: Windows build and release
 
 on:
   push:
-    branches: [master]
+    branches: [master, "release/v*"]
     tags: ["v*"]
   pull_request:
     branches: [master]
@@ -135,8 +135,8 @@ jobs:
             dist/*.zip.sha256
           if-no-files-found: error
 
-      - name: Publish tagged release
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/') || startsWith(github.ref, 'refs/heads/release/v')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -144,9 +144,21 @@ jobs:
           $archive = Get-ChildItem dist\*.zip | Select-Object -First 1
           if (-not $archive) { throw "Release archive not found" }
           $checksum = Get-Item "$($archive.FullName).sha256"
-          gh release create "${{ github.ref_name }}" `
-            $archive.FullName `
-            $checksum.FullName `
-            --verify-tag `
-            --title "BLoader ${{ github.ref_name }}" `
-            --generate-notes
+
+          if ($env:GITHUB_REF -like "refs/tags/*") {
+            $tag = $env:GITHUB_REF_NAME
+            gh release create $tag `
+              $archive.FullName `
+              $checksum.FullName `
+              --verify-tag `
+              --title "BLoader $tag" `
+              --generate-notes
+          } else {
+            $tag = $env:GITHUB_REF_NAME.Substring("release/".Length)
+            gh release create $tag `
+              $archive.FullName `
+              $checksum.FullName `
+              --target master `
+              --title "BLoader $tag" `
+              --generate-notes
+          }
