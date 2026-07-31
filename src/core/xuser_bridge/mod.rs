@@ -40,12 +40,14 @@ pub fn initialize_before_mods() {
     let candidate = match ipc::receive_session() {
         Ok(Some(session)) => session,
         Ok(None) => {
-            bridge_info("BMCBL session absent; QueryApiImpl hook not installed");
+            bridge_info(
+                "未检测到 BMCBL 安全一次性管道；不安装 QueryApiImpl Hook，继续使用微软官方 XUser 登录",
+            );
             return;
         }
         Err(error) => {
             bridge_warn(&format!(
-                "session rejected; official Microsoft XUser remains active | reason={error}"
+                "BMCBL 安全会话验证失败；不安装 QueryApiImpl Hook，继续使用微软官方 XUser 登录 | reason={error}"
             ));
             return;
         }
@@ -58,10 +60,10 @@ pub fn initialize_before_mods() {
 
     match install_hook(candidate) {
         Ok(()) => bridge_info(&format!(
-            "authenticated Win32 session accepted; only official QueryApiImpl is hooked | gamertag={gamertag}"
+            "已接收 BMCBL 安全一次性管道会话；仅接管官方 QueryApiImpl | xbox_gamertag={gamertag}"
         )),
         Err(error) => bridge_error(&format!(
-            "QueryApiImpl hook not installed; official Microsoft XUser remains active | reason={error}"
+            "QueryApiImpl Hook 安装失败；自定义 XUser 已停用，继续使用微软官方 XUser 登录 | reason={error}"
         )),
     }
 }
