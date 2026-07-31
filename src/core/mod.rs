@@ -2,6 +2,7 @@ pub mod console;
 pub mod file_redirection;
 pub mod loader;
 pub mod network_hook;
+#[path = "xuser_bridge/mod.rs"]
 pub mod xuser_bridge;
 #[cfg(feature = "panel-ui")]
 pub mod global_input;
