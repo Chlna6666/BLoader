@@ -18,9 +18,7 @@ use core::ffi::c_void;
 use minhook::MinHook;
 use std::{mem, ptr, sync::OnceLock};
 
-use abi::{
-    CLSID_XUSER_IMPL, E_POINTER, Guid, HResult, QueryApiImplFn,
-};
+use abi::{CLSID_XUSER_IMPL, E_POINTER, Guid, HResult, QueryApiImplFn};
 use ipc::Session;
 
 use crate::runtime::foundation::logging;
@@ -53,10 +51,15 @@ pub fn initialize_before_mods() {
         }
     };
 
+    // Gamertag is public profile data and is useful for confirming that BMCBL
+    // delivered the intended account. Remove control characters and bound the
+    // length before it reaches any text log to prevent log injection.
+    let gamertag = sanitize_gamertag(&candidate.gamertag);
+
     match install_hook(candidate) {
-        Ok(()) => bridge_info(
-            "authenticated Win32 session accepted; only official QueryApiImpl is hooked",
-        ),
+        Ok(()) => bridge_info(&format!(
+            "authenticated Win32 session accepted; only official QueryApiImpl is hooked | gamertag={gamertag}"
+        )),
         Err(error) => bridge_error(&format!(
             "QueryApiImpl hook not installed; official Microsoft XUser remains active | reason={error}"
         )),
@@ -126,6 +129,20 @@ unsafe extern "system" fn query_api_hook(
     unsafe { call_original_query(runtime_class_id, interface_id, out) }
 }
 
+fn sanitize_gamertag(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(64)
+        .collect::<String>();
+    let sanitized = sanitized.trim();
+    if sanitized.is_empty() {
+        "<unknown>".to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
+
 fn bridge_info(message: &str) {
     if logging::is_ready() {
         logging::scoped_info_message("xuser-bridge", message);
@@ -152,4 +169,19 @@ fn bridge_error(message: &str) {
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(core::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_gamertag;
+
+    #[test]
+    fn gamertag_log_value_removes_control_characters() {
+        assert_eq!(sanitize_gamertag(" Civil\r\nRelic\t4341 "), "CivilRelic4341");
+    }
+
+    #[test]
+    fn gamertag_log_value_is_bounded() {
+        assert_eq!(sanitize_gamertag(&"a".repeat(80)).len(), 64);
+    }
 }
