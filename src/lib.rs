@@ -76,10 +76,21 @@ pub unsafe extern "system" fn DllMain(
                 runtime::foundation::build_info::PROFILE,
             ));
 
-            // Do not load third-party native modules under loader lock. The
-            // bootstrap thread must first decide whether BMCBL supplied an
-            // authenticated XUser session and, only then, optionally install
-            // the single QueryApiImpl hook.
+            runtime::foundation::logging::write_bootstrap_marker(
+                "dllmain.xuser_bridge.begin mode=pipe_gated",
+            );
+            // BMCBL creates the PID-scoped pipe before resuming the process.
+            // No pipe means this performs one immediate failed open and returns
+            // without loading xgameruntime or installing MinHook. A valid pipe
+            // is consumed synchronously so QueryApiImpl is ready before the
+            // executable can enter its normal GDK initialization path.
+            core::xuser_bridge::initialize_before_mods();
+            runtime::foundation::logging::write_bootstrap_marker(
+                "dllmain.xuser_bridge.done",
+            );
+
+            // Third-party native modules are deliberately deferred until after
+            // the authenticated session buffer has been imported and cleared.
             runtime::foundation::logging::write_bootstrap_marker(
                 "dllmain.native_preload.deferred reason=xuser_security_boundary",
             );
@@ -174,15 +185,6 @@ unsafe fn bootstrap() {
 
     let game_dir = utils::get_exe_directory();
 
-    // This is the only activation point. If BMCBL did not create the
-    // process-scoped pipe, the function returns immediately and the official
-    // Microsoft XUser implementation remains completely untouched.
-    runtime::foundation::logging::write_bootstrap_marker("bootstrap.xuser_bridge.begin");
-    core::xuser_bridge::initialize_before_mods();
-    runtime::foundation::logging::write_bootstrap_marker("bootstrap.xuser_bridge.done");
-
-    // Third-party native modules are loaded only after the login bridge has
-    // consumed and cleared its transport buffer.
     runtime::foundation::logging::write_bootstrap_marker("bootstrap.native_preload.begin");
     let loaded_summary = core::loader::load_native_preloads_in_dllmain(&game_dir);
     runtime::foundation::logging::write_bootstrap_marker(&format!(
