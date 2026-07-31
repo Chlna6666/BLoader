@@ -2,6 +2,23 @@
 
 本项目遵循语义化版本。每次 BLoader 行为、ABI、安全协议或发布格式发生变化时，必须更新版本号或本文件。
 
+## [0.2.7] - 2026-07-31
+
+### Added
+
+- 将 `DllMain` 阶段产生的 XUser Bridge 入口、管道验证、系统 Runtime 和 Hook 安装状态缓存为安全诊断记录。
+- 在正常日志系统和调试控制台就绪后回放早期诊断，使 `latest.log` 和控制台都能直接看到桥接结果。
+- 最早构建标记新增 `xuser_bridge=embedded protocol=1`，便于识别实际加载的 DLL 是否包含内置 XUser Bridge。
+
+### Fixed
+
+- 修复桥接入口已经执行但日志只存在于 `bootstrap.marker.log`，导致主日志中看不到 Xbox Gamertag、系统 `xgameruntime.dll` 路径和 `QueryApiImpl` Hook 状态的问题。
+- 修复用户仅根据常规控制台日志无法区分“未执行桥接”“桥接失败”和“Hook 尚未首次命中”的诊断歧义。
+
+### Security
+
+- 回放队列只保存经过清理的 Gamertag、系统 DLL 路径、函数地址和状态文本；仍不保存或输出 Token、XUID、私钥、Authorization、Signature、请求正文或原始 IPC 载荷。
+
 ## [0.2.6] - 2026-07-31
 
 ### Added
@@ -64,7 +81,7 @@
 - BLoader bootstrap 先处理一次性登录会话，再加载任何第三方 Mod。
 - 除 `QueryApiImpl` 外，所有 XGameRuntime API 继续由系统官方 `xgameruntime.dll` 实现。
 - 未检测到有效会话时，BLoader 不创建 MinHook、不修改官方函数，并保持原版 Xbox 登录行为。
-- Windows CI 使用 `Swatinem/rust-cache` 缓存 Cargo registry、Git 依赖和可复用编译产物；缓存键包含 Rust 环境与 Cargo 清单变化。
+- Windows CI 使用 `Swatinem/rust-cache` 缓存 Cargo registry、Git 依赖和可复用 `target` 缓存；缓存键包含 Rust 环境与 Cargo 清单变化。
 - `dumpbin.exe` 不再硬编码 Visual Studio 2022 路径，优先使用 PATH，再通过 `vswhere.exe` 定位当前 Runner 的 MSVC 工具链。
 - GitHub 标签发布同时上传 ZIP 与 SHA-256 文件，CHANGELOG 不再作为二进制附件上传。
 
