@@ -19,54 +19,27 @@ mod core;
 mod runtime;
 mod utils;
 
-// 导出 D3D12 渲染回调注册函数供 MOD 使用
 pub use crate::bl::host::{bl_i18n_current_locale, bl_i18n_tr, bl_register_mod_lang};
 pub use crate::core::d3d12_queue::bl_register_d3d12_render_callback;
 
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_camera_zoom_set_enabled(_enabled: bool) -> bool {
-    false
-}
-
+pub extern "system" fn bl_camera_zoom_set_enabled(_enabled: bool) -> bool { false }
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_camera_zoom_set_percent(_percent: u32) -> bool {
-    false
-}
-
+pub extern "system" fn bl_camera_zoom_set_percent(_percent: u32) -> bool { false }
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_camera_zoom_get_enabled() -> bool {
-    false
-}
-
+pub extern "system" fn bl_camera_zoom_get_enabled() -> bool { false }
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_camera_zoom_get_percent() -> u32 {
-    0
-}
-
+pub extern "system" fn bl_camera_zoom_get_percent() -> u32 { 0 }
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_gamma_set_enabled(_enabled: bool) -> bool {
-    false
-}
-
+pub extern "system" fn bl_gamma_set_enabled(_enabled: bool) -> bool { false }
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_gamma_set_value(_value: f32) -> bool {
-    false
-}
-
+pub extern "system" fn bl_gamma_set_value(_value: f32) -> bool { false }
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_gamma_get_enabled() -> bool {
-    false
-}
-
+pub extern "system" fn bl_gamma_get_enabled() -> bool { false }
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_gamma_get_value() -> f32 {
-    1.0
-}
-
+pub extern "system" fn bl_gamma_get_value() -> f32 { 1.0 }
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_render3d_ready() -> bool {
-    false
-}
+pub extern "system" fn bl_render3d_ready() -> bool { false }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn bl_render3d_line(
@@ -96,10 +69,6 @@ pub unsafe extern "system" fn DllMain(
         DLL_PROCESS_ATTACH => {
             utils::set_exe_cwd();
             utils::set_loader_module_handle(hinstance.0 as usize);
-
-            // Install process exception handlers before any third-party preload DLL.
-            // This is the only point early enough to attribute a crash raised from
-            // the preloaded DLL's own DllMain/CRT initialization.
             runtime::foundation::crash_report::install_early();
             runtime::foundation::logging::write_bootstrap_marker(&format!(
                 "bloader.build version={} profile={}",
@@ -107,24 +76,13 @@ pub unsafe extern "system" fn DllMain(
                 runtime::foundation::build_info::PROFILE,
             ));
 
-            // Native preload packages must be loaded before this DllMain returns.
-            // This mirrors PreLoadCpp's process-attach behavior and is required by
-            // runtime proxy DLLs such as xgameruntime.dll, which need to occupy the
-            // module name before the host initializes the official runtime.
-            let game_dir = utils::get_exe_directory();
+            // Do not load third-party native modules under loader lock. The
+            // bootstrap thread must first decide whether BMCBL supplied an
+            // authenticated XUser session and, only then, optionally install
+            // the single QueryApiImpl hook.
             runtime::foundation::logging::write_bootstrap_marker(
-                "dllmain.native_preload.begin",
+                "dllmain.native_preload.deferred reason=xuser_security_boundary",
             );
-            let native_preload_summary =
-                core::loader::load_native_preloads_in_dllmain(&game_dir);
-            runtime::foundation::logging::write_bootstrap_marker(&format!(
-                "dllmain.native_preload.done discovered={} attempted={} verified={} failed={} required_failed={}",
-                native_preload_summary.discovered,
-                native_preload_summary.attempted,
-                native_preload_summary.verified,
-                native_preload_summary.failed,
-                native_preload_summary.required_failed,
-            ));
 
             match thread::Builder::new()
                 .name("bloader-bootstrap".to_string())
@@ -175,20 +133,15 @@ unsafe fn bootstrap() {
     runtime::foundation::i18n::init(&config);
     runtime::foundation::logging::write_bootstrap_marker("bootstrap.i18n.ready");
 
-    // Lightweight build: Minecraft external symbol packs and native HUD discovery
-    // are intentionally not linked into the DLL.
     logging::info_message("Minecraft symbol subsystem: disabled (not compiled in lightweight build).");
 
-    // 1. 初始化控制台
     if config.enable_debug_console {
         core::console::init_console();
         runtime::foundation::logging::write_bootstrap_marker("bootstrap.console.ready");
     } else {
-        // Capture puts/printf/std::cout even in headless launch mode.
         runtime::foundation::native_stdio::install_process_capture();
     }
     runtime::foundation::native_stdio::flush_pending();
-
     setup_panic_hook();
 
     const PKG_NAME: &str = crate::runtime::foundation::build_info::NAME;
@@ -219,8 +172,28 @@ unsafe fn bootstrap() {
         "Runtime profile: lightweight | panel=off | ArcUI=not-compiled | symbols=not-compiled | i18n=embedded",
     );
 
-    // DllMain 阶段只能写最小 bootstrap 标记。完整日志系统和可见提示就绪后，
-    // 在这里重放同步原生加载结果，并发布机器可读状态文件。
+    let game_dir = utils::get_exe_directory();
+
+    // This is the only activation point. If BMCBL did not create the
+    // process-scoped pipe, the function returns immediately and the official
+    // Microsoft XUser implementation remains completely untouched.
+    runtime::foundation::logging::write_bootstrap_marker("bootstrap.xuser_bridge.begin");
+    core::xuser_bridge::initialize_before_mods();
+    runtime::foundation::logging::write_bootstrap_marker("bootstrap.xuser_bridge.done");
+
+    // Third-party native modules are loaded only after the login bridge has
+    // consumed and cleared its transport buffer.
+    runtime::foundation::logging::write_bootstrap_marker("bootstrap.native_preload.begin");
+    let loaded_summary = core::loader::load_native_preloads_in_dllmain(&game_dir);
+    runtime::foundation::logging::write_bootstrap_marker(&format!(
+        "bootstrap.native_preload.done discovered={} attempted={} verified={} failed={} required_failed={}",
+        loaded_summary.discovered,
+        loaded_summary.attempted,
+        loaded_summary.verified,
+        loaded_summary.failed,
+        loaded_summary.required_failed,
+    ));
+
     let native_preload_summary = core::loader::publish_native_preload_reports();
     let native_load_failure_message = core::loader::required_native_failure_message();
     let native_load_success_message = core::loader::native_success_notification_message();
@@ -234,35 +207,6 @@ unsafe fn bootstrap() {
         );
     }
 
-    let game_dir = utils::get_exe_directory();
-    let xgameruntime_preloaded =
-        core::loader::verified_native_module_path("xgameruntime.dll");
-    match &xgameruntime_preloaded {
-        Some(path) => {
-            logging::scoped_info_message(
-                "xgameruntime",
-                &format!(
-                    "native preload active | mode=dllmain_sync | verified=true | path={}",
-                    path.display()
-                ),
-            );
-            runtime::foundation::logging::write_bootstrap_marker(&format!(
-                "bootstrap.xgameruntime.native_preload.verified path={}",
-                path.display()
-            ));
-        }
-        None => {
-            logging::scoped_warn_message(
-                "xgameruntime",
-                "native preload not verified; legacy LdrLoadDll redirection has been removed and will not be installed",
-            );
-            runtime::foundation::logging::write_bootstrap_marker(
-                "bootstrap.xgameruntime.native_preload.unverified legacy_redirect=removed",
-            );
-        }
-    }
-
-    // 显式提示在独立线程中显示，避免 MessageBox 阻塞 BLoader 的后续初始化链路。
     if let Some(message) = native_load_failure_message {
         let _ = thread::Builder::new()
             .name("bloader-native-load-error".to_string())
@@ -283,8 +227,6 @@ unsafe fn bootstrap() {
             });
     }
 
-    // Keep only a tiny Present observer. It supplies a stable first-frame signal
-    // for delayed Mod loading without rendering a panel or capturing input.
     if !core::render_signal::install() {
         logging::warn_message("Graphics readiness hook unavailable; hot Mods will use window fallback.");
     }
@@ -308,7 +250,6 @@ unsafe fn bootstrap() {
         "bootstrap.queue_hook.skipped_for_hudhook",
     );
 
-    // 2. 加载 Mods
     if config.disable_mod_loading {
         logging::info_message("Mod loading disabled by config.");
     } else {
@@ -325,7 +266,6 @@ unsafe fn bootstrap() {
         elapsed.as_secs_f64()
     ));
 
-    // 3. 保持输入线程
     if config.enable_debug_console {
         core::console::start_input_listener();
     }
@@ -343,17 +283,17 @@ fn panic_info_to_string(info: &PanicHookInfo<'_>) -> String {
     let msg = panic_payload_to_string(info.payload());
     let location = info
         .location()
-        .map(|l| format!("{}:{}", l.file(), l.line()))
+        .map(|location| format!("{}:{}", location.file(), location.line()))
         .unwrap_or_else(|| "<unknown location>".to_string());
     format!("{msg} at {location}")
 }
 
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(msg) = payload.downcast_ref::<&str>() {
-        return (*msg).to_string();
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
     }
-    if let Some(msg) = payload.downcast_ref::<String>() {
-        return msg.clone();
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
     }
     "Unknown panic".to_string()
 }
