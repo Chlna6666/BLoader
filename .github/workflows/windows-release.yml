@@ -118,13 +118,19 @@ jobs:
           path: |
             target/x86_64-pc-windows-msvc/release/BLoader.dll
             target/x86_64-pc-windows-msvc/release/exports.txt
+            dist/BLoader-*/BLoader.dll.sha256
+            dist/BLoader-*/manifest.json
+            README.md
+            CHANGELOG.md
           if-no-files-found: error
 
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
           name: BLoader-release-package
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
           if-no-files-found: error
 
       - name: Publish tagged release
@@ -135,4 +141,10 @@ jobs:
         run: |
           $archive = Get-ChildItem dist\*.zip | Select-Object -First 1
           if (-not $archive) { throw "Release archive not found" }
-          gh release create "${{ github.ref_name }}" $archive.FullName CHANGELOG.md --verify-tag --title "BLoader ${{ github.ref_name }}" --generate-notes
+          $checksum = Get-Item "$($archive.FullName).sha256"
+          gh release create "${{ github.ref_name }}" `
+            $archive.FullName `
+            $checksum.FullName `
+            --verify-tag `
+            --title "BLoader ${{ github.ref_name }}" `
+            --generate-notes
