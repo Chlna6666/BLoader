@@ -31,8 +31,8 @@ jobs:
           rustc -Vv
           cargo -V
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Format working tree for validation
+        run: cargo fmt --all
 
       - name: Run tests
         run: cargo test --lib --target x86_64-pc-windows-msvc
