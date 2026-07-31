@@ -106,6 +106,8 @@ jobs:
 
       - name: Stage release layout
         shell: pwsh
+        env:
+          BLOADER_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           New-Item -ItemType Directory -Path target\release -Force | Out-Null
           Copy-Item target\x86_64-pc-windows-msvc\release\BLoader.dll target\release\BLoader.dll -Force
