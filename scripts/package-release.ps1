@@ -41,7 +41,14 @@ foreach ($file in @("README.md", "LICENSE", "CHANGELOG.md")) {
 $dllHash = (Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant()
 "$dllHash  BLoader.dll" | Set-Content (Join-Path $stage "BLoader.dll.sha256") -Encoding utf8NoBOM
 
-$commit = if ($env:GITHUB_SHA) { $env:GITHUB_SHA } else { "local" }
+$sourceCommit = if ($env:BLOADER_SOURCE_SHA) {
+    $env:BLOADER_SOURCE_SHA
+} elseif ($env:GITHUB_SHA) {
+    $env:GITHUB_SHA
+} else {
+    "local"
+}
+$workflowCommit = if ($env:GITHUB_SHA) { $env:GITHUB_SHA } else { $sourceCommit }
 $runId = if ($env:GITHUB_RUN_ID) { $env:GITHUB_RUN_ID } else { $null }
 $builtAt = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
 
@@ -50,7 +57,8 @@ $manifest = [ordered]@{
     version = $version
     target = "x86_64-pc-windows-msvc"
     profile = $Configuration
-    commit = $commit
+    source_commit = $sourceCommit
+    workflow_commit = $workflowCommit
     github_run_id = $runId
     built_at_utc = $builtAt
     files = [ordered]@{
@@ -77,3 +85,4 @@ $zipHash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
 Write-Host "Package: $archive"
 Write-Host "Package SHA256: $zipHash"
 Write-Host "DLL SHA256: $dllHash"
+Write-Host "Source commit: $sourceCommit"
