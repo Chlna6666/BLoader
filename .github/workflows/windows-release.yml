@@ -25,6 +25,14 @@ jobs:
           targets: x86_64-pc-windows-msvc
           components: rustfmt
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          shared-key: windows-x64-msvc
+          cache-targets: "true"
+          cache-on-failure: "true"
+
       - name: Rust versions
         shell: pwsh
         run: |
