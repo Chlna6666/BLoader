@@ -23,23 +23,41 @@ pub use crate::bl::host::{bl_i18n_current_locale, bl_i18n_tr, bl_register_mod_la
 pub use crate::core::d3d12_queue::bl_register_d3d12_render_callback;
 
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_camera_zoom_set_enabled(_enabled: bool) -> bool { false }
+pub extern "system" fn bl_camera_zoom_set_enabled(_enabled: bool) -> bool {
+    false
+}
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_camera_zoom_set_percent(_percent: u32) -> bool { false }
+pub extern "system" fn bl_camera_zoom_set_percent(_percent: u32) -> bool {
+    false
+}
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_camera_zoom_get_enabled() -> bool { false }
+pub extern "system" fn bl_camera_zoom_get_enabled() -> bool {
+    false
+}
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_camera_zoom_get_percent() -> u32 { 0 }
+pub extern "system" fn bl_camera_zoom_get_percent() -> u32 {
+    0
+}
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_gamma_set_enabled(_enabled: bool) -> bool { false }
+pub extern "system" fn bl_gamma_set_enabled(_enabled: bool) -> bool {
+    false
+}
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_gamma_set_value(_value: f32) -> bool { false }
+pub extern "system" fn bl_gamma_set_value(_value: f32) -> bool {
+    false
+}
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_gamma_get_enabled() -> bool { false }
+pub extern "system" fn bl_gamma_get_enabled() -> bool {
+    false
+}
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_gamma_get_value() -> f32 { 1.0 }
+pub extern "system" fn bl_gamma_get_value() -> f32 {
+    1.0
+}
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_render3d_ready() -> bool { false }
+pub extern "system" fn bl_render3d_ready() -> bool {
+    false
+}
 
 #[unsafe(no_mangle)]
 pub extern "system" fn bl_render3d_line(
@@ -71,7 +89,7 @@ pub unsafe extern "system" fn DllMain(
             utils::set_loader_module_handle(hinstance.0 as usize);
             runtime::foundation::crash_report::install_early();
             runtime::foundation::logging::write_bootstrap_marker(&format!(
-                "bloader.build version={} profile={}",
+                "bloader.build version={} profile={} xuser_bridge=embedded protocol=1",
                 runtime::foundation::build_info::VERSION,
                 runtime::foundation::build_info::PROFILE,
             ));
@@ -153,6 +171,7 @@ unsafe fn bootstrap() {
         runtime::foundation::native_stdio::install_process_capture();
     }
     runtime::foundation::native_stdio::flush_pending();
+    core::xuser_bridge::publish_pending_logs();
     setup_panic_hook();
 
     const PKG_NAME: &str = crate::runtime::foundation::build_info::NAME;
