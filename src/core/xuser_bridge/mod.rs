@@ -21,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
     ptr,
     sync::{
-        OnceLock,
+        Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -38,6 +38,19 @@ static SESSION: OnceLock<Session> = OnceLock::new();
 static ORIGINAL_QUERY_API: OnceLock<usize> = OnceLock::new();
 static QUERY_HOOK_FIRST_CALL: AtomicBool = AtomicBool::new(false);
 static XUSER_QUERY_FIRST_CALL: AtomicBool = AtomicBool::new(false);
+static PENDING_LOGS: OnceLock<Mutex<Vec<PendingLog>>> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+enum BridgeLogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+struct PendingLog {
+    level: BridgeLogLevel,
+    message: String,
+}
 
 #[derive(Debug)]
 struct HookInstallReport {
@@ -100,6 +113,42 @@ pub fn initialize_before_mods() {
         Err(error) => bridge_error(&format!(
             "QueryApiImpl Hook 安装失败；自定义 XUser 已停用；系统原生 xgameruntime.dll 保持原样，继续使用微软官方 XUser 登录 | reason={error}"
         )),
+    }
+}
+
+/// Replays XUser bridge diagnostics generated before the normal tracing and
+/// console pipeline became available. This makes loader-lock-time decisions
+/// visible in `latest.log` and the debug console instead of only in the
+/// bootstrap marker file.
+pub fn publish_pending_logs() {
+    let Some(queue) = PENDING_LOGS.get() else {
+        return;
+    };
+    let pending = {
+        let mut guard = match queue.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        mem::take(&mut *guard)
+    };
+
+    if pending.is_empty() {
+        return;
+    }
+
+    logging::scoped_info_message(
+        "xuser-bridge",
+        &format!(
+            "正在回放 {} 条早期 XUser Bridge 诊断；以下状态生成于 BLoader DllMain 阶段",
+            pending.len()
+        ),
+    );
+    for entry in pending {
+        match entry.level {
+            BridgeLogLevel::Info => logging::scoped_info_message("xuser-bridge", &entry.message),
+            BridgeLogLevel::Warn => logging::scoped_warn_message("xuser-bridge", &entry.message),
+            BridgeLogLevel::Error => logging::scoped_error_message("xuser-bridge", &entry.message),
+        }
     }
 }
 
@@ -282,27 +331,42 @@ fn sanitize_gamertag(value: &str) -> String {
     }
 }
 
+fn queue_pending(level: BridgeLogLevel, message: &str) {
+    let queue = PENDING_LOGS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = match queue.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.push(PendingLog {
+        level,
+        message: message.to_string(),
+    });
+}
+
 fn bridge_info(message: &str) {
+    logging::write_bootstrap_marker(&format!("xuser-bridge.info {message}"));
     if logging::is_ready() {
         logging::scoped_info_message("xuser-bridge", message);
     } else {
-        logging::write_bootstrap_marker(&format!("xuser-bridge.info {message}"));
+        queue_pending(BridgeLogLevel::Info, message);
     }
 }
 
 fn bridge_warn(message: &str) {
+    logging::write_bootstrap_marker(&format!("xuser-bridge.warn {message}"));
     if logging::is_ready() {
         logging::scoped_warn_message("xuser-bridge", message);
     } else {
-        logging::write_bootstrap_marker(&format!("xuser-bridge.warn {message}"));
+        queue_pending(BridgeLogLevel::Warn, message);
     }
 }
 
 fn bridge_error(message: &str) {
+    logging::write_bootstrap_marker(&format!("xuser-bridge.error {message}"));
     if logging::is_ready() {
         logging::scoped_error_message("xuser-bridge", message);
     } else {
-        logging::write_bootstrap_marker(&format!("xuser-bridge.error {message}"));
+        queue_pending(BridgeLogLevel::Error, message);
     }
 }
 
