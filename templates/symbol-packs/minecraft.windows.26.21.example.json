@@ -1,0 +1,21 @@
+{
+  "format_version": 1,
+  "id": "example.minecraft.windows.26.21",
+  "target": {
+    "exe_name": "Minecraft.Windows.exe",
+    "sha256": "48e1f498eac0ce00a9de1f91773ee4510b507c39a55fd09f9c5dd07da0982f3f"
+  },
+  "symbols": [
+    {
+      "name": "runtime.game_module_base",
+      "kind": "rva",
+      "rva": "0x0",
+      "validate": "4D 5A",
+      "description": "Verified base address of the loaded Minecraft.Windows.exe image.",
+      "expose_to_mods": true
+    }
+  ],
+  "native_hud": {
+    "candidates": []
+  }
+}

@@ -1,0 +1,14 @@
+# Rust build outputs (any depth)
+target/
+
+# JetBrains IDE
+.idea/
+
+# Runtime log output
+logs/
+
+# Compiled external symbol packs
+*.blsym
+
+# Loader-generated user config (regenerated on first launch)
+/config.json

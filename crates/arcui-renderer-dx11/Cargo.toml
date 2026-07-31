@@ -1,0 +1,18 @@
+[package]
+name = "arcui-renderer-dx11"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+arcui-core = { path = "../arcui-core" }
+
+[dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+]

@@ -1,0 +1,14 @@
+[package]
+name = "lucide-arcui"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+arcui-core = { path = "../arcui-core" }
+
+[build-dependencies]
+anyhow = "1.0"
+roxmltree = "0.20"

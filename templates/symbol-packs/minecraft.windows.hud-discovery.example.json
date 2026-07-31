@@ -1,0 +1,12 @@
+{
+  "format_version": 1,
+  "id": "example.minecraft.windows.native-hud-discovery",
+  "discovery_only": true,
+  "target": {
+    "exe_name": "Minecraft.Windows.exe"
+  },
+  "symbols": [],
+  "native_hud": {
+    "candidates": []
+  }
+}

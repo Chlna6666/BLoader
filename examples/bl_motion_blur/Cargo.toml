@@ -1,0 +1,24 @@
+[package]
+name = "bl_motion_blur"
+version = "0.1.0"
+edition = "2021"
+authors = ["BLoader"]
+description = "Motion blur effect (D3D11/D3D12)"
+homepage = "https://example.invalid/bl_motion_blur"
+
+[package.metadata.bl]
+mod_id = "demo.motion_blur"
+mod_name = "Motion Blur"
+api_version = 1
+entry = "bl_motion_blur.dll"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+bl-sdk = { path = "../../bl-sdk" }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D_Fxc", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi_Common"] }
+
+[build-dependencies]
+serde_json = "1.0"
+toml = "0.8"

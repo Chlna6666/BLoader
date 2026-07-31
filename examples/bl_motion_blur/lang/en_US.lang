@@ -1,0 +1,9 @@
+motion_blur.feature.title=Motion Blur
+motion_blur.feature.description=Enable the DX12 motion blur post-process effect from this mod.
+motion_blur.ui.title=Motion Blur
+motion_blur.ui.enabled=Enabled
+motion_blur.ui.history=History Frames
+motion_blur.ui.strength=Strength
+motion_blur.ui.frame_index=Frame Index
+motion_blur.ui.backend=UI Backend
+motion_blur.ui.clear_history=Clear History

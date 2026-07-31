@@ -1,0 +1,20 @@
+[package]
+name = "bl-sdk"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "bl_sdk"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Windows API for GetModuleHandleW/GetProcAddress
+[dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_System_LibraryLoader",
+]

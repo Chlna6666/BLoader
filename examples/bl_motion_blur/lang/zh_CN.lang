@@ -1,0 +1,9 @@
+motion_blur.feature.title=动态模糊
+motion_blur.feature.description=启用当前模组提供的 DX12 动态模糊后处理效果。
+motion_blur.ui.title=动态模糊
+motion_blur.ui.enabled=启用
+motion_blur.ui.history=历史帧数
+motion_blur.ui.strength=强度
+motion_blur.ui.frame_index=帧索引
+motion_blur.ui.backend=UI 后端
+motion_blur.ui.clear_history=清空历史帧
