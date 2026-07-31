@@ -203,6 +203,24 @@ XUser Bridge 日志只记录：
 
 禁止记录 XUID、Token、私钥、Authorization、Signature、完整请求 Body 或原始管道载荷。
 
+### XUser Bridge 判定顺序
+
+BLoader 0.2.6 起会在最早启动阶段输出完整判定链。有效 BMCBL 会话下，正常日志应依次包含：
+
+```text
+XUser Bridge 入口已执行
+已从 BMCBL 安全一次性管道接收并验证 Xbox 会话
+系统原生 xgameruntime.dll 已就绪 | source=... | path=C:\Windows\System32\xgameruntime.dll
+已定位系统原生 QueryApiImpl | address=...
+XUser Bridge 已启用；仅接管官方 QueryApiImpl
+QueryApiImpl Hook 已首次命中
+QueryApiImpl 已请求 CLSID_XUserImpl；返回 BLoader 内置 Rust XUser
+```
+
+若没有安全会话，日志会明确说明“不主动加载系统 Runtime、不安装 Hook，系统原生 `xgameruntime.dll` 由游戏按微软正常流程启动”。
+
+如果日志中完全没有 `XUser Bridge 入口已执行`，说明实际加载的不是支持该桥接入口的 BLoader 产物，应优先检查 BMCBL 内嵌的 `assets/bin/BLoader.dll`，而不是继续判断 Hook 是否命中。
+
 ## 配置
 
 BLoader 在 DLL 所在目录读取 `config.json`。常用配置：
