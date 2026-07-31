@@ -1,0 +1,89 @@
+name: Windows build and release
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt
+
+      - name: Rust versions
+        shell: pwsh
+        run: |
+          rustc -Vv
+          cargo -V
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --lib --target x86_64-pc-windows-msvc
+
+      - name: Build release DLL
+        run: cargo build --release --lib --target x86_64-pc-windows-msvc
+
+      - name: Validate DLL and exports
+        shell: pwsh
+        run: |
+          $dll = "target\x86_64-pc-windows-msvc\release\BLoader.dll"
+          if (-not (Test-Path $dll)) { throw "Missing $dll" }
+          $size = (Get-Item $dll).Length
+          if ($size -lt 65536) { throw "BLoader.dll is unexpectedly small: $size" }
+          $dumpbin = Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio\2022" -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found" }
+          $exports = & $dumpbin.FullName /exports $dll | Out-String
+          foreach ($name in @("DllMain", "bl_i18n_current_locale", "bl_register_d3d12_render_callback")) {
+            if ($exports -notmatch [regex]::Escape($name)) { throw "Missing export: $name" }
+          }
+          $exports | Set-Content "target\x86_64-pc-windows-msvc\release\exports.txt"
+
+      - name: Stage release layout
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path target\release -Force | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\BLoader.dll target\release\BLoader.dll -Force
+          ./scripts/package-release.ps1
+
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: BLoader-windows-x64
+          path: |
+            target/x86_64-pc-windows-msvc/release/BLoader.dll
+            target/x86_64-pc-windows-msvc/release/exports.txt
+          if-no-files-found: error
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: BLoader-release-package
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $archive = Get-ChildItem dist\*.zip | Select-Object -First 1
+          if (-not $archive) { throw "Release archive not found" }
+          gh release create "${{ github.ref_name }}" $archive.FullName CHANGELOG.md --verify-tag --title "BLoader ${{ github.ref_name }}" --generate-notes
