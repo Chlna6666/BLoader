@@ -15,37 +15,65 @@ $cargo = Get-Content (Join-Path $root "Cargo.toml") -Raw
 if ($cargo -notmatch '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"') {
     throw "Unable to read package version from Cargo.toml"
 }
+
 $version = $Matches[1]
-$stage = Join-Path $root "$OutputDirectory\BLoader-$version-windows-x64"
-$archive = "$stage.zip"
+$dist = Join-Path $root $OutputDirectory
+$stageName = "BLoader-$version-windows-x64"
+$stage = Join-Path $dist $stageName
+$archive = Join-Path $dist "$stageName.zip"
+$archiveChecksum = "$archive.sha256"
 
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item $archive -Force -ErrorAction SilentlyContinue
+Remove-Item $archiveChecksum -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
-Copy-Item $target (Join-Path $stage "BLoader.dll")
+$dll = Join-Path $stage "BLoader.dll"
+Copy-Item $target $dll -Force
+
 foreach ($file in @("README.md", "LICENSE", "CHANGELOG.md")) {
     $source = Join-Path $root $file
     if (Test-Path $source) {
-        Copy-Item $source (Join-Path $stage $file)
+        Copy-Item $source (Join-Path $stage $file) -Force
     }
 }
+
+$dllHash = (Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant()
+"$dllHash  BLoader.dll" | Set-Content (Join-Path $stage "BLoader.dll.sha256") -Encoding utf8NoBOM
+
+$commit = if ($env:GITHUB_SHA) { $env:GITHUB_SHA } else { "local" }
+$runId = if ($env:GITHUB_RUN_ID) { $env:GITHUB_RUN_ID } else { $null }
+$builtAt = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
 
 $manifest = [ordered]@{
     name = "BLoader"
     version = $version
     target = "x86_64-pc-windows-msvc"
     profile = $Configuration
-    sha256 = (Get-FileHash (Join-Path $stage "BLoader.dll") -Algorithm SHA256).Hash.ToLowerInvariant()
+    commit = $commit
+    github_run_id = $runId
+    built_at_utc = $builtAt
+    files = [ordered]@{
+        "BLoader.dll" = [ordered]@{
+            size = (Get-Item $dll).Length
+            sha256 = $dllHash
+        }
+    }
     xuser_bridge = [ordered]@{
-        activation = "authenticated BMCBL named pipe only"
-        hook = "xgameruntime.dll!QueryApiImpl only"
-        default_without_session = "official Microsoft XUser untouched"
+        platform = "Win32 GDK only"
+        activation = "authenticated BMCBL process-scoped named pipe only"
+        hook = "Microsoft xgameruntime.dll!QueryApiImpl only"
+        without_session = "no hook; official Microsoft XUser remains untouched"
         signature = "SHA-256 + ECDSA P-256 Xbox proof-of-possession"
+        credential_environment_variables = $false
     }
 }
-$manifest | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $stage "manifest.json") -Encoding UTF8
+$manifest | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $stage "manifest.json") -Encoding utf8NoBOM
 
 Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $archive -CompressionLevel Optimal
+$zipHash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+"$zipHash  $stageName.zip" | Set-Content $archiveChecksum -Encoding utf8NoBOM
+
 Write-Host "Package: $archive"
-Write-Host "SHA256: $((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant())"
+Write-Host "Package SHA256: $zipHash"
+Write-Host "DLL SHA256: $dllHash"
