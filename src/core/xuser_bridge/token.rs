@@ -10,6 +10,7 @@ use super::{
         TokenData, TokenHeader, TokenUtf16Data, TokenUtf16Header, XAsyncBlock,
         XAsyncOp, XAsyncProviderData, XUserHandle,
     },
+    presence_token,
     session,
     xasync,
     xuser,
@@ -357,6 +358,12 @@ unsafe fn begin_token_request(
     } else {
         unsafe { std::slice::from_raw_parts(body.cast::<u8>(), body_size) }
     };
+
+    // Rich Presence is emitted by XSAPI through this XUser signing boundary
+    // even when XblPresenceSetPresenceAsync is statically linked and cannot be
+    // found as a module export. Observe before TokenContext takes its own copy.
+    presence_token::observe_token_request(method, url, body);
+
     let context = match TokenContext::new(user, method, url, headers, body, utf16) {
         Ok(context) => Box::into_raw(Box::new(context)),
         Err(error) => return error,
