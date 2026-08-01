@@ -3,6 +3,9 @@
 use core::ffi::{c_char, c_void};
 use std::{mem, ptr, sync::OnceLock};
 
+#[path = "xuser_lifecycle.rs"]
+mod lifecycle;
+
 use super::{
     abi::{
         E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_NOT_SUFFICIENT_BUFFER,
@@ -12,9 +15,11 @@ use super::{
         XAsyncProviderData, XUserGamertagVtable, XUserHandle, XUserLocalId,
         XUserVtable, XUSER_STATE_SIGNED_IN,
     },
-    session,
-    token,
-    xasync,
+    bridge_info, bridge_warn, session, token, xasync,
+};
+use lifecycle::{
+    E_GAMEUSER_SIGNED_OUT, E_GAMEUSER_USER_NOT_FOUND, XTaskQueueRegistrationToken,
+    XUserChangeEventCallback, XUSER_STATE_SIGNING_OUT,
 };
 
 #[repr(C)]
@@ -127,8 +132,12 @@ unsafe extern "system" fn duplicate_handle(
     let Some(provider) = provider_interface() else {
         return E_FAIL;
     };
-    if !user.is_null() && user != provider {
+    if user != provider {
         return E_INVALIDARG;
+    }
+    let status = lifecycle::duplicate_active_handle();
+    if status < 0 {
+        return status;
     }
     unsafe {
         duplicated.write(provider);
@@ -136,7 +145,18 @@ unsafe extern "system" fn duplicate_handle(
     S_OK
 }
 
-unsafe extern "system" fn close_handle(_interface: *mut c_void, _user: XUserHandle) {}
+unsafe extern "system" fn close_handle(_interface: *mut c_void, user: XUserHandle) {
+    if !valid_user(user) {
+        bridge_warn("XUserCloseHandle 收到未知用户句柄；已忽略");
+        return;
+    }
+    match lifecycle::release_user_handle() {
+        Some(remaining) => bridge_info(&format!(
+            "XUserCloseHandle 已处理 | remaining_handles={remaining}"
+        )),
+        None => bridge_warn("XUserCloseHandle 检测到句柄引用计数下溢；已忽略重复关闭"),
+    }
+}
 
 unsafe extern "system" fn compare(
     _interface: *mut c_void,
@@ -161,6 +181,7 @@ unsafe extern "system" fn get_max_users(
 
 struct XUserAddContext {
     handle: usize,
+    claimed: bool,
 }
 
 unsafe extern "system" fn xuser_add_provider(
@@ -194,11 +215,19 @@ unsafe extern "system" fn xuser_add_provider(
             {
                 return E_NOT_SUFFICIENT_BUFFER;
             }
+            let context = unsafe { &mut *context };
+            if !context.claimed {
+                let status = lifecycle::acquire_added_handle();
+                if status < 0 {
+                    return status;
+                }
+                context.claimed = true;
+            }
             unsafe {
                 provider_data
                     .buffer
                     .cast::<XUserHandle>()
-                    .write((*context).handle as XUserHandle);
+                    .write(context.handle as XUserHandle);
             }
             S_OK
         }
@@ -220,11 +249,15 @@ unsafe extern "system" fn add_async(
     if async_block.is_null() {
         return E_POINTER;
     }
+    if lifecycle::state() == XUSER_STATE_SIGNING_OUT {
+        return E_GAMEUSER_SIGNED_OUT;
+    }
     let Some(handle) = provider_interface() else {
         return E_FAIL;
     };
     let context = Box::into_raw(Box::new(XUserAddContext {
         handle: handle as usize,
+        claimed: false,
     }));
     let result = unsafe {
         xasync::begin(
@@ -287,8 +320,12 @@ unsafe extern "system" fn find_user_by_local_id(
     if user.is_null() {
         return E_POINTER;
     }
-    if local_id != session().unwrap().local_id {
-        return E_FAIL;
+    if local_id != session().unwrap().local_id || !lifecycle::active_handle_exists() {
+        return E_GAMEUSER_USER_NOT_FOUND;
+    }
+    let status = lifecycle::duplicate_active_handle();
+    if status < 0 {
+        return status;
     }
     unsafe {
         user.write(provider_interface().unwrap());
@@ -321,8 +358,12 @@ unsafe extern "system" fn find_user_by_id(
     if user.is_null() {
         return E_POINTER;
     }
-    if user_id != session().unwrap().xuid {
-        return E_FAIL;
+    if user_id != session().unwrap().xuid || !lifecycle::active_handle_exists() {
+        return E_GAMEUSER_USER_NOT_FOUND;
+    }
+    let status = lifecycle::duplicate_active_handle();
+    if status < 0 {
+        return status;
     }
     unsafe {
         user.write(provider_interface().unwrap());
@@ -359,7 +400,7 @@ unsafe extern "system" fn get_state(
         return E_INVALIDARG;
     }
     unsafe {
-        state.write(XUSER_STATE_SIGNED_IN);
+        state.write(lifecycle::state());
     }
     S_OK
 }
@@ -395,6 +436,9 @@ unsafe extern "system" fn check_privilege(
     if !valid_user(user) {
         return E_INVALIDARG;
     }
+    if lifecycle::state() != XUSER_STATE_SIGNED_IN {
+        return E_GAMEUSER_SIGNED_OUT;
+    }
     let allowed = privilege >= 0
         && session()
             .unwrap()
@@ -405,6 +449,42 @@ unsafe extern "system" fn check_privilege(
         deny_reason.write(0);
     }
     S_OK
+}
+
+unsafe extern "system" fn register_for_change_event(
+    _interface: *mut c_void,
+    _queue: *mut c_void,
+    context: *mut c_void,
+    callback: Option<XUserChangeEventCallback>,
+    registration_token: *mut XTaskQueueRegistrationToken,
+) -> HResult {
+    unsafe {
+        lifecycle::register_for_change_event(context, callback, registration_token)
+    }
+}
+
+unsafe extern "system" fn unregister_for_change_event(
+    _interface: *mut c_void,
+    registration_token: XTaskQueueRegistrationToken,
+    wait: u8,
+) -> u8 {
+    unsafe { lifecycle::unregister_for_change_event(registration_token, wait) }
+}
+
+unsafe extern "system" fn get_sign_out_deferral(
+    _interface: *mut c_void,
+    deferral: *mut *mut c_void,
+) -> HResult {
+    unsafe { lifecycle::get_sign_out_deferral(deferral) }
+}
+
+unsafe extern "system" fn close_sign_out_deferral_handle(
+    _interface: *mut c_void,
+    deferral: *mut c_void,
+) {
+    unsafe {
+        lifecycle::close_sign_out_deferral_handle(deferral);
+    }
 }
 
 unsafe extern "system" fn get_gamertag(
@@ -450,8 +530,6 @@ unsafe extern "system" fn stub_boolean(_interface: *mut c_void) -> u8 {
     0
 }
 
-unsafe extern "system" fn stub_void(_interface: *mut c_void) {}
-
 fn user_vtable() -> *const XUserVtable {
     USER_VTABLE.get_or_init(|| XUserVtable {
         slots: [
@@ -488,10 +566,10 @@ fn user_vtable() -> *const XUserVtable {
             stub_hresult as usize,
             stub_hresult as usize,
             stub_hresult as usize,
-            stub_hresult as usize,
-            stub_boolean as usize,
-            stub_hresult as usize,
-            stub_void as usize,
+            register_for_change_event as usize,
+            unregister_for_change_event as usize,
+            get_sign_out_deferral as usize,
+            close_sign_out_deferral_handle as usize,
             stub_hresult as usize,
             stub_hresult as usize,
             stub_hresult as usize,
