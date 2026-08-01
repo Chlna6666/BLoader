@@ -2,6 +2,32 @@
 
 本项目遵循语义化版本。每次 BLoader 行为、ABI、安全协议或发布格式发生变化时，必须更新版本号或本文件。
 
+## [0.2.9] - 2026-08-01
+
+### Added
+
+- 为 ANSI 与 UTF-16 `XUserGetTokenAndSignatureAsync` 增加完整请求头复制，不再只检查调用方指针后丢弃 Header 内容。
+- 增加签名策略模型，按策略规定的 Header 名称顺序、忽略大小写匹配 Header 值；策略要求但请求未携带的 Header 使用空值占位，保持 Proof-of-Possession 输入布局稳定。
+- 内置 Xbox 默认 NSAL 策略：普通 `*.xboxlive.com` 服务使用签名版本 1、`MaxBodyBytes=8192`、无 `ExtraHeaders`；`device.mgt.xboxlive.com` 与 `data-vef.xboxlive.com` 使用完整请求正文。
+- 增加请求头顺序、大小写、缺失占位、未知服务兼容回退和 CR/LF Header 注入拒绝测试。
+
+### Changed
+
+- 签名正文现在按策略的 `MaxBodyBytes` 截断，不再无条件签入完整请求正文。
+- 对尚未提供 Partner Center Title NSAL 元数据的非 Xbox 自定义服务，暂按调用方 Header 顺序兼容回退，并排除 `Authorization`、`Signature`、`Host` 与 `Content-Length` 等派生 Header。
+- BLoader 版本更新为 `0.2.9`。
+
+### Fixed
+
+- 修复 Token Provider 接收 `header_count` 与 `headers` 后只验证、不保存，导致非空 `ExtraHeaders` 签名策略无法工作的实现缺口。
+- 修复签名 Header 名称大小写不同或策略 Header 缺失时，无法按照 Xbox Signing Policy 生成确定性字段序列的问题。
+- 明确 Presence 默认 Xbox 签名策略的 `ExtraHeaders` 为空：`x-xbl-contract-version`、`Content-Type` 和 `Accept-Language` 等 Header 仍随 HTTP 请求发送，但不会被错误地强行加入默认 PoP Signature。
+
+### Security
+
+- Header 名称和值均有长度上限；Header 名称必须符合 HTTP token 字符集，值拒绝 CR、LF 与 NUL，防止 Header 注入。
+- 复制到异步上下文中的策略 Header 值和请求正文会在完成或释放时清零；日志仍不记录 Header 值、Token、Authorization、Signature 或请求正文。
+
 ## [0.2.8] - 2026-08-01
 
 ### Added
