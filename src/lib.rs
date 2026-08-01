@@ -88,6 +88,13 @@ pub unsafe extern "system" fn DllMain(
             utils::set_exe_cwd();
             utils::set_loader_module_handle(hinstance.0 as usize);
             runtime::foundation::crash_report::install_early();
+
+            let runtime_kind = runtime::foundation::runtime_environment::prime_detection();
+            runtime::foundation::logging::write_bootstrap_marker(&format!(
+                "runtime.environment.early kind={} wine={}",
+                runtime_kind.as_str(),
+                runtime_kind.is_wine(),
+            ));
             runtime::foundation::logging::write_bootstrap_marker(&format!(
                 "bloader.build version={} profile={} xuser_bridge=embedded protocol=1",
                 runtime::foundation::build_info::VERSION,
@@ -173,6 +180,7 @@ unsafe fn bootstrap() {
     runtime::foundation::native_stdio::flush_pending();
     core::xuser_bridge::publish_pending_logs();
     setup_panic_hook();
+    runtime::foundation::runtime_environment::log_summary();
 
     const PKG_NAME: &str = crate::runtime::foundation::build_info::NAME;
     const VERSION: &str = crate::runtime::foundation::build_info::VERSION;
