@@ -18,7 +18,7 @@ resolver = "2"
 
 [package]
 name = "BLoader"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Chlna6666/BLoader"
