@@ -17,8 +17,6 @@ use super::{
     xasync,
 };
 
-mod presence;
-
 #[repr(C)]
 struct XUserGamertagInterface {
     vtable: *const XUserGamertagVtable,
@@ -70,7 +68,6 @@ pub unsafe fn query_interface(iid: *const Guid, out: *mut *mut c_void) -> HResul
         out.write(ptr::null_mut());
     }
 
-    presence::ensure_started();
     let iid = unsafe { &*iid };
 
     if [
