@@ -5,3 +5,4 @@ pub mod i18n;
 pub mod logging;
 pub mod mod_diagnostics;
 pub mod native_stdio;
+pub mod runtime_environment;
