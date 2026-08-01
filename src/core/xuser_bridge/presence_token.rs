@@ -6,7 +6,7 @@ use std::{
     ptr,
     sync::{
         Condvar, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -21,6 +21,7 @@ const PRESENCE_CONTRACT_VERSION: &str = "3";
 const PRESENCE_ENDPOINT_SUFFIX: &str = "/devices/current/titles/current";
 const MAX_CAPTURED_BODY_SIZE: usize = 256 * 1024;
 const XBOX_SIGNATURE_MAX_BODY_BYTES: usize = 8 * 1024;
+const MAX_TOKEN_ROUTE_LOGS: usize = 24;
 
 const WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY: u32 = 4;
 const INTERNET_DEFAULT_HTTPS_PORT: u16 = 443;
@@ -29,6 +30,7 @@ const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
 const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 
 static RELAY_STARTED: AtomicBool = AtomicBool::new(false);
+static TOKEN_REQUEST_COUNT: AtomicUsize = AtomicUsize::new(0);
 static RELAY_QUEUE: OnceLock<RelayQueue> = OnceLock::new();
 
 #[link(name = "kernel32")]
@@ -131,6 +133,17 @@ pub(crate) fn observe_token_request(method: &str, url: &str, body: &[u8]) {
     let Some((host, path)) = parse_https_target(url) else {
         return;
     };
+
+    let sequence = TOKEN_REQUEST_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence <= MAX_TOKEN_ROUTE_LOGS {
+        bridge_info(&format!(
+            "XUser Token 请求路由 | sequence={sequence} | method={} | host={} | body_bytes={} | values=redacted",
+            sanitize_method(method),
+            sanitize_host(&host),
+            body.len(),
+        ));
+    }
+
     if !host.eq_ignore_ascii_case(PRESENCE_HOST) || !path.ends_with(PRESENCE_ENDPOINT_SUFFIX) {
         return;
     }
@@ -193,10 +206,9 @@ pub(crate) fn observe_token_request(method: &str, url: &str, body: &[u8]) {
     });
 
     bridge_info(&format!(
-        "Token Presence Relay 已捕获 XSAPI Presence 请求 | method={method} | state={} | rich_presence={rich_presence} | body_bytes={} | source_path={}",
+        "Token Presence Relay 已捕获 XSAPI Presence 请求 | method={method} | state={} | rich_presence={rich_presence} | body_bytes={} | url_path=redacted",
         state.as_deref().unwrap_or("<none>"),
         body.len(),
-        sanitize_path(&path),
     ));
 }
 
@@ -458,6 +470,25 @@ fn parse_https_target(url: &str) -> Option<(String, String)> {
     Some((host.to_ascii_lowercase(), path))
 }
 
+fn sanitize_method(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphabetic())
+        .take(16)
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+fn sanitize_host(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | ':')
+        })
+        .take(255)
+        .collect()
+}
+
 fn sanitize_state(value: &str) -> String {
     let value = value
         .chars()
@@ -469,14 +500,6 @@ fn sanitize_state(value: &str) -> String {
     } else {
         value
     }
-}
-
-fn sanitize_path(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| !character.is_control())
-        .take(256)
-        .collect()
 }
 
 fn wide(value: &str) -> Vec<u16> {
