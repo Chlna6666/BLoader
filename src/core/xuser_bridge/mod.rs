@@ -10,7 +10,6 @@ compile_error!("BLoader's embedded XUser bridge currently supports Windows x64 o
 mod abi;
 mod crypto;
 mod ipc;
-mod presence_token;
 mod token;
 mod xasync;
 mod xuser;
