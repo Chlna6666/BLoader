@@ -19,8 +19,12 @@ const TOKEN_OPTIONS_MASK: u32 = 0x03;
 const MAX_METHOD_LENGTH: usize = 32;
 const MAX_URL_LENGTH: usize = 32 * 1024;
 const MAX_HEADER_COUNT: usize = 128;
+const MAX_HEADER_NAME_LENGTH: usize = 256;
+const MAX_HEADER_VALUE_LENGTH: usize = 32 * 1024;
 const MAX_REQUEST_BODY_SIZE: usize = 64 * 1024 * 1024;
 const MAX_UTF16_INPUT_UNITS: usize = 32 * 1024;
+const DEFAULT_XBOX_MAX_BODY_BYTES: usize = 8 * 1024;
+const FULL_BODY_MAX_BYTES: usize = u32::MAX as usize;
 const TOKEN_NAME_ANSI: &[u8] = b"XUserGetTokenAndSignatureAsync\0";
 const TOKEN_NAME_UTF16: &[u8] = b"XUserGetTokenAndSignatureUtf16Async\0";
 static TOKEN_IDENTITY_ANSI: u8 = 0x41;
@@ -32,10 +36,58 @@ const MULTIPLAYER_RP: &str = "https://multiplayer.minecraft.net/";
 const REALMS_RP: &str = "https://pocket.realms.minecraft.net/";
 const LICENSING_RP: &str = "http://licensing.xboxlive.com";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RequestHeader {
+    name: String,
+    value: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SigningPolicy {
+    max_body_bytes: usize,
+    extra_header_names: Vec<String>,
+}
+
+impl SigningPolicy {
+    fn xbox_default() -> Self {
+        Self {
+            max_body_bytes: DEFAULT_XBOX_MAX_BODY_BYTES,
+            extra_header_names: Vec::new(),
+        }
+    }
+
+    fn xbox_full_body() -> Self {
+        Self {
+            max_body_bytes: FULL_BODY_MAX_BYTES,
+            extra_header_names: Vec::new(),
+        }
+    }
+
+    fn caller_headers(headers: &[RequestHeader]) -> Self {
+        let mut names = Vec::new();
+        for header in headers {
+            if is_transport_or_auth_header(&header.name)
+                || names
+                    .iter()
+                    .any(|name: &String| name.eq_ignore_ascii_case(&header.name))
+            {
+                continue;
+            }
+            names.push(header.name.clone());
+        }
+        Self {
+            max_body_bytes: FULL_BODY_MAX_BYTES,
+            extra_header_names: names,
+        }
+    }
+}
+
 struct TokenContext {
     utf16: bool,
     method: String,
     request_target: String,
+    policy_header_values: Vec<String>,
+    max_body_bytes: usize,
     body: Vec<u8>,
     authorization: Vec<u8>,
     authorization_utf16: Vec<u16>,
@@ -49,6 +101,7 @@ impl TokenContext {
         user: XUserHandle,
         method: &str,
         url: &str,
+        headers: Vec<RequestHeader>,
         body: &[u8],
         utf16: bool,
     ) -> Result<Self, HResult> {
@@ -64,6 +117,9 @@ impl TokenContext {
             return Err(E_FAIL);
         }
         let request_target = request_target_from_url(url).ok_or(E_INVALIDARG)?;
+        let policy = signing_policy_for_url(url, &headers);
+        let policy_header_values =
+            select_policy_header_values(&headers, &policy.extra_header_names);
 
         let authorization_text = Zeroizing::new(format!(
             "XBL3.0 x={};{}",
@@ -78,6 +134,8 @@ impl TokenContext {
             utf16,
             method: method.to_ascii_uppercase(),
             request_target,
+            policy_header_values,
+            max_body_bytes: policy.max_body_bytes,
             body: body.to_vec(),
             authorization,
             authorization_utf16,
@@ -96,6 +154,12 @@ impl TokenContext {
             .strip_suffix(&[0])
             .and_then(|value| std::str::from_utf8(value).ok())
             .ok_or(E_INVALIDARG)?;
+        let policy_header_values = self
+            .policy_header_values
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let body_to_sign = &self.body[..self.body.len().min(self.max_body_bytes)];
 
         let signature_text = Zeroizing::new(
             session()
@@ -105,12 +169,14 @@ impl TokenContext {
                     &self.method,
                     &self.request_target,
                     authorization,
-                    &[],
-                    &self.body,
+                    &policy_header_values,
+                    body_to_sign,
                 )?,
         );
         self.body.zeroize();
         self.body.clear();
+        self.policy_header_values.zeroize();
+        self.policy_header_values.clear();
 
         self.signature = signature_text.as_bytes().to_vec();
         self.signature.push(0);
@@ -142,6 +208,7 @@ impl TokenContext {
 impl Drop for TokenContext {
     fn drop(&mut self) {
         self.body.zeroize();
+        self.policy_header_values.zeroize();
         self.authorization.zeroize();
         self.authorization_utf16.zeroize();
         self.signature.zeroize();
@@ -264,6 +331,7 @@ unsafe fn begin_token_request(
     options: u32,
     method: &str,
     url: &str,
+    headers: Vec<RequestHeader>,
     body_size: usize,
     body: *const c_void,
     async_block: *mut XAsyncBlock,
@@ -289,7 +357,7 @@ unsafe fn begin_token_request(
     } else {
         unsafe { std::slice::from_raw_parts(body.cast::<u8>(), body_size) }
     };
-    let context = match TokenContext::new(user, method, url, body, utf16) {
+    let context = match TokenContext::new(user, method, url, headers, body, utf16) {
         Ok(context) => Box::into_raw(Box::new(context)),
         Err(error) => return error,
     };
@@ -329,23 +397,18 @@ pub unsafe extern "system" fn get_token_and_signature_async(
     {
         return E_POINTER;
     }
-    if header_count != 0 {
-        for header in unsafe { std::slice::from_raw_parts(headers, header_count) } {
-            if header.name.is_null() || header.value.is_null() {
-                return E_POINTER;
-            }
-            let _ = unsafe { CStr::from_ptr(header.name) };
-            let _ = unsafe { CStr::from_ptr(header.value) };
-        }
-    }
 
+    let headers = match unsafe { copy_ansi_headers(headers, header_count) } {
+        Ok(headers) => headers,
+        Err(error) => return error,
+    };
     let method = match unsafe { CStr::from_ptr(method) }.to_str() {
-        Ok(value) => value,
-        Err(_) => return E_INVALIDARG,
+        Ok(value) if value.len() <= MAX_METHOD_LENGTH && value.is_ascii() => value,
+        _ => return E_INVALIDARG,
     };
     let url = match unsafe { CStr::from_ptr(url) }.to_str() {
-        Ok(value) => value,
-        Err(_) => return E_INVALIDARG,
+        Ok(value) if value.len() <= MAX_URL_LENGTH && value.is_ascii() => value,
+        _ => return E_INVALIDARG,
     };
     unsafe {
         begin_token_request(
@@ -353,6 +416,7 @@ pub unsafe extern "system" fn get_token_and_signature_async(
             options,
             method,
             url,
+            headers,
             body_size,
             body,
             async_block,
@@ -405,23 +469,19 @@ pub unsafe extern "system" fn get_token_and_signature_utf16_async(
     if header_count > MAX_HEADER_COUNT || (header_count != 0 && headers.is_null()) {
         return E_POINTER;
     }
-    if header_count != 0 {
-        for header in unsafe { std::slice::from_raw_parts(headers, header_count) } {
-            if let Err(error) = unsafe { utf16_to_string(header.name) } {
-                return error;
-            }
-            if let Err(error) = unsafe { utf16_to_string(header.value) } {
-                return error;
-            }
-        }
-    }
 
-    let method = match unsafe { utf16_to_string(method) } {
-        Ok(value) => value,
+    let headers = match unsafe { copy_utf16_headers(headers, header_count) } {
+        Ok(headers) => headers,
         Err(error) => return error,
     };
-    let url = match unsafe { utf16_to_string(url) } {
-        Ok(value) => value,
+    let method = match unsafe { utf16_to_string_bounded(method, MAX_METHOD_LENGTH) } {
+        Ok(value) if value.is_ascii() => value,
+        Ok(_) => return E_INVALIDARG,
+        Err(error) => return error,
+    };
+    let url = match unsafe { utf16_to_string_bounded(url, MAX_URL_LENGTH) } {
+        Ok(value) if value.is_ascii() => value,
+        Ok(_) => return E_INVALIDARG,
         Err(error) => return error,
     };
     unsafe {
@@ -430,6 +490,7 @@ pub unsafe extern "system" fn get_token_and_signature_utf16_async(
             options,
             &method,
             &url,
+            headers,
             body_size,
             body,
             async_block,
@@ -465,6 +526,135 @@ pub unsafe extern "system" fn get_token_and_signature_utf16_result(
         }
     }
     result
+}
+
+unsafe fn copy_ansi_headers(
+    headers: *const TokenHeader,
+    count: usize,
+) -> Result<Vec<RequestHeader>, HResult> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if headers.is_null() {
+        return Err(E_POINTER);
+    }
+
+    let mut copied = Vec::with_capacity(count);
+    for header in unsafe { std::slice::from_raw_parts(headers, count) } {
+        if header.name.is_null() || header.value.is_null() {
+            return Err(E_POINTER);
+        }
+        let name = unsafe { CStr::from_ptr(header.name) }
+            .to_str()
+            .map_err(|_| E_INVALIDARG)?;
+        let value = unsafe { CStr::from_ptr(header.value) }
+            .to_str()
+            .map_err(|_| E_INVALIDARG)?;
+        copied.push(validate_header(name, value)?);
+    }
+    Ok(copied)
+}
+
+unsafe fn copy_utf16_headers(
+    headers: *const TokenUtf16Header,
+    count: usize,
+) -> Result<Vec<RequestHeader>, HResult> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if headers.is_null() {
+        return Err(E_POINTER);
+    }
+
+    let mut copied = Vec::with_capacity(count);
+    for header in unsafe { std::slice::from_raw_parts(headers, count) } {
+        let name = unsafe { utf16_to_string_bounded(header.name, MAX_HEADER_NAME_LENGTH) }?;
+        let value = unsafe { utf16_to_string_bounded(header.value, MAX_HEADER_VALUE_LENGTH) }?;
+        copied.push(validate_header(&name, &value)?);
+    }
+    Ok(copied)
+}
+
+fn validate_header(name: &str, value: &str) -> Result<RequestHeader, HResult> {
+    if name.is_empty()
+        || name.len() > MAX_HEADER_NAME_LENGTH
+        || value.len() > MAX_HEADER_VALUE_LENGTH
+        || !name.is_ascii()
+        || !value.is_ascii()
+        || !name.bytes().all(is_http_token_byte)
+        || value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+    {
+        return Err(E_INVALIDARG);
+    }
+    Ok(RequestHeader {
+        name: name.to_ascii_lowercase(),
+        value: value.to_string(),
+    })
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn is_transport_or_auth_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "signature" | "host" | "content-length"
+    )
+}
+
+fn select_policy_header_values(
+    headers: &[RequestHeader],
+    policy_header_names: &[String],
+) -> Vec<String> {
+    policy_header_names
+        .iter()
+        .map(|policy_name| {
+            headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case(policy_name))
+                .map(|header| header.value.clone())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn signing_policy_for_url(url: &str, headers: &[RequestHeader]) -> SigningPolicy {
+    let host = url_host(url).unwrap_or_default();
+
+    // Microsoft XSAPI's default NSAL maps ordinary *.xboxlive.com endpoints,
+    // including userpresence.xboxlive.com, to policy v1 with no ExtraHeaders
+    // and an 8192-byte body limit. Adding contract/content headers to those
+    // signatures would be incorrect even though those headers are sent.
+    if host == "device.mgt.xboxlive.com" || host == "data-vef.xboxlive.com" {
+        return SigningPolicy::xbox_full_body();
+    }
+    if host == "xboxlive.com" || host.ends_with(".xboxlive.com") {
+        return SigningPolicy::xbox_default();
+    }
+
+    // BLoader currently has no title NSAL payload for custom Partner Center
+    // endpoints. Preserve the caller-provided order as a compatibility
+    // fallback instead of silently discarding every header. Transport-derived
+    // and always-signed headers are excluded.
+    SigningPolicy::caller_headers(headers)
 }
 
 fn relying_party_for_url(url: &str) -> &'static str {
@@ -533,12 +723,12 @@ fn request_target_from_url(url: &str) -> Option<String> {
     }
 }
 
-unsafe fn utf16_to_string(value: *const u16) -> Result<String, HResult> {
+unsafe fn utf16_to_string_bounded(value: *const u16, max_units: usize) -> Result<String, HResult> {
     if value.is_null() {
         return Err(E_POINTER);
     }
     let mut length = 0usize;
-    while length < MAX_UTF16_INPUT_UNITS {
+    while length <= max_units && length < MAX_UTF16_INPUT_UNITS {
         if unsafe { value.add(length).read() } == 0 {
             return String::from_utf16(unsafe { std::slice::from_raw_parts(value, length) })
                 .map_err(|_| E_INVALIDARG);
@@ -558,6 +748,13 @@ fn now_epoch() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn header(name: &str, value: &str) -> RequestHeader {
+        RequestHeader {
+            name: name.to_ascii_lowercase(),
+            value: value.to_string(),
+        }
+    }
 
     #[test]
     fn presence_uses_xbox_live_relying_party() {
@@ -579,5 +776,57 @@ mod tests {
             relying_party_for_url("https://b980a380.minecraft.playfabapi.com/Client/Login"),
             PLAYFAB_RP
         );
+    }
+
+    #[test]
+    fn xbox_default_policy_does_not_sign_transport_headers() {
+        let headers = vec![
+            header("x-xbl-contract-version", "3"),
+            header("content-type", "application/json"),
+            header("accept-language", "zh-CN"),
+        ];
+        let policy = signing_policy_for_url(
+            "https://userpresence.xboxlive.com/users/xuid(1)/devices/current/titles/current",
+            &headers,
+        );
+        assert_eq!(policy.max_body_bytes, DEFAULT_XBOX_MAX_BODY_BYTES);
+        assert!(policy.extra_header_names.is_empty());
+    }
+
+    #[test]
+    fn policy_headers_are_case_insensitive_ordered_and_keep_missing_slots() {
+        let headers = vec![
+            header("content-type", "application/json"),
+            header("x-xbl-contract-version", "3"),
+        ];
+        let policy_names = vec![
+            "X-XBL-CONTRACT-VERSION".to_string(),
+            "Accept-Language".to_string(),
+            "Content-Type".to_string(),
+        ];
+        assert_eq!(
+            select_policy_header_values(&headers, &policy_names),
+            vec!["3", "", "application/json"]
+        );
+    }
+
+    #[test]
+    fn custom_endpoint_fallback_preserves_caller_header_order() {
+        let headers = vec![
+            header("content-type", "application/json"),
+            header("authorization", "ignored"),
+            header("x-custom-policy", "value"),
+        ];
+        let policy = signing_policy_for_url("https://api.example.test/path", &headers);
+        assert_eq!(
+            policy.extra_header_names,
+            vec!["content-type", "x-custom-policy"]
+        );
+    }
+
+    #[test]
+    fn header_validation_rejects_injection() {
+        assert_eq!(validate_header("x-test", "ok\r\nbad"), Err(E_INVALIDARG));
+        assert_eq!(validate_header("bad header", "ok"), Err(E_INVALIDARG));
     }
 }
