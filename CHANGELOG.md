@@ -2,6 +2,34 @@
 
 本项目遵循语义化版本。每次 BLoader 行为、ABI、安全协议或发布格式发生变化时，必须更新版本号或本文件。
 
+## [0.2.8] - 2026-08-01
+
+### Added
+
+- 新增进程内 Xbox Rich Presence Bridge，在自定义 XUser 会话启用时动态扫描并 Hook 已加载 XSAPI 模块导出的 `XblPresenceSetPresenceAsync`。
+- 直接复用 Minecraft 传入的 SCID、Presence ID、Presence Token IDs 和 active/inactive 状态，不依赖游戏内部类、偏移或版本特定地图状态 Hook。
+- 使用 BMCBL 注入账户的 Xbox Live XSTS、UHS 和 P-256 Proof-of-Possession 私钥，通过 WinHTTP 向 `userpresence.xboxlive.com` 独立提交原始 Rich Presence。
+- Presence Bridge 使用 Microsoft 官方 `IXThreadingImpl` 驱动调用方的 `XAsyncBlock`，避免官方 XSAPI 因自定义 XUser 上下文失败而阻断游戏状态更新。
+- 增加 XSAPI 导出发现、Hook 地址、HTTP 状态码、Rich Presence 参数数量和失败原因诊断；日志不包含 Token、Authorization、Signature 或请求正文。
+- 增加 Presence JSON 结构单元测试，验证输出与 XSAPI `TitleRequest` 的 `state/activity/richPresence/id/scid/params` 格式一致。
+
+### Changed
+
+- 自定义 XUser 首次被查询时启动 Presence Bridge 后台 Hook 与发送线程；无 BMCBL 安全会话时不会启动或修改 XSAPI。
+- Presence 更新采用 latest-wins 队列，避免游戏短时间连续切换界面或世界时堆积过时请求。
+- BLoader 版本更新为 `0.2.8`。
+
+### Fixed
+
+- 修复使用 `QueryApiImpl` 替换 XUser 后，好友状态只能显示“正在玩 Minecraft”，无法显示主菜单、世界或地图等 Rich Presence 详细状态的问题。
+- 修复官方 XSAPI Presence 上下文与 BMCBL 自定义 XUser 不完全兼容时，`XblPresenceSetPresenceAsync` 异步失败并停止详细状态上报的问题。
+
+### Security
+
+- Presence Bridge 只在已验证的一次性 BMCBL XUser 会话存在时启用。
+- Xbox Token、UHS、Authorization 和 Signature 只保存在进程内临时缓冲区，并使用 `Zeroizing` 在释放时清理。
+- Bridge 仅记录公开模块名、函数地址、HTTP 状态和参数计数，不记录 XUID、Token、私钥、Authorization、Signature 或 Presence 请求正文。
+
 ## [0.2.7] - 2026-07-31
 
 ### Added
