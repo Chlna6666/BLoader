@@ -174,9 +174,12 @@ unsafe fn bootstrap() {
     if config.enable_debug_console {
         core::console::init_console();
         runtime::foundation::logging::write_bootstrap_marker("bootstrap.console.ready");
-    } else {
-        runtime::foundation::native_stdio::install_process_capture();
     }
+    // Always install the process-wide native stdout/stderr capture. With a debug
+    // console, logging writes directly to the preserved CONOUT$ handle while
+    // third-party puts/printf/std::cout output is tailed into the global logger.
+    // Without a console, the same output still reaches latest.log and DebugView.
+    runtime::foundation::native_stdio::install_process_capture();
     runtime::foundation::native_stdio::flush_pending();
     core::xuser_bridge::publish_pending_logs();
     setup_panic_hook();
@@ -212,8 +215,31 @@ unsafe fn bootstrap() {
 
     let game_dir = utils::get_exe_directory();
 
+    runtime::foundation::logging::write_bootstrap_marker("bootstrap.preloader.begin");
+    let preloader_summary = core::preloader_proxy::try_load(&game_dir);
+    runtime::foundation::native_stdio::flush_pending();
+    runtime::foundation::logging::write_bootstrap_marker(&format!(
+        "bootstrap.preloader.done discovered={} state={:?}",
+        preloader_summary.discovered,
+        preloader_summary.state,
+    ));
+
     runtime::foundation::logging::write_bootstrap_marker("bootstrap.native_preload.begin");
-    let loaded_summary = core::loader::load_native_preloads_in_dllmain(&game_dir);
+    let loaded_summary = if preloader_summary.active() {
+        logging::scoped_info_message(
+            "preloader",
+            "PreLoader proxy owns the remaining preload chain; BLoader legacy native preload pass skipped.",
+        );
+        core::loader::NativePreloadSummary::default()
+    } else {
+        if preloader_summary.failed() {
+            logging::scoped_warn_message(
+                "preloader",
+                "PreLoader priority load failed; falling back to BLoader native preload loader.",
+            );
+        }
+        core::loader::load_native_preloads_in_dllmain(&game_dir)
+    };
     runtime::foundation::logging::write_bootstrap_marker(&format!(
         "bootstrap.native_preload.done discovered={} attempted={} verified={} failed={} required_failed={}",
         loaded_summary.discovered,
