@@ -91,13 +91,13 @@ pub unsafe extern "system" fn DllMain(
 
             // BMCBL adds BLoader.dll to Minecraft's PE import table. Windows
             // documents lpvReserved != NULL for this static process-start load.
-            // Arm the OEP gate while DllMain still runs, but do not LoadLibrary
-            // any third-party code until the bootstrap thread starts after the
-            // loader lock is released.
+            // DllMain only arms the OEP gate; all immediate Mod/preload loading
+            // is executed later on Minecraft's own startup thread after the
+            // loader lock has been released.
             let static_process_attach = !reserved.is_null();
             let gate_armed = core::pre_main_gate::install_for_process_start(static_process_attach);
             runtime::foundation::logging::write_bootstrap_marker(&format!(
-                "dllmain.premain-gate static_attach={} armed={}",
+                "dllmain.premain-gate static_attach={} armed={} mode=inline-single-thread",
                 static_process_attach, gate_armed
             ));
 
@@ -126,23 +126,35 @@ pub unsafe extern "system" fn DllMain(
                 "dllmain.xuser_bridge.done",
             );
 
-            runtime::foundation::logging::write_bootstrap_marker(
-                "dllmain.preloader.deferred target=bloader-bootstrap-premain",
-            );
-
-            match thread::Builder::new()
-                .name("bloader-bootstrap".to_string())
-                .spawn(run_bootstrap_with_error_dialog)
-            {
-                Ok(_) => logging::write_bootstrap_marker("bootstrap.thread.spawn.ok"),
-                Err(error) => {
-                    logging::write_bootstrap_marker(&format!(
-                        "bootstrap.thread.spawn.failed error={error}"
-                    ));
-                    // Nothing will perform pre-main initialization now. Release
-                    // the gate so a thread-creation failure does not permanently
-                    // deadlock Minecraft at its entry point.
-                    core::pre_main_gate::release("bootstrap-thread-spawn-failed");
+            if gate_armed {
+                runtime::foundation::logging::write_bootstrap_marker(
+                    "dllmain.bootstrap.deferred target=minecraft-startup-thread-oep",
+                );
+            } else if static_process_attach {
+                // A static BMCBL launch without a working OEP gate would recreate
+                // the exact startup race this mode is intended to remove. Fail
+                // closed instead of silently falling back to a concurrent worker.
+                runtime::foundation::logging::write_bootstrap_marker(
+                    "dllmain.bootstrap.fatal reason=static-attach-premain-gate-unavailable",
+                );
+                return 0;
+            } else {
+                // Late/dynamic injection cannot provide true pre-main semantics
+                // because Minecraft may already have passed its OEP. Keep the
+                // legacy worker only as a compatibility path for that case.
+                runtime::foundation::logging::write_bootstrap_marker(
+                    "dllmain.bootstrap.fallback target=bloader-late-attach reason=no-static-oep-gate",
+                );
+                match thread::Builder::new()
+                    .name("bloader-late-attach".to_string())
+                    .spawn(run_bootstrap_late_attach)
+                {
+                    Ok(_) => logging::write_bootstrap_marker("bootstrap.late_attach.spawn.ok"),
+                    Err(error) => {
+                        logging::write_bootstrap_marker(&format!(
+                            "bootstrap.late_attach.spawn.failed error={error}"
+                        ));
+                    }
                 }
             }
         }
@@ -154,61 +166,80 @@ pub unsafe extern "system" fn DllMain(
     1
 }
 
-fn run_bootstrap_with_error_dialog() {
-    runtime::foundation::logging::write_bootstrap_marker("bootstrap.thread.start");
+/// Invoked directly by the OEP VEH on Minecraft's original startup thread.
+///
+/// At this point BLoader's DllMain has already returned and the Windows loader
+/// lock is no longer held. The entire immediate startup/loading chain therefore
+/// runs serially on the same thread that will later execute Minecraft's OEP.
+pub(crate) fn run_bootstrap_on_startup_thread() -> bool {
+    runtime::foundation::logging::write_bootstrap_marker(
+        "bootstrap.inline.start execution=minecraft-startup-thread",
+    );
+    run_bootstrap_sequence("oep-gated-startup-thread")
+}
+
+fn run_bootstrap_late_attach() {
+    runtime::foundation::logging::write_bootstrap_marker(
+        "bootstrap.thread.start execution=late-attach-worker",
+    );
+    let _ = run_bootstrap_sequence("late-attach-worker");
+}
+
+fn run_bootstrap_sequence(execution_mode: &'static str) -> bool {
     runtime::foundation::crash_report::install();
 
-    // All loader work that must happen before Minecraft executes its original
-    // entry point belongs in this first phase. The startup thread is parked at
-    // the OEP INT3 gate while this thread is free of the Windows loader lock.
-    let premain_result = panic::catch_unwind(|| unsafe { prepare_premain_preloads() });
+    let premain_result =
+        panic::catch_unwind(|| unsafe { prepare_premain_preloads(execution_mode) });
     let (preloader_summary, loaded_summary) = match premain_result {
         Ok(summary) => summary,
         Err(panic_payload) => {
             let details = panic_payload_to_string(panic_payload.as_ref());
             runtime::foundation::logging::write_bootstrap_marker(&format!(
-                "bootstrap.premain.panic {details}"
+                "bootstrap.premain.panic execution={execution_mode} {details}"
             ));
-            core::pre_main_gate::release("premain-rust-panic");
-            report_bootstrap_panic(&details);
-            return;
+            report_bootstrap_panic(&details, execution_mode);
+            return false;
         }
     };
 
-    // Critical preload initialization is complete. Only now may Minecraft's
-    // primary thread execute its original first instruction.
-    core::pre_main_gate::release("critical-preloads-ready");
-
-    if let Err(panic_payload) =
-        panic::catch_unwind(|| unsafe { bootstrap(preloader_summary, loaded_summary) })
-    {
+    if let Err(panic_payload) = panic::catch_unwind(|| unsafe {
+        bootstrap(preloader_summary, loaded_summary, execution_mode)
+    }) {
         let details = panic_payload_to_string(panic_payload.as_ref());
-        report_bootstrap_panic(&details);
+        report_bootstrap_panic(&details, execution_mode);
+        return false;
     }
+
+    runtime::foundation::logging::write_bootstrap_marker(&format!(
+        "bootstrap.sequence.complete execution={execution_mode}"
+    ));
+    true
 }
 
-unsafe fn prepare_premain_preloads() -> (
+unsafe fn prepare_premain_preloads(
+    execution_mode: &str,
+) -> (
     core::preloader_proxy::PreloaderProxySummary,
     core::loader::NativePreloadSummary,
 ) {
     let game_dir = utils::get_exe_directory();
-    runtime::foundation::logging::write_bootstrap_marker(
-        "bootstrap.preloader.premain.begin phase=oep-gated-bootstrap-thread",
-    );
+    runtime::foundation::logging::write_bootstrap_marker(&format!(
+        "bootstrap.preloader.premain.begin phase={execution_mode}"
+    ));
 
-    // PreLoader is the first third-party DLL loaded after DllMain returns. Its
-    // synchronous LoadLibrary call covers LeviLamina initialization while the
-    // Minecraft startup thread remains blocked at the OEP gate.
+    // Strict static-start path: this synchronous LoadLibrary executes on the
+    // Minecraft startup thread itself. There is no separate BLoader bootstrap
+    // worker racing the host thread while PreLoader/LeviLamina initializes.
     let preloader_summary = core::preloader_proxy::try_load(&game_dir);
     runtime::foundation::logging::write_bootstrap_marker(&format!(
-        "bootstrap.preloader.premain.done discovered={} state={:?}",
+        "bootstrap.preloader.premain.done discovered={} state={:?} execution={execution_mode}",
         preloader_summary.discovered,
         preloader_summary.state,
     ));
 
-    runtime::foundation::logging::write_bootstrap_marker(
-        "bootstrap.native_preload.premain.begin",
-    );
+    runtime::foundation::logging::write_bootstrap_marker(&format!(
+        "bootstrap.native_preload.premain.begin execution={execution_mode}"
+    ));
     let loaded_summary = if preloader_summary.active() {
         runtime::foundation::logging::write_bootstrap_marker(
             "bootstrap.native_preload.premain.delegated owner=PreLoader",
@@ -223,7 +254,7 @@ unsafe fn prepare_premain_preloads() -> (
         core::loader::load_native_preloads_in_dllmain(&game_dir)
     };
     runtime::foundation::logging::write_bootstrap_marker(&format!(
-        "bootstrap.native_preload.premain.done discovered={} attempted={} verified={} failed={} required_failed={}",
+        "bootstrap.native_preload.premain.done discovered={} attempted={} verified={} failed={} required_failed={} execution={execution_mode}",
         loaded_summary.discovered,
         loaded_summary.attempted,
         loaded_summary.verified,
@@ -237,9 +268,12 @@ unsafe fn prepare_premain_preloads() -> (
 unsafe fn bootstrap(
     preloader_summary: core::preloader_proxy::PreloaderProxySummary,
     loaded_summary: core::loader::NativePreloadSummary,
+    execution_mode: &'static str,
 ) {
     let start_time = Instant::now();
-    runtime::foundation::logging::write_bootstrap_marker("bootstrap.begin");
+    runtime::foundation::logging::write_bootstrap_marker(&format!(
+        "bootstrap.begin execution={execution_mode}"
+    ));
 
     let config = config::Config::load();
     config::ensure_config_watcher();
@@ -258,9 +292,10 @@ unsafe fn bootstrap(
         runtime::foundation::logging::write_bootstrap_marker("bootstrap.console.ready");
     }
 
-    // The process-wide capture is installed only after all pre-main loaders have
-    // completed and Minecraft's OEP has been released. PreLoader itself is never
-    // wrapped in the temporary per-library CRT redirection path.
+    // Process-wide capture is installed only after PreLoader/delegated preloads
+    // complete. In the strict static-start path this still happens before the
+    // original Minecraft OEP resumes, but never while a third-party DllMain is
+    // actively executing.
     runtime::foundation::native_stdio::install_process_capture();
     runtime::foundation::native_stdio::flush_pending();
     core::xuser_bridge::publish_pending_logs();
@@ -294,24 +329,28 @@ unsafe fn bootstrap(
     logging::info_message(
         "Runtime profile: lightweight | panel=off | ArcUI=not-compiled | symbols=not-compiled | i18n=embedded",
     );
+    logging::scoped_info_message(
+        "bootstrap",
+        &format!("Immediate startup execution mode: {execution_mode}"),
+    );
 
     match preloader_summary.state {
         core::preloader_proxy::PreloaderProxyState::Loaded => {
             logging::scoped_info_message(
                 "preloader",
-                "PreLoader and its delegated preload chain completed behind the Pre-Main Gate before Minecraft OEP execution.",
+                "PreLoader and its delegated preload chain completed synchronously before Minecraft OEP execution.",
             );
         }
         core::preloader_proxy::PreloaderProxyState::Failed => {
             logging::scoped_warn_message(
                 "preloader",
-                "Priority PreLoader failed; BLoader completed the legacy native preload fallback before releasing Minecraft OEP.",
+                "Priority PreLoader failed; BLoader completed the legacy native preload fallback before Minecraft OEP execution.",
             );
         }
         core::preloader_proxy::PreloaderProxyState::NotFound => {
             logging::scoped_debug_message(
                 "preloader",
-                "No type=preload PreLoader.dll package was found; legacy native preloads were handled before Minecraft OEP release.",
+                "No type=preload PreLoader.dll package was found; legacy native preloads were handled before Minecraft OEP execution.",
             );
         }
     }
@@ -319,7 +358,8 @@ unsafe fn bootstrap(
     logging::scoped_info_message(
         "premain-gate",
         &format!(
-            "Critical preload phase completed before Minecraft main | native_discovered={} attempted={} verified={} failed={} required_failed={}",
+            "Critical preload phase completed before Minecraft main | execution={} native_discovered={} attempted={} verified={} failed={} required_failed={}",
+            execution_mode,
             loaded_summary.discovered,
             loaded_summary.attempted,
             loaded_summary.verified,
@@ -388,9 +428,13 @@ unsafe fn bootstrap(
     if config.disable_mod_loading {
         logging::info_message("Mod loading disabled by config.");
     } else {
-        runtime::foundation::logging::write_bootstrap_marker("bootstrap.mods.load.begin");
+        runtime::foundation::logging::write_bootstrap_marker(&format!(
+            "bootstrap.mods.load.begin execution={execution_mode} serial=true"
+        ));
         core::loader::load_mods(&game_dir);
-        runtime::foundation::logging::write_bootstrap_marker("bootstrap.mods.load.done");
+        runtime::foundation::logging::write_bootstrap_marker(&format!(
+            "bootstrap.mods.load.done execution={execution_mode} serial=true"
+        ));
         bl::host::dispatch_bootstrap_complete();
     }
 
@@ -406,14 +450,14 @@ unsafe fn bootstrap(
     }
 }
 
-fn report_bootstrap_panic(details: &str) {
+fn report_bootstrap_panic(details: &str, execution_mode: &str) {
     let message = format!("BLoader failed during startup.\n\n{details}");
     runtime::foundation::logging::emergency_error_message(
         "loader",
-        &format!("Bootstrap thread panic: {details}"),
+        &format!("Bootstrap panic execution={execution_mode}: {details}"),
     );
     runtime::foundation::logging::write_bootstrap_marker(&format!(
-        "bootstrap.thread.panic {details}"
+        "bootstrap.panic execution={execution_mode} {details}"
     ));
     runtime::foundation::error_dialog::show_fatal_error("BLoader Startup Error", &message);
 }
