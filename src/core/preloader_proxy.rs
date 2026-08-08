@@ -7,7 +7,7 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows::core::PCWSTR;
 
-use crate::runtime::foundation::{crash_report, logging, mod_diagnostics, native_stdio};
+use crate::runtime::foundation::{crash_report, logging, mod_diagnostics};
 
 const PRELOAD_TYPE: &str = "preload";
 const PRELOADER_DLL: &str = "PreLoader.dll";
@@ -87,6 +87,7 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
             detail: "no type=preload package with entry PreLoader.dll was found",
             elapsed_ms: started.elapsed().as_millis(),
         });
+        logging::write_bootstrap_marker("preloader.early.not_found");
         return PreloaderProxySummary {
             discovered: 0,
             state: PreloaderProxyState::NotFound,
@@ -94,6 +95,11 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
     }
 
     if candidates.len() > 1 {
+        logging::write_bootstrap_marker(&format!(
+            "preloader.early.multiple count={} selected={}",
+            candidates.len(),
+            candidates[0].path.display()
+        ));
         logging::scoped_warn_message(
             "preloader",
             &format!(
@@ -117,7 +123,7 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
     );
 
     logging::write_bootstrap_marker(&format!(
-        "preloader.priority.detected name={} path={} type={}",
+        "preloader.priority.detected name={} path={} type={} phase=bootstrap-thread-first",
         candidate.name,
         expected.display(),
         PRELOAD_TYPE
@@ -136,6 +142,11 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
         if paths_equivalent(&expected, &resolved) {
             mod_diagnostics::mark_loaded(&identity, module.0 as usize, "preloader_preexisting");
             let detail = "PreLoader was already loaded from the requested package; proxy ownership accepted";
+            logging::write_bootstrap_marker(&format!(
+                "preloader.priority.preexisting module=0x{:X} path={}",
+                module.0 as usize,
+                resolved.display()
+            ));
             logging::scoped_info_message(
                 "preloader",
                 &format!(
@@ -165,6 +176,7 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
         );
         mod_diagnostics::mark_failed(&identity, "preloader_collision", &detail);
         logging::scoped_error_message("preloader", &detail);
+        logging::write_bootstrap_marker(&format!("preloader.priority.collision {detail}"));
         publish_status(ProxyStatus {
             state: "failed",
             discovered,
@@ -179,17 +191,25 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
         };
     }
 
-    mod_diagnostics::mark_loading(&identity, "preloader_priority");
+    mod_diagnostics::mark_loading(&identity, "preloader_priority_early");
+    logging::write_bootstrap_marker(&format!(
+        "preloader.priority.load.begin path={} capture=process-crt-disabled",
+        expected.display()
+    ));
+
+    // PreLoader is a bootstrap loader, not an ordinary native Mod. It must run
+    // before BLoader installs process-wide stdout/stderr capture. Do not wrap
+    // this LoadLibraryW call in capture_library_load(), because that function
+    // temporarily rewires process-global Win32 and CRT stdout/stderr handles.
+    // PreLoader/LeviLamina performs delay-load remapping and loader work during
+    // initialization; changing global CRT state around that work can race the
+    // already-starting Minecraft process.
     let load_result = {
-        let _scope = mod_diagnostics::enter_scope(&identity, "LoadLibrary:preloader_priority");
-        unsafe {
-            native_stdio::capture_library_load(&identity, "preloader_priority", || {
-                let wide = wide_null(expected.as_os_str());
-                LoadLibraryW(PCWSTR(wide.as_ptr()))
-            })
-        }
+        let _scope = mod_diagnostics::enter_scope(&identity, "LoadLibrary:preloader_priority_early");
+        let wide = wide_null(expected.as_os_str());
+        LoadLibraryW(PCWSTR(wide.as_ptr()))
     };
-    crash_report::rearm_unhandled_filter("after-preloader-priority-load");
+    crash_report::rearm_unhandled_filter("after-preloader-priority-early-load");
 
     match load_result {
         Ok(module) => {
@@ -202,6 +222,9 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
                 );
                 mod_diagnostics::mark_failed(&identity, "preloader_path_verification", &detail);
                 logging::scoped_error_message("preloader", &detail);
+                logging::write_bootstrap_marker(&format!(
+                    "preloader.priority.path_mismatch {detail}"
+                ));
                 publish_status(ProxyStatus {
                     state: "failed",
                     discovered,
@@ -216,8 +239,8 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
                 };
             }
 
-            mod_diagnostics::mark_loaded(&identity, module.0 as usize, "preloader_priority");
-            let detail = "PreLoader loaded successfully; remaining preload modules are delegated to PreLoader";
+            mod_diagnostics::mark_loaded(&identity, module.0 as usize, "preloader_priority_early");
+            let detail = "PreLoader loaded successfully during earliest bootstrap-thread phase; remaining preload modules are delegated to PreLoader";
             logging::scoped_info_message(
                 "preloader",
                 &format!(
@@ -227,9 +250,10 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
                 ),
             );
             logging::write_bootstrap_marker(&format!(
-                "preloader.priority.active module=0x{:X} path={} delegate_remaining=true",
+                "preloader.priority.active module=0x{:X} path={} elapsed_ms={} delegate_remaining=true phase=bootstrap-thread-first",
                 module.0 as usize,
-                resolved.display()
+                resolved.display(),
+                started.elapsed().as_millis()
             ));
             publish_status(ProxyStatus {
                 state: "loaded",
@@ -260,7 +284,7 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
                 ),
             );
             logging::write_bootstrap_marker(&format!(
-                "preloader.priority.failed path={} detail={}",
+                "preloader.priority.failed path={} detail={} phase=bootstrap-thread-first",
                 expected.display(),
                 detail
             ));
