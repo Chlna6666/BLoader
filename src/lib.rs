@@ -114,10 +114,11 @@ pub unsafe extern "system" fn DllMain(
                 "dllmain.xuser_bridge.done",
             );
 
-            // Third-party native modules are deliberately deferred until after
-            // the authenticated session buffer has been imported and cleared.
+            // Do not LoadLibrary third-party code while DllMain still owns the
+            // Windows loader lock. The bootstrap thread runs immediately after
+            // DllMain returns and makes PreLoader its first loading operation.
             runtime::foundation::logging::write_bootstrap_marker(
-                "dllmain.native_preload.deferred reason=xuser_security_boundary",
+                "dllmain.preloader.deferred target=bloader-bootstrap-first",
             );
 
             match thread::Builder::new()
@@ -141,7 +142,25 @@ pub unsafe extern "system" fn DllMain(
 fn run_bootstrap_with_error_dialog() {
     runtime::foundation::logging::write_bootstrap_marker("bootstrap.thread.start");
     runtime::foundation::crash_report::install();
-    if let Err(panic_payload) = panic::catch_unwind(|| unsafe { bootstrap() }) {
+
+    // PreLoader is intentionally the first third-party load performed by the
+    // bootstrap thread. At this point BLoader has not loaded config, allocated a
+    // debug console, rebound process CRT stdout/stderr, installed graphics or
+    // network hooks, or loaded ordinary Mods.
+    let game_dir = utils::get_exe_directory();
+    runtime::foundation::logging::write_bootstrap_marker(
+        "bootstrap.preloader.early.begin phase=bootstrap-thread-first",
+    );
+    let preloader_summary = unsafe { core::preloader_proxy::try_load(&game_dir) };
+    runtime::foundation::logging::write_bootstrap_marker(&format!(
+        "bootstrap.preloader.early.done discovered={} state={:?}",
+        preloader_summary.discovered,
+        preloader_summary.state,
+    ));
+
+    if let Err(panic_payload) =
+        panic::catch_unwind(|| unsafe { bootstrap(preloader_summary) })
+    {
         let details = panic_payload_to_string(panic_payload.as_ref());
         let message = format!("BLoader failed during startup.\n\n{details}");
         runtime::foundation::logging::emergency_error_message(
@@ -155,7 +174,7 @@ fn run_bootstrap_with_error_dialog() {
     }
 }
 
-unsafe fn bootstrap() {
+unsafe fn bootstrap(preloader_summary: core::preloader_proxy::PreloaderProxySummary) {
     let start_time = Instant::now();
     runtime::foundation::logging::write_bootstrap_marker("bootstrap.begin");
 
@@ -175,10 +194,11 @@ unsafe fn bootstrap() {
         core::console::init_console();
         runtime::foundation::logging::write_bootstrap_marker("bootstrap.console.ready");
     }
-    // Always install the process-wide native stdout/stderr capture. With a debug
-    // console, logging writes directly to the preserved CONOUT$ handle while
-    // third-party puts/printf/std::cout output is tailed into the global logger.
-    // Without a console, the same output still reaches latest.log and DebugView.
+
+    // Process-wide capture is deliberately installed only after the priority
+    // PreLoader has finished its early initialization. This avoids changing
+    // Win32/CRT stdout and stderr handles while PreLoader performs delay-load,
+    // symbol remapping and loader initialization.
     runtime::foundation::native_stdio::install_process_capture();
     runtime::foundation::native_stdio::flush_pending();
     core::xuser_bridge::publish_pending_logs();
@@ -213,16 +233,28 @@ unsafe fn bootstrap() {
         "Runtime profile: lightweight | panel=off | ArcUI=not-compiled | symbols=not-compiled | i18n=embedded",
     );
 
-    let game_dir = utils::get_exe_directory();
+    match preloader_summary.state {
+        core::preloader_proxy::PreloaderProxyState::Loaded => {
+            logging::scoped_info_message(
+                "preloader",
+                "PreLoader completed in bootstrap-thread-first phase before config console and global stdio capture; remaining preload chain delegated to PreLoader.",
+            );
+        }
+        core::preloader_proxy::PreloaderProxyState::Failed => {
+            logging::scoped_warn_message(
+                "preloader",
+                "Early PreLoader load failed; BLoader will use the legacy native preload fallback.",
+            );
+        }
+        core::preloader_proxy::PreloaderProxyState::NotFound => {
+            logging::scoped_debug_message(
+                "preloader",
+                "No type=preload PreLoader.dll package was discovered during early bootstrap.",
+            );
+        }
+    }
 
-    runtime::foundation::logging::write_bootstrap_marker("bootstrap.preloader.begin");
-    let preloader_summary = core::preloader_proxy::try_load(&game_dir);
-    runtime::foundation::native_stdio::flush_pending();
-    runtime::foundation::logging::write_bootstrap_marker(&format!(
-        "bootstrap.preloader.done discovered={} state={:?}",
-        preloader_summary.discovered,
-        preloader_summary.state,
-    ));
+    let game_dir = utils::get_exe_directory();
 
     runtime::foundation::logging::write_bootstrap_marker("bootstrap.native_preload.begin");
     let loaded_summary = if preloader_summary.active() {
