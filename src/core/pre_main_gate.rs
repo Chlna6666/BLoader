@@ -15,19 +15,16 @@ const IMAGE_NT_OPTIONAL_HDR32_MAGIC: u16 = 0x10B;
 const IMAGE_NT_OPTIONAL_HDR64_MAGIC: u16 = 0x20B;
 const EXCEPTION_BREAKPOINT_CODE: u32 = 0x8000_0003;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
-const WAIT_OBJECT_0: u32 = 0;
-const PREMAIN_TIMEOUT_MS: u32 = 90_000;
-const PREMAIN_TIMEOUT_EXIT_CODE: u32 = 0xE016_0001;
+const PREMAIN_FAILURE_EXIT_CODE: u32 = 0xE017_0001;
 
 static ENTRY_POINT: AtomicUsize = AtomicUsize::new(0);
-static READY_EVENT: AtomicUsize = AtomicUsize::new(0);
 static STARTUP_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static ORIGINAL_BYTE: AtomicU8 = AtomicU8::new(0);
 static GATE_ARMED: AtomicBool = AtomicBool::new(false);
 static BYTE_RESTORED: AtomicBool = AtomicBool::new(false);
-static RELEASE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static GATE_HIT: AtomicBool = AtomicBool::new(false);
-static GATE_TIMED_OUT: AtomicBool = AtomicBool::new(false);
+static BOOTSTRAP_STARTED: AtomicBool = AtomicBool::new(false);
+static BOOTSTRAP_COMPLETED: AtomicBool = AtomicBool::new(false);
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -50,27 +47,21 @@ unsafe extern "system" {
     fn get_current_process() -> *mut c_void;
     #[link_name = "GetCurrentThreadId"]
     fn get_current_thread_id() -> u32;
-    #[link_name = "CreateEventW"]
-    fn create_event_w(
-        event_attributes: *const c_void,
-        manual_reset: i32,
-        initial_state: i32,
-        name: *const u16,
-    ) -> *mut c_void;
-    #[link_name = "SetEvent"]
-    fn set_event(event: *mut c_void) -> i32;
-    #[link_name = "WaitForSingleObject"]
-    fn wait_for_single_object(handle: *mut c_void, milliseconds: u32) -> u32;
     #[link_name = "TerminateProcess"]
     fn terminate_process(process: *mut c_void, exit_code: u32) -> i32;
 }
 
 /// Arms a one-byte INT3 gate at the host executable's original entry point.
 ///
-/// BLoader is statically imported by the BMCBL PE patch. During that startup path
-/// `DllMain` runs under the Windows loader lock before Minecraft's OEP. We only
-/// install the gate there; third-party DLL loading remains deferred to the
-/// `bloader-bootstrap` thread after `DllMain` returns and the loader lock is free.
+/// BLoader is statically imported by the BMCBL PE patch. `DllMain` only installs
+/// this gate while the Windows loader lock is held. No third-party DLL is loaded
+/// from `DllMain`.
+///
+/// When the startup thread later reaches Minecraft's OEP, the loader lock has
+/// already been released. The VEH restores the original byte and runs BLoader's
+/// complete immediate startup/loading sequence synchronously on that same startup
+/// thread. Only after the sequence returns successfully does execution resume at
+/// the original OEP.
 ///
 /// Dynamic `LoadLibrary` injection is intentionally excluded because the host OEP
 /// may already have executed by the time BLoader is attached.
@@ -105,26 +96,18 @@ pub unsafe fn install_for_process_start(static_process_attach: bool) -> bool {
         return false;
     }
 
-    let ready_event = create_event_w(ptr::null(), 1, 0, ptr::null());
-    if ready_event.is_null() {
-        logging::write_bootstrap_marker("premain-gate.install.failed reason=create-event");
-        return false;
-    }
-
     ENTRY_POINT.store(entry_point, Ordering::Release);
     ORIGINAL_BYTE.store(original_byte, Ordering::Release);
-    READY_EVENT.store(ready_event as usize, Ordering::Release);
     STARTUP_THREAD_ID.store(get_current_thread_id(), Ordering::Release);
-    RELEASE_REQUESTED.store(false, Ordering::Release);
     BYTE_RESTORED.store(false, Ordering::Release);
     GATE_HIT.store(false, Ordering::Release);
-    GATE_TIMED_OUT.store(false, Ordering::Release);
+    BOOTSTRAP_STARTED.store(false, Ordering::Release);
+    BOOTSTRAP_COMPLETED.store(false, Ordering::Release);
 
     let handler = AddVectoredExceptionHandler(1, Some(pre_main_vectored_handler));
     if handler.is_null() {
         logging::write_bootstrap_marker("premain-gate.install.failed reason=veh-install");
         ENTRY_POINT.store(0, Ordering::Release);
-        READY_EVENT.store(0, Ordering::Release);
         return false;
     }
 
@@ -133,45 +116,15 @@ pub unsafe fn install_for_process_start(static_process_attach: bool) -> bool {
             "premain-gate.install.failed reason=oep-patch oep=0x{entry_point:X}"
         ));
         ENTRY_POINT.store(0, Ordering::Release);
-        READY_EVENT.store(0, Ordering::Release);
         return false;
     }
 
     GATE_ARMED.store(true, Ordering::Release);
     logging::write_bootstrap_marker(&format!(
-        "premain-gate.armed mode=oep-int3 oep=0x{entry_point:X} startup_thread={} timeout_ms={PREMAIN_TIMEOUT_MS}",
+        "premain-gate.armed mode=oep-int3-inline-single-thread oep=0x{entry_point:X} startup_thread={}",
         STARTUP_THREAD_ID.load(Ordering::Acquire),
     ));
     true
-}
-
-/// Releases Minecraft's OEP after all critical pre-main preload work is complete.
-///
-/// The OEP byte is restored by the VEH on the startup thread immediately when the
-/// breakpoint is hit. The thread then waits on this event and resumes from the
-/// original first instruction only after this function signals readiness.
-pub fn release(reason: &str) {
-    if !GATE_ARMED.load(Ordering::Acquire) {
-        logging::write_bootstrap_marker(&format!(
-            "premain-gate.release.skipped reason={reason} armed=false"
-        ));
-        return;
-    }
-
-    RELEASE_REQUESTED.store(true, Ordering::Release);
-    let event = READY_EVENT.load(Ordering::Acquire) as *mut c_void;
-    if !event.is_null() {
-        unsafe {
-            let _ = set_event(event);
-        }
-    }
-
-    logging::write_bootstrap_marker(&format!(
-        "premain-gate.release reason={reason} hit={} byte_restored={} timed_out={}",
-        GATE_HIT.load(Ordering::Acquire),
-        BYTE_RESTORED.load(Ordering::Acquire),
-        GATE_TIMED_OUT.load(Ordering::Acquire),
-    ));
 }
 
 pub fn is_armed() -> bool {
@@ -199,7 +152,8 @@ unsafe extern "system" fn pre_main_vectored_handler(
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    if get_current_thread_id() != STARTUP_THREAD_ID.load(Ordering::Acquire) {
+    let current_thread_id = get_current_thread_id();
+    if current_thread_id != STARTUP_THREAD_ID.load(Ordering::Acquire) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
@@ -211,31 +165,43 @@ unsafe extern "system" fn pre_main_vectored_handler(
     {
         let original = ORIGINAL_BYTE.load(Ordering::Acquire);
         if !write_code_byte(entry_point, original) {
-            // Continuing from OEP while the INT3 is still present would recurse
-            // into this handler forever, so terminate instead of corrupting the
-            // startup sequence.
-            GATE_TIMED_OUT.store(true, Ordering::Release);
-            let _ = terminate_process(get_current_process(), PREMAIN_TIMEOUT_EXIT_CODE);
+            logging::write_bootstrap_marker(&format!(
+                "premain-gate.restore.failed oep=0x{entry_point:X} thread={current_thread_id}"
+            ));
+            let _ = terminate_process(get_current_process(), PREMAIN_FAILURE_EXIT_CODE);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
 
-    if !RELEASE_REQUESTED.load(Ordering::Acquire) {
-        let event = READY_EVENT.load(Ordering::Acquire) as *mut c_void;
-        let wait_result = if event.is_null() {
-            u32::MAX
-        } else {
-            wait_for_single_object(event, PREMAIN_TIMEOUT_MS)
-        };
-        if wait_result != WAIT_OBJECT_0 {
-            GATE_TIMED_OUT.store(true, Ordering::Release);
-            // Fail closed. Allowing Minecraft to continue while a bootstrap
-            // loader is still replacing allocator/hooks recreates the exact
-            // cross-allocator race this gate exists to prevent.
-            let _ = terminate_process(get_current_process(), PREMAIN_TIMEOUT_EXIT_CODE);
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
+    if BOOTSTRAP_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        logging::write_bootstrap_marker(&format!(
+            "premain-gate.reentry.blocked oep=0x{entry_point:X} thread={current_thread_id}"
+        ));
+        let _ = terminate_process(get_current_process(), PREMAIN_FAILURE_EXIT_CODE);
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
+
+    // The INT3 byte has already been restored. Disable the gate before invoking
+    // third-party code so nested exceptions raised by a preload are never
+    // mistaken for a second OEP gate hit.
+    GATE_ARMED.store(false, Ordering::Release);
+    logging::write_bootstrap_marker(&format!(
+        "premain-gate.hit execution=inline-single-thread oep=0x{entry_point:X} thread={current_thread_id}"
+    ));
+
+    let bootstrap_ok = crate::run_bootstrap_on_startup_thread();
+    if !bootstrap_ok {
+        logging::write_bootstrap_marker(&format!(
+            "premain-gate.bootstrap.failed thread={current_thread_id}"
+        ));
+        let _ = terminate_process(get_current_process(), PREMAIN_FAILURE_EXIT_CODE);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    BOOTSTRAP_COMPLETED.store(true, Ordering::Release);
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -244,11 +210,15 @@ unsafe extern "system" fn pre_main_vectored_handler(
 
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = terminate_process(get_current_process(), PREMAIN_TIMEOUT_EXIT_CODE);
+        let _ = terminate_process(get_current_process(), PREMAIN_FAILURE_EXIT_CODE);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
-    GATE_ARMED.store(false, Ordering::Release);
+    logging::write_bootstrap_marker(&format!(
+        "premain-gate.complete execution=inline-single-thread oep=0x{entry_point:X} thread={current_thread_id} byte_restored={} bootstrap_completed={}",
+        BYTE_RESTORED.load(Ordering::Acquire),
+        BOOTSTRAP_COMPLETED.load(Ordering::Acquire),
+    ));
     EXCEPTION_CONTINUE_EXECUTION
 }
 
@@ -268,8 +238,7 @@ unsafe fn write_code_byte(address: usize, value: u8) -> bool {
     let _ = flush_instruction_cache(get_current_process(), address as *const c_void, 1);
 
     let mut ignored = 0u32;
-    let restored = virtual_protect(address as *mut c_void, 1, old_protect, &mut ignored) != 0;
-    restored
+    virtual_protect(address as *mut c_void, 1, old_protect, &mut ignored) != 0
 }
 
 unsafe fn pe_entry_point(image_base: usize) -> Option<usize> {
