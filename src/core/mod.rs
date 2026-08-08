@@ -2,6 +2,7 @@ pub mod console;
 pub mod file_redirection;
 pub mod loader;
 pub mod network_hook;
+pub mod pre_main_gate;
 pub mod preloader_proxy;
 #[path = "xuser_bridge/mod.rs"]
 pub mod xuser_bridge;
