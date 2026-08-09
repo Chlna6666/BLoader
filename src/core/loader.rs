@@ -1,23 +1,20 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ffi::CString;
-use std::os::windows::ffi::OsStrExt;
 use std::fs::{self};
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::LibraryLoader::{
     GetModuleHandleW, GetProcAddress, LoadLibraryA, LoadLibraryW,
 };
-use windows::Win32::System::Threading::GetCurrentProcessId;
-use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GetClientRect, GetWindow, GetWindowThreadProcessId, IsWindowVisible,
-};
-use windows::core::{BOOL, PCSTR, PCWSTR};
+use windows::core::{PCSTR, PCWSTR};
 
 use crate::bl;
+use crate::core::runtime_ready::{self, ReadyLevel};
 use crate::runtime::foundation::{crash_report, logging, mod_diagnostics, native_stdio};
 
 #[derive(Serialize, Deserialize)]
@@ -39,8 +36,14 @@ struct ModManifest {
     api_version: Option<u32>,
     #[serde(default)]
     inject_delay_ms: Option<u64>,
+    /// Deprecated compatibility field. BLoader 0.2.19+ no longer counts
+    /// graphics frames or installs a Present hook for delayed Mod loading.
     #[serde(default)]
     inject_min_frames: Option<usize>,
+    /// Runtime readiness required before a hot Mod may load.
+    /// Supported values: process, window, stable-window.
+    #[serde(default)]
+    inject_ready: Option<String>,
     #[serde(default)]
     requires_symbol_pack: bool,
     #[serde(default)]
@@ -90,7 +93,7 @@ struct HotMod {
     dll_path: PathBuf,
     log_aliases: Vec<String>,
     inject_delay_ms: u64,
-    inject_min_frames: usize,
+    ready_level: ReadyLevel,
     required: bool,
     verify_exports: Vec<String>,
     verify_modules: Vec<String>,
@@ -124,7 +127,6 @@ const MOD_TYPE_HOT_INJECT: &str = "hot-inject";
 const MOD_TYPE_BL: &str = "BL";
 
 const HOT_INJECT_DEFAULT_DELAY_MS: u64 = 15_000;
-const HOT_INJECT_DEFAULT_MIN_FRAMES: usize = 60;
 const HOT_INJECT_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
 
 static LOADED_DLL_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -468,7 +470,14 @@ unsafe fn load_and_verify_native(
             mod_diagnostics::record_lifecycle(
                 &identity,
                 "native_entry_call",
-                &format!("phase={phase} api_preference={}", if prefer_load_library_a { "LoadLibraryA" } else { "LoadLibraryW" }),
+                &format!(
+                    "phase={phase} api_preference={}",
+                    if prefer_load_library_a {
+                        "LoadLibraryA"
+                    } else {
+                        "LoadLibraryW"
+                    }
+                ),
             );
             unsafe {
                 native_stdio::capture_library_load(&identity, phase, || {
@@ -1001,7 +1010,7 @@ fn discover_packaged_mod(entry_path: &Path, discovered: &mut DiscoveredMods) {
         return;
     }
 
-    let id = manifest.id.unwrap_or_else(|| manifest.name.clone());
+    let id = manifest.id.clone().unwrap_or_else(|| manifest.name.clone());
     let kind = manifest.mod_type.clone();
     match manifest.mod_type.as_str() {
         MOD_TYPE_BL => discovered.bl.push(BlMod {
@@ -1016,24 +1025,36 @@ fn discover_packaged_mod(entry_path: &Path, discovered: &mut DiscoveredMods) {
             requires_symbol_pack: manifest.requires_symbol_pack,
             required_symbols: manifest.required_symbols,
         }),
-        MOD_TYPE_HOT_NATIVE | MOD_TYPE_HOT_INJECT => discovered.hot.push(HotMod {
-            id,
-            name: manifest.name,
-            version: manifest.version,
-            kind,
-            dll_path,
-            log_aliases: manifest.log_aliases,
-            inject_delay_ms: manifest
-                .inject_delay_ms
-                .unwrap_or(HOT_INJECT_DEFAULT_DELAY_MS),
-            inject_min_frames: manifest
-                .inject_min_frames
-                .unwrap_or(HOT_INJECT_DEFAULT_MIN_FRAMES),
-            required: manifest.required,
-            verify_exports: manifest.verify_exports,
-            verify_modules: manifest.verify_modules,
-            notify_success: manifest.notify_success,
-        }),
+        MOD_TYPE_HOT_NATIVE | MOD_TYPE_HOT_INJECT => {
+            let ready_level = resolve_hot_ready_level(&manifest);
+            if let Some(frames) = manifest.inject_min_frames {
+                logging::scoped_warn_message(
+                    "runtime-ready",
+                    &format!(
+                        "mod={} deprecated inject_min_frames={} ignored; readiness={} graphics_hooks=disabled",
+                        manifest.name,
+                        frames,
+                        ready_level.as_str()
+                    ),
+                );
+            }
+            discovered.hot.push(HotMod {
+                id,
+                name: manifest.name,
+                version: manifest.version,
+                kind,
+                dll_path,
+                log_aliases: manifest.log_aliases,
+                inject_delay_ms: manifest
+                    .inject_delay_ms
+                    .unwrap_or(HOT_INJECT_DEFAULT_DELAY_MS),
+                ready_level,
+                required: manifest.required,
+                verify_exports: manifest.verify_exports,
+                verify_modules: manifest.verify_modules,
+                notify_success: manifest.notify_success,
+            });
+        }
         _ => discovered.preload.push(PreloadMod {
             id,
             name: manifest.name,
@@ -1047,6 +1068,33 @@ fn discover_packaged_mod(entry_path: &Path, discovered: &mut DiscoveredMods) {
             notify_success: manifest.notify_success,
         }),
     }
+}
+
+fn resolve_hot_ready_level(manifest: &ModManifest) -> ReadyLevel {
+    let default = if manifest.mod_type == MOD_TYPE_HOT_NATIVE {
+        ReadyLevel::Window
+    } else {
+        ReadyLevel::StableWindow
+    };
+
+    let Some(configured) = manifest.inject_ready.as_deref() else {
+        return default;
+    };
+
+    if let Some(level) = ReadyLevel::from_manifest(configured) {
+        return level;
+    }
+
+    logging::scoped_warn_message(
+        "runtime-ready",
+        &format!(
+            "mod={} invalid inject_ready={} fallback={} supported=process|window|stable-window",
+            manifest.name,
+            configured,
+            default.as_str()
+        ),
+    );
+    default
 }
 
 fn parse_manifest_json(text: &str) -> Result<ModManifest, serde_json::Error> {
@@ -1116,6 +1164,7 @@ fn package_loose_dll(mods_dir: &Path, entry_path: &Path) -> Option<PreloadMod> {
             api_version: None,
             inject_delay_ms: None,
             inject_min_frames: None,
+            inject_ready: None,
             requires_symbol_pack: false,
             required_symbols: Vec::new(),
             required: false,
@@ -1257,142 +1306,74 @@ fn spawn_hot_mod_loader(mut hot_mods: Vec<HotMod>) {
         return;
     }
 
-    thread::spawn(move || {
-        logging::info_message(&format!(
-            "Hot inject queued: {} mod(s); waiting for graphics readiness signal.",
-            hot_mods.len()
-        ));
-
-        let graphics_ready = crate::core::render_signal::wait_for_frame(1, HOT_INJECT_WAIT_TIMEOUT);
-        let inject_base = Instant::now();
-        if graphics_ready {
-            logging::info_message("First real Present observed; delayed Mod loading is now armed.");
-        } else if wait_for_render_ready(Duration::from_secs(5)) {
-            logging::warn_message(
-                "Present signal timed out; visible game window fallback accepted for hot injection.",
+    let _ = thread::Builder::new()
+        .name("bloader-hot-mod-loader".to_string())
+        .spawn(move || {
+            logging::scoped_info_message(
+                "runtime-ready",
+                &format!(
+                    "hot Mod queue={} mode=oep+window-stability graphics_hooks=disabled",
+                    hot_mods.len()
+                ),
             );
-        } else {
-            logging::warn_message(
-                "Graphics/window readiness timed out; continuing hot injection with configured delays.",
-            );
-        }
 
-        hot_mods.sort_by(|a, b| {
-            a.inject_delay_ms
-                .cmp(&b.inject_delay_ms)
-                .then_with(|| a.inject_min_frames.cmp(&b.inject_min_frames))
-                .then_with(|| a.name.cmp(&b.name))
-        });
+            hot_mods.sort_by(|a, b| {
+                a.inject_delay_ms
+                    .cmp(&b.inject_delay_ms)
+                    .then_with(|| a.ready_level.cmp(&b.ready_level))
+                    .then_with(|| a.name.cmp(&b.name))
+            });
 
-        for hot_mod in hot_mods {
-            if graphics_ready && hot_mod.inject_min_frames > 1 {
-                let _ = crate::core::render_signal::wait_for_frame(
-                    hot_mod.inject_min_frames as u64,
-                    HOT_INJECT_WAIT_TIMEOUT,
-                );
+            for hot_mod in hot_mods {
+                let readiness_reached =
+                    runtime_ready::wait_for(hot_mod.ready_level, HOT_INJECT_WAIT_TIMEOUT);
+                runtime_ready::wait_until_oep_delay(hot_mod.inject_delay_ms);
+
+                if !readiness_reached {
+                    logging::scoped_warn_message(
+                        "runtime-ready",
+                        &format!(
+                            "mod={} readiness={} timed out; continuing for compatibility after configured delay",
+                            hot_mod.name,
+                            hot_mod.ready_level.as_str()
+                        ),
+                    );
+                }
+
+                logging::info_message(&format!(
+                    "Hot Loading Mod: {} <{}> readiness={} readiness_reached={} delay_from_oep={}ms graphics_hooks=disabled",
+                    hot_mod.name,
+                    hot_mod
+                        .dll_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy(),
+                    hot_mod.ready_level.as_str(),
+                    readiness_reached,
+                    hot_mod.inject_delay_ms,
+                ));
+                let native_mod = PreloadMod {
+                    id: hot_mod.id.clone(),
+                    name: hot_mod.name.clone(),
+                    version: hot_mod.version.clone(),
+                    kind: hot_mod.kind.clone(),
+                    dll_path: hot_mod.dll_path.clone(),
+                    log_aliases: hot_mod.log_aliases.clone(),
+                    required: hot_mod.required,
+                    verify_exports: hot_mod.verify_exports.clone(),
+                    verify_modules: hot_mod.verify_modules.clone(),
+                    notify_success: hot_mod.notify_success,
+                };
+                unsafe { load_library(&native_mod, "hot_inject", false) };
             }
-            wait_until_delay(inject_base, hot_mod.inject_delay_ms);
-
-            logging::info_message(&format!(
-                "Hot Loading Mod: {} <{}> after frame={} delay={}ms",
-                hot_mod.name,
-                hot_mod.dll_path.file_name().unwrap_or_default().to_string_lossy(),
-                crate::core::render_signal::frame_count(),
-                hot_mod.inject_delay_ms,
-            ));
-            let native_mod = PreloadMod {
-                id: hot_mod.id.clone(),
-                name: hot_mod.name.clone(),
-                version: hot_mod.version.clone(),
-                kind: hot_mod.kind.clone(),
-                dll_path: hot_mod.dll_path.clone(),
-                log_aliases: hot_mod.log_aliases.clone(),
-                required: hot_mod.required,
-                verify_exports: hot_mod.verify_exports.clone(),
-                verify_modules: hot_mod.verify_modules.clone(),
-                notify_success: hot_mod.notify_success,
-            };
-            unsafe { load_library(&native_mod, "hot_inject", false) };
-        }
-    });
-}
-
-fn wait_until_delay(start: Instant, delay_ms: u64) {
-    let target = Duration::from_millis(delay_ms);
-    while start.elapsed() < target {
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn wait_for_render_ready(timeout: Duration) -> bool {
-    let start = Instant::now();
-    loop {
-        if is_gui_ready() {
-            return true;
-        }
-        if start.elapsed() >= timeout {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
-}
-
-fn is_gui_ready() -> bool {
-    struct EnumData {
-        pid: u32,
-        found: bool,
-    }
-
-    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let data = &mut *(lparam.0 as *mut EnumData);
-
-        let mut window_pid = 0u32;
-        GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
-        if window_pid != data.pid {
-            return BOOL(1);
-        }
-
-        if !IsWindowVisible(hwnd).as_bool() {
-            return BOOL(1);
-        }
-
-        if GetWindow(hwnd, GW_OWNER).unwrap_or_default().0 != std::ptr::null_mut() {
-            return BOOL(1);
-        }
-
-        let mut rect = RECT::default();
-        if GetClientRect(hwnd, &mut rect).is_err() {
-            return BOOL(1);
-        }
-
-        let width = rect.right - rect.left;
-        let height = rect.bottom - rect.top;
-        if width <= 1 || height <= 1 {
-            return BOOL(1);
-        }
-
-        data.found = true;
-        BOOL(0)
-    }
-
-    let pid = unsafe { GetCurrentProcessId() };
-    let mut data = EnumData { pid, found: false };
-
-    unsafe {
-        let _ = EnumWindows(
-            Some(enum_proc),
-            LPARAM((&mut data as *mut EnumData) as isize),
-        );
-    }
-
-    data.found
+        });
 }
 
 fn is_dll_path(path: &Path) -> bool {
     path.is_file()
         && path
-        .extension()
-        .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("dll"))
+            .extension()
+            .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("dll"))
         == Some(true)
 }
 
@@ -1502,14 +1483,18 @@ unsafe fn load_library(preload: &PreloadMod, phase: &str, silent_success: bool) 
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_manifest_json, symbol_requirement_message};
+    use super::{parse_manifest_json, resolve_hot_ready_level, symbol_requirement_message};
+    use crate::core::runtime_ready::ReadyLevel;
 
     #[test]
     fn symbol_pack_requirement_blocks_a_mod_without_a_loaded_pack() {
         let reason = symbol_requirement_message(true, &[])
             .expect("a required pack must block the mod when no pack is loaded");
 
-        assert_eq!(reason, "Minecraft symbol subsystem is disabled in this lightweight build");
+        assert_eq!(
+            reason,
+            "Minecraft symbol subsystem is disabled in this lightweight build"
+        );
     }
 
     #[test]
@@ -1517,7 +1502,7 @@ mod tests {
         let manifest = parse_manifest_json(
             r#"{"manifest":{"name":"Probe","entry":"probe.dll","type":"BL","requires_symbol_pack":true,"required_symbols":["client.instance"]}}"#,
         )
-            .expect("blgen bundle must parse");
+        .expect("blgen bundle must parse");
 
         assert!(manifest.requires_symbol_pack);
         assert_eq!(manifest.required_symbols, ["client.instance"]);
@@ -1528,11 +1513,29 @@ mod tests {
         let manifest = parse_manifest_json(
             r#"{"name":"NativeProbe","entry":"native_probe.dll","type":"native","required":true,"notify_success":true,"verify_exports":["ProbeInitialize"],"verify_modules":["kernel32.dll"]}"#,
         )
-            .expect("native verification fields must parse");
+        .expect("native verification fields must parse");
 
         assert!(manifest.required);
         assert!(manifest.notify_success);
         assert_eq!(manifest.verify_exports, ["ProbeInitialize"]);
         assert_eq!(manifest.verify_modules, ["kernel32.dll"]);
+    }
+
+    #[test]
+    fn hot_inject_defaults_to_stable_window_readiness() {
+        let manifest = parse_manifest_json(
+            r#"{"name":"HotProbe","entry":"probe.dll","type":"hot-inject"}"#,
+        )
+        .expect("hot manifest must parse");
+        assert_eq!(resolve_hot_ready_level(&manifest), ReadyLevel::StableWindow);
+    }
+
+    #[test]
+    fn hot_native_accepts_explicit_process_readiness() {
+        let manifest = parse_manifest_json(
+            r#"{"name":"HotProbe","entry":"probe.dll","type":"hot-native","inject_ready":"process"}"#,
+        )
+        .expect("hot manifest must parse");
+        assert_eq!(resolve_hot_ready_level(&manifest), ReadyLevel::Process);
     }
 }
