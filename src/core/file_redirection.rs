@@ -417,16 +417,12 @@ impl RuntimeRule {
     }
 }
 
-fn default_redirection_root(config: &Config, game_dir: &Path) -> Option<String> {
+fn default_redirection_root(config: &Config, _game_dir: &Path) -> Option<String> {
     let configured = config.redirection_root.trim();
-    if configured.is_empty() {
-        Some(canonicalize_lexical_windows_path(
-            &game_dir.join("Minecraft Bedrock").to_string_lossy(),
-        ))
-    } else {
-        let (namespace, path) = resolve_configured_path(game_dir, configured)?;
-        Some(apply_windows_namespace(namespace, &path))
-    }
+    if configured.is_empty() { return None; }
+    let (namespace, stripped) = split_windows_namespace(configured);
+    if !is_absolute_windows_path(&stripped) { return None; }
+    Some(apply_windows_namespace(namespace, &canonicalize_lexical_windows_path(&stripped)))
 }
 
 fn add_known_data_root_rules(rules: &mut Vec<RuntimeRule>, redirection_root: &str) {
