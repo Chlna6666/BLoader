@@ -10,11 +10,6 @@ pub mod xuser_bridge;
 #[cfg(feature = "panel-ui")]
 pub mod global_input;
 
-// Compatibility API for existing delayed-Mod code. The implementation no
-// longer touches D3D/DXGI; frame waits are mapped to runtime/window readiness.
-#[path = "render/render_signal.rs"]
-pub mod render_signal;
-
 #[path = "render/d3d12_queue.rs"]
 pub mod d3d12_queue;
 
