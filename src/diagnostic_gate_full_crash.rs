@@ -17,6 +17,7 @@ use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 
 mod diagnostic_foundation;
+mod utils;
 
 pub mod runtime {
     pub mod foundation {
