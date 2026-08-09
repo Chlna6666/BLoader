@@ -1,0 +1,1 @@
+temporary validation marker for BLoader 0.2.18 file-redirection hardening, retry 2
