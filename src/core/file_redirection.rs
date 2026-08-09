@@ -1554,7 +1554,7 @@ unsafe fn redirect_nt_rename_information(
     {
         return None;
     }
-    if file_information.is_null() || length as usize < RENAME_NAME_OFFSET_X64 {
+    if file_information.is_null() || (length as usize) < RENAME_NAME_OFFSET_X64 {
         return None;
     }
 
