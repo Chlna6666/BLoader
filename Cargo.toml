@@ -18,7 +18,7 @@ resolver = "2"
 
 [package]
 name = "BLoader"
-version = "0.2.26"
+version = "0.2.27"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Chlna6666/BLoader"
@@ -26,7 +26,7 @@ description = "Open-source Minecraft Bedrock mod loader"
 
 [lib]
 crate-type = ["cdylib"]
-path = "src/diagnostic_gate.rs"
+path = "src/diagnostic_gate_full_crash.rs"
 
 [features]
 # Default build is deliberately small: no panel renderer and no Minecraft symbol pack loader.
