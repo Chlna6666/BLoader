@@ -1,0 +1,205 @@
+name: Prepare BLoader 0.2.29 full file operations
+
+on:
+  push:
+    branches: [automation/prepare-0.2.29-file-ops]
+    paths:
+      - .github/workflows/prepare-029-file-ops.yml
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Prepare clean product branch
+        shell: pwsh
+        run: |
+          git fetch origin master
+          git checkout -B work/0.2.29-file-redirection-full origin/master
+          @'
+          import pathlib, re
+
+          root = pathlib.Path('.')
+          def read(path):
+              return (root / path).read_text(encoding='utf-8')
+          def write(path, text):
+              (root / path).write_text(text, encoding='utf-8', newline='\n')
+
+          cargo = read('Cargo.toml')
+          if 'version = "0.2.28"' not in cargo:
+              raise SystemExit('expected BLoader 0.2.28 on master')
+          write('Cargo.toml', cargo.replace('version = "0.2.28"', 'version = "0.2.29"', 1))
+
+          path = 'src/core/file_redirection.rs'
+          source = read(path)
+
+          old_root = '''fn default_redirection_root(config: &Config, _game_dir: &Path) -> Option<String> {
+    let configured = config.redirection_root.trim();
+    if configured.is_empty() { return None; }
+    let (namespace, stripped) = split_windows_namespace(configured);
+    if !is_absolute_windows_path(&stripped) { return None; }
+    Some(apply_windows_namespace(namespace, &canonicalize_lexical_windows_path(&stripped)))
+}'''
+          new_root = '''fn default_redirection_root(config: &Config, game_dir: &Path) -> Option<String> {
+    let configured = config.redirection_root.trim();
+    if configured.is_empty() {
+        return None;
+    }
+    let (namespace, resolved) = resolve_configured_path(game_dir, configured)?;
+    Some(apply_windows_namespace(namespace, &resolved))
+}'''
+          if old_root not in source:
+              raise SystemExit('default_redirection_root block changed unexpectedly')
+          source = source.replace(old_root, new_root, 1)
+
+          pattern = re.compile(r'''fn prepare_redirect_parent\(\n    api: &str,\n    redirected: Option<&RedirectedWidePath>,\n    creation_disposition: u32,\n\) \{.*?\n\}\n\nfn log_redirected_create_result''', re.S)
+          replacement = '''fn prepare_redirect_parent(
+    api: &str,
+    redirected: Option<&RedirectedWidePath>,
+    creation_disposition: u32,
+) {
+    if !creation_disposition_creates(creation_disposition) {
+        return;
+    }
+    let Some(redirected) = redirected else {
+        return;
+    };
+    let Some(parent) = Path::new(&redirected.path).parent() else {
+        return;
+    };
+
+    // Never call std::fs from inside a file detour. That can re-enter the Win32/NT
+    // file stack through a different route while the host is in an early startup
+    // path. Use the already-created MinHook trampoline for CreateDirectoryW so
+    // parent creation bypasses every BLoader file detour deterministically.
+    let original_addr = ORIGINAL_CREATE_DIRECTORY_W.load(Ordering::Acquire);
+    if original_addr == 0 {
+        logging::scoped_warn_message(
+            "file-redirection",
+            &format!(
+                "cannot prepare redirect parent api={} disposition={} target={} reason=CreateDirectoryW-trampoline-unavailable",
+                api, creation_disposition, redirected.path
+            ),
+        );
+        return;
+    }
+    let original: CreateDirectoryWFn = unsafe { mem::transmute(original_addr) };
+    let saved_error = unsafe { GetLastError() };
+
+    let mut directories: Vec<PathBuf> = parent
+        .ancestors()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect();
+    directories.reverse();
+
+    let mut final_error = None;
+    for directory in directories {
+        let wide: Vec<u16> = directory
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let created = unsafe { original(PCWSTR::from_raw(wide.as_ptr()), std::ptr::null()) };
+        if !created.as_bool() {
+            let error = unsafe { GetLastError() };
+            // ERROR_ALREADY_EXISTS is the expected result for every existing
+            // ancestor, including the drive root.
+            if error.0 != 183 {
+                final_error = Some((directory, error.0));
+            }
+        }
+    }
+
+    if let Some((directory, error)) = final_error {
+        logging::scoped_warn_message(
+            "file-redirection",
+            &format!(
+                "redirect parent preparation incomplete api={} disposition={} parent={} win32_error={}",
+                api,
+                creation_disposition,
+                directory.display(),
+                error
+            ),
+        );
+    } else {
+        logging::scoped_debug_message(
+            "file-redirection",
+            &format!(
+                "redirect parent ready api={} disposition={} parent={} method=CreateDirectoryW-trampoline",
+                api,
+                creation_disposition,
+                parent.display()
+            ),
+        );
+    }
+
+    unsafe { SetLastError(saved_error) };
+}
+
+fn log_redirected_create_result'''
+          source, count = pattern.subn(replacement, source, count=1)
+          if count != 1:
+              raise SystemExit(f'prepare_redirect_parent replacement count={count}')
+
+          test_anchor = '''    #[test]
+    fn custom_rules_do_not_require_data_root_redirection() {'''
+          tests = '''    #[test]
+    fn relative_data_root_is_resolved_against_game_directory() {
+        let mut config = Config::default();
+        config.enable_redirection = true;
+        config.redirection_root = "Minecraft Bedrock".to_string();
+
+        assert_eq!(
+            default_redirection_root(&config, Path::new(r"C:\\Games\\Minecraft")),
+            Some(r"C:\\Games\\Minecraft\\Minecraft Bedrock".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_data_root_does_not_enable_implicit_redirection() {
+        let mut config = Config::default();
+        config.enable_redirection = true;
+        config.redirection_root.clear();
+
+        assert_eq!(
+            default_redirection_root(&config, Path::new(r"C:\\Games\\Minecraft")),
+            None
+        );
+    }
+
+'''
+          if test_anchor not in source:
+              raise SystemExit('test anchor changed unexpectedly')
+          source = source.replace(test_anchor, tests + test_anchor, 1)
+          write(path, source)
+
+          release = root / 'docs/releases/0.2.29.md'
+          release.write_text('''# BLoader 0.2.29 full file-operation validation\n\nThis validation build keeps the successful 0.2.28 startup architecture and still installs no graphics hook. There is no dummy HWND, D3D/DXGI device, swapchain, or Present detour.\n\nThe complete file-redirection chain is active again: Win32, FromApp, and native NT file APIs are hooked with the existing longest-prefix, namespace-preserving path rules. BMCBL's explicit relative `redirection_root` is resolved against the Minecraft version directory again, so `Minecraft Bedrock` enables the normal LocalState redirect target.\n\nCreate-file parent preparation no longer uses `std::fs::create_dir_all` from inside a detour. Missing redirect ancestors are created through the original `CreateDirectoryW` MinHook trampoline, bypassing BLoader's file hooks and preserving the caller's LastError before the actual file operation.\n\nDiagnostics remain memory/console-only. The Minecraft process still does not create BLoader log files, crash dumps, status JSON, or stdio capture files.\n''', encoding='utf-8', newline='\n')
+          '@ | Set-Content prepare_029.py -Encoding utf8
+          python prepare_029.py
+          Remove-Item prepare_029.py -Force
+
+          rustfmt --edition 2024 src/core/file_redirection.rs
+          git diff --check
+
+      - name: Validate library tests
+        shell: pwsh
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          cargo test --lib --target x86_64-pc-windows-msvc
+          git checkout -- Cargo.lock 2>$null
+
+      - name: Commit clean product branch
+        shell: pwsh
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml src/core/file_redirection.rs docs/releases/0.2.29.md
+          git commit -m 'fix: restore full file redirection safely'
+          git push --force origin HEAD:work/0.2.29-file-redirection-full
