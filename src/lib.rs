@@ -13,7 +13,6 @@ use windows::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DET
 use crate::runtime::foundation::logging;
 
 mod bl;
-mod bl_dummy_hwnd;
 mod config;
 mod core;
 mod runtime;
@@ -182,6 +181,10 @@ fn run_bootstrap_late_attach() {
     runtime::foundation::logging::write_bootstrap_marker(
         "bootstrap.thread.start execution=late-attach-worker",
     );
+    // A late attachment occurs after Minecraft may already have crossed its OEP.
+    // Treat the host process as released so delayed Mods can use the same
+    // non-graphics readiness state machine as the static PE-import path.
+    core::runtime_ready::mark_oep_released("late-attach");
     let _ = run_bootstrap_sequence("late-attach-worker");
 }
 
@@ -402,9 +405,10 @@ unsafe fn bootstrap(
             });
     }
 
-    if !core::render_signal::install() {
-        logging::warn_message("Graphics readiness hook unavailable; hot Mods will use window fallback.");
-    }
+    logging::scoped_info_message(
+        "runtime-ready",
+        "Delayed Mod readiness uses OEP/process/window stability only; no D3D/DXGI device, swapchain, Present, or dummy HWND hook is installed.",
+    );
 
     logging::info_message(&format!(
         "{} v{} initialized. {}",
