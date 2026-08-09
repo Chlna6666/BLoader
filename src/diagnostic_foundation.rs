@@ -1,0 +1,12 @@
+#[path = "runtime/foundation/build_info.rs"]
+pub mod build_info;
+#[path = "runtime/foundation/error_dialog.rs"]
+pub mod error_dialog;
+#[path = "runtime/foundation/logging.rs"]
+pub mod logging;
+#[path = "runtime/foundation/mod_diagnostics.rs"]
+pub mod mod_diagnostics;
+#[path = "runtime/foundation/native_stdio.rs"]
+pub mod native_stdio;
+#[path = "runtime/foundation/crash_report.rs"]
+pub mod crash_report;
