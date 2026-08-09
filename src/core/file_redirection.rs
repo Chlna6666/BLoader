@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use minhook::MinHook;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{GetLastError, HANDLE, SetLastError};
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Storage::FileSystem::{
     CREATEFILE2_EXTENDED_PARAMETERS, FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES,
@@ -83,14 +83,8 @@ type MoveFileWFn = unsafe extern "system" fn(PCWSTR, PCWSTR) -> BOOL;
 type MoveFileExWFn = unsafe extern "system" fn(PCWSTR, PCWSTR, MOVE_FILE_FLAGS) -> BOOL;
 type MoveFileFromAppWFn = unsafe extern "system" fn(PCWSTR, PCWSTR) -> BOOL;
 type CopyFileWFn = unsafe extern "system" fn(PCWSTR, PCWSTR, BOOL) -> BOOL;
-type ReplaceFileWFn = unsafe extern "system" fn(
-    PCWSTR,
-    PCWSTR,
-    PCWSTR,
-    u32,
-    *mut c_void,
-    *mut c_void,
-) -> BOOL;
+type ReplaceFileWFn =
+    unsafe extern "system" fn(PCWSTR, PCWSTR, PCWSTR, u32, *mut c_void, *mut c_void) -> BOOL;
 type SetFileAttributesWFn = unsafe extern "system" fn(PCWSTR, FILE_FLAGS_AND_ATTRIBUTES) -> BOOL;
 
 type NtStatus = i32;
@@ -227,6 +221,7 @@ enum WindowsNamespace {
 }
 
 struct RedirectedWidePath {
+    path: String,
     wide: Vec<u16>,
 }
 
@@ -301,7 +296,7 @@ pub fn install(config: &Config, game_dir: &Path) -> bool {
     logging::scoped_info_message(
         "file-redirection",
         &format!(
-            "installed {installed} hooks with {rule_count} rules | coverage=KernelBase+kernel32+ntdll | namespace=preserved | lexical_canonicalization=enabled | overlap=longest-first | hook_reentry=tls-bypass | hook_parent_creation=disabled | redirect_log_limit={REDIRECT_LOG_LIMIT}"
+            "installed {installed} hooks with {rule_count} rules | coverage=KernelBase+kernel32+ntdll | namespace=preserved | lexical_canonicalization=enabled | overlap=longest-first | hook_reentry=tls-bypass | hook_parent_creation=create-dispositions-only | redirect_log_limit={REDIRECT_LOG_LIMIT}"
         ),
     );
     true
@@ -366,9 +361,7 @@ impl RedirectionState {
             {
                 return None;
             }
-            canonicalize_lexical_windows_path(
-                &self.game_dir.join(stripped).to_string_lossy(),
-            )
+            canonicalize_lexical_windows_path(&self.game_dir.join(stripped).to_string_lossy())
         };
         let requested_key = requested.to_ascii_lowercase();
 
@@ -470,12 +463,9 @@ fn add_known_data_root_rules(rules: &mut Vec<RuntimeRule>, redirection_root: &st
 }
 
 fn push_runtime_rule(rules: &mut Vec<RuntimeRule>, source: &Path, target: &str) {
-    if let Some(rule) = RuntimeRule::from_config(
-        Path::new(""),
-        &source.to_string_lossy(),
-        target,
-        true,
-    ) {
+    if let Some(rule) =
+        RuntimeRule::from_config(Path::new(""), &source.to_string_lossy(), target, true)
+    {
         rules.push(rule);
     }
 }
@@ -503,7 +493,10 @@ fn prepare_rule_targets(state: &RedirectionState) {
     }
 }
 
-fn resolve_configured_path(game_dir: &Path, configured: &str) -> Option<(WindowsNamespace, String)> {
+fn resolve_configured_path(
+    game_dir: &Path,
+    configured: &str,
+) -> Option<(WindowsNamespace, String)> {
     let (namespace, stripped) = split_windows_namespace(configured);
     if is_absolute_windows_path(&stripped) {
         return Some((namespace, canonicalize_lexical_windows_path(&stripped)));
@@ -609,7 +602,10 @@ fn canonicalize_lexical_windows_path(path: &str) -> String {
     if bytes.len() >= 3 && bytes[1] == b':' && bytes[2] == b'\\' {
         let drive = &path[..2];
         let mut stack: Vec<&str> = Vec::new();
-        for component in path[3..].split('\\').filter(|component| !component.is_empty()) {
+        for component in path[3..]
+            .split('\\')
+            .filter(|component| !component.is_empty())
+        {
             match component {
                 "." => {}
                 ".." => {
@@ -647,22 +643,14 @@ unsafe fn install_file_hooks() -> usize {
 
     macro_rules! kernel_hook {
         ($name:literal, $detour:expr, $slot:expr) => {
-            installed += hook_kernel_export(
-                s!($name),
-                $name,
-                $detour as *mut c_void,
-                $slot,
-            ) as usize;
+            installed +=
+                hook_kernel_export(s!($name), $name, $detour as *mut c_void, $slot) as usize;
         };
     }
     macro_rules! ntdll_hook {
         ($name:literal, $detour:expr, $slot:expr) => {
-            installed += hook_ntdll_export(
-                s!($name),
-                $name,
-                $detour as *mut c_void,
-                $slot,
-            ) as usize;
+            installed +=
+                hook_ntdll_export(s!($name), $name, $detour as *mut c_void, $slot) as usize;
         };
     }
 
@@ -740,7 +728,11 @@ unsafe fn install_file_hooks() -> usize {
         &ORIGINAL_FIND_FIRST_FILE_EX_FROM_APP_W
     );
     kernel_hook!("MoveFileW", detour_move_file_w, &ORIGINAL_MOVE_FILE_W);
-    kernel_hook!("MoveFileExW", detour_move_file_ex_w, &ORIGINAL_MOVE_FILE_EX_W);
+    kernel_hook!(
+        "MoveFileExW",
+        detour_move_file_ex_w,
+        &ORIGINAL_MOVE_FILE_EX_W
+    );
     kernel_hook!(
         "MoveFileFromAppW",
         detour_move_file_from_app_w,
@@ -752,7 +744,11 @@ unsafe fn install_file_hooks() -> usize {
         detour_copy_file_from_app_w,
         &ORIGINAL_COPY_FILE_FROM_APP_W
     );
-    kernel_hook!("ReplaceFileW", detour_replace_file_w, &ORIGINAL_REPLACE_FILE_W);
+    kernel_hook!(
+        "ReplaceFileW",
+        detour_replace_file_w,
+        &ORIGINAL_REPLACE_FILE_W
+    );
     kernel_hook!(
         "SetFileAttributesW",
         detour_set_file_attributes_w,
@@ -764,9 +760,17 @@ unsafe fn install_file_hooks() -> usize {
         &ORIGINAL_SET_FILE_ATTRIBUTES_FROM_APP_W
     );
 
-    ntdll_hook!("NtCreateFile", detour_nt_create_file, &ORIGINAL_NT_CREATE_FILE);
+    ntdll_hook!(
+        "NtCreateFile",
+        detour_nt_create_file,
+        &ORIGINAL_NT_CREATE_FILE
+    );
     ntdll_hook!("NtOpenFile", detour_nt_open_file, &ORIGINAL_NT_OPEN_FILE);
-    ntdll_hook!("NtDeleteFile", detour_nt_delete_file, &ORIGINAL_NT_DELETE_FILE);
+    ntdll_hook!(
+        "NtDeleteFile",
+        detour_nt_delete_file,
+        &ORIGINAL_NT_DELETE_FILE
+    );
     ntdll_hook!(
         "NtQueryAttributesFile",
         detour_nt_query_attributes_file,
@@ -866,6 +870,84 @@ macro_rules! guard_or_call_original {
     };
 }
 
+fn creation_disposition_creates(value: u32) -> bool {
+    matches!(value, 1 | 2 | 4)
+}
+
+fn prepare_redirect_parent(
+    api: &str,
+    redirected: Option<&RedirectedWidePath>,
+    creation_disposition: u32,
+) {
+    if !creation_disposition_creates(creation_disposition) {
+        return;
+    }
+    let Some(redirected) = redirected else {
+        return;
+    };
+    let (_, target) = split_windows_namespace(&redirected.path);
+    let target = Path::new(&target);
+    let Some(parent) = target.parent() else {
+        return;
+    };
+    if parent.as_os_str().is_empty() || parent.exists() {
+        return;
+    }
+
+    match std::fs::create_dir_all(parent) {
+        Ok(()) => logging::scoped_debug_message(
+            "file-redirection",
+            &format!(
+                "prepared redirect parent api={} disposition={} parent={}",
+                api,
+                creation_disposition,
+                parent.display()
+            ),
+        ),
+        Err(error) => logging::scoped_warn_message(
+            "file-redirection",
+            &format!(
+                "failed to prepare redirect parent api={} disposition={} parent={} error={error}",
+                api,
+                creation_disposition,
+                parent.display()
+            ),
+        ),
+    }
+}
+
+fn log_redirected_create_result(
+    api: &str,
+    redirected: Option<&RedirectedWidePath>,
+    creation_disposition: u32,
+    result: HANDLE,
+) -> HANDLE {
+    let Some(redirected) = redirected else {
+        return result;
+    };
+
+    let last_error = unsafe { GetLastError() };
+    if result.is_invalid() {
+        logging::scoped_warn_message(
+            "file-redirection",
+            &format!(
+                "redirect create failed api={} disposition={} target={} win32_error={}",
+                api, creation_disposition, redirected.path, last_error.0
+            ),
+        );
+    } else {
+        logging::scoped_debug_message(
+            "file-redirection",
+            &format!(
+                "redirect create ok api={} disposition={} target={} handle=0x{:X}",
+                api, creation_disposition, redirected.path, result.0 as usize
+            ),
+        );
+    }
+    unsafe { SetLastError(last_error) };
+    result
+}
+
 unsafe extern "system" fn detour_create_file_w(
     filename: PCWSTR,
     desired_access: u32,
@@ -887,7 +969,8 @@ unsafe extern "system" fn detour_create_file_w(
         template_file
     );
     let redirected = redirect_pcwstr("CreateFileW", filename);
-    original(
+    prepare_redirect_parent("CreateFileW", redirected.as_ref(), creation_disposition.0);
+    let result = original(
         redirected_pcwstr(filename, redirected.as_ref()),
         desired_access,
         share_mode,
@@ -895,6 +978,12 @@ unsafe extern "system" fn detour_create_file_w(
         creation_disposition,
         flags_and_attributes,
         template_file,
+    );
+    log_redirected_create_result(
+        "CreateFileW",
+        redirected.as_ref(),
+        creation_disposition.0,
+        result,
     )
 }
 
@@ -920,7 +1009,12 @@ unsafe extern "system" fn detour_create_file_from_app_w(
         template_file
     );
     let redirected = redirect_pcwstr("CreateFileFromAppW", filename);
-    original(
+    prepare_redirect_parent(
+        "CreateFileFromAppW",
+        redirected.as_ref(),
+        creation_disposition,
+    );
+    let result = original(
         redirected_pcwstr(filename, redirected.as_ref()),
         desired_access,
         share_mode,
@@ -928,6 +1022,12 @@ unsafe extern "system" fn detour_create_file_from_app_w(
         creation_disposition,
         flags_and_attributes,
         template_file,
+    );
+    log_redirected_create_result(
+        "CreateFileFromAppW",
+        redirected.as_ref(),
+        creation_disposition,
+        result,
     )
 }
 
@@ -948,12 +1048,19 @@ unsafe extern "system" fn detour_create_file2(
         create_ex_params
     );
     let redirected = redirect_pcwstr("CreateFile2", filename);
-    original(
+    prepare_redirect_parent("CreateFile2", redirected.as_ref(), creation_disposition.0);
+    let result = original(
         redirected_pcwstr(filename, redirected.as_ref()),
         desired_access,
         share_mode,
         creation_disposition,
         create_ex_params,
+    );
+    log_redirected_create_result(
+        "CreateFile2",
+        redirected.as_ref(),
+        creation_disposition.0,
+        result,
     )
 }
 
@@ -975,12 +1082,23 @@ unsafe extern "system" fn detour_create_file2_from_app_w(
         create_ex_params
     );
     let redirected = redirect_pcwstr("CreateFile2FromAppW", filename);
-    original(
+    prepare_redirect_parent(
+        "CreateFile2FromAppW",
+        redirected.as_ref(),
+        creation_disposition,
+    );
+    let result = original(
         redirected_pcwstr(filename, redirected.as_ref()),
         desired_access,
         share_mode,
         creation_disposition,
         create_ex_params,
+    );
+    log_redirected_create_result(
+        "CreateFile2FromAppW",
+        redirected.as_ref(),
+        creation_disposition,
+        result,
     )
 }
 
@@ -1496,6 +1614,7 @@ fn redirect_pcwstr(api: &str, path: PCWSTR) -> Option<RedirectedWidePath> {
     let redirected = REDIRECTION_STATE.get()?.redirect_path(&requested)?;
     log_redirect(api, &requested, &redirected);
     Some(RedirectedWidePath {
+        path: redirected.clone(),
         wide: wide_null(&redirected),
     })
 }
@@ -1519,8 +1638,11 @@ unsafe fn redirect_nt_object_attributes(
         return None;
     }
     let unit_count = usize::from(unicode.length) / 2;
-    let requested = String::from_utf16(std::slice::from_raw_parts(unicode.buffer, unit_count)).ok()?;
-    let redirected = REDIRECTION_STATE.get()?.redirect_absolute_path(&requested)?;
+    let requested =
+        String::from_utf16(std::slice::from_raw_parts(unicode.buffer, unit_count)).ok()?;
+    let redirected = REDIRECTION_STATE
+        .get()?
+        .redirect_absolute_path(&requested)?;
     let mut wide: Vec<u16> = redirected.encode_utf16().collect();
     let byte_len = wide.len().checked_mul(2)?;
     let length = u16::try_from(byte_len).ok()?;
@@ -1563,8 +1685,7 @@ unsafe fn redirect_nt_rename_information(
     if root_directory != 0 {
         return None;
     }
-    let name_length =
-        std::ptr::read_unaligned(bytes.as_ptr().add(16).cast::<u32>()) as usize;
+    let name_length = std::ptr::read_unaligned(bytes.as_ptr().add(16).cast::<u32>()) as usize;
     if name_length == 0
         || name_length % 2 != 0
         || RENAME_NAME_OFFSET_X64.checked_add(name_length)? > bytes.len()
@@ -1578,15 +1699,16 @@ unsafe fn redirect_nt_rename_information(
         name_units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
     }
     let requested = String::from_utf16(&name_units).ok()?;
-    let redirected = REDIRECTION_STATE.get()?.redirect_absolute_path(&requested)?;
+    let redirected = REDIRECTION_STATE
+        .get()?
+        .redirect_absolute_path(&requested)?;
     log_redirect(api, &requested, &redirected);
 
     let redirected_units: Vec<u16> = redirected.encode_utf16().collect();
     let redirected_name_length = redirected_units.len().checked_mul(2)?;
     let total_length = RENAME_NAME_OFFSET_X64.checked_add(redirected_name_length)?;
     let mut output = vec![0u8; total_length];
-    output[..RENAME_NAME_OFFSET_X64]
-        .copy_from_slice(&bytes[..RENAME_NAME_OFFSET_X64]);
+    output[..RENAME_NAME_OFFSET_X64].copy_from_slice(&bytes[..RENAME_NAME_OFFSET_X64]);
     output[16..20].copy_from_slice(&(redirected_name_length as u32).to_le_bytes());
     for (index, unit) in redirected_units.iter().enumerate() {
         let offset = RENAME_NAME_OFFSET_X64 + index * 2;
@@ -1642,6 +1764,15 @@ mod tests {
     }
 
     #[test]
+    fn create_parent_policy_only_allows_create_dispositions() {
+        assert!(creation_disposition_creates(1)); // CREATE_NEW
+        assert!(creation_disposition_creates(2)); // CREATE_ALWAYS
+        assert!(creation_disposition_creates(4)); // OPEN_ALWAYS
+        assert!(!creation_disposition_creates(3)); // OPEN_EXISTING
+        assert!(!creation_disposition_creates(5)); // TRUNCATE_EXISTING
+    }
+
+    #[test]
     fn redirects_exact_directory() {
         let state = state_with_rule(r"data\skin_packs\vanilla", r"C:\BMCBL\skin_packs\custom");
         assert_eq!(
@@ -1681,9 +1812,7 @@ mod tests {
             r"C:\BMCBL\skin_packs\custom",
         );
         assert_eq!(
-            state.redirect_path(
-                r"C:\Games\Minecraft\data\skin_packs\temp\..\vanilla\.\skins.json"
-            ),
+            state.redirect_path(r"C:\Games\Minecraft\data\skin_packs\temp\..\vanilla\.\skins.json"),
             Some(r"C:\BMCBL\skin_packs\custom\skins.json".to_string())
         );
     }
