@@ -4,15 +4,11 @@ pub mod loader;
 pub mod network_hook;
 pub mod pre_main_gate;
 pub mod preloader_proxy;
+pub mod runtime_ready;
 #[path = "xuser_bridge/mod.rs"]
 pub mod xuser_bridge;
 #[cfg(feature = "panel-ui")]
 pub mod global_input;
-
-// Minimal graphics hook: only observes Present frames for delayed Mod loading
-// and render-frame signals. It does not render ArcUI or capture input.
-#[path = "render/render_signal.rs"]
-pub mod render_signal;
 
 #[path = "render/d3d12_queue.rs"]
 pub mod d3d12_queue;
