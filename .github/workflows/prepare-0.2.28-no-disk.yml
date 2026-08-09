@@ -1,0 +1,104 @@
+name: Prepare BLoader 0.2.28 no-disk runtime
+
+on:
+  push:
+    branches: [work/0.2.28-no-disk-runtime]
+    paths:
+      - .github/workflows/prepare-0.2.28-no-disk.yml
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Generate no-disk runtime source
+        shell: pwsh
+        run: |
+          @'
+          import pathlib, re, subprocess
+          root = pathlib.Path('.')
+          def read(p): return (root/p).read_text(encoding='utf-8')
+          def write(p,s):
+              p=root/p; p.parent.mkdir(parents=True,exist_ok=True); p.write_text(s,encoding='utf-8',newline='\n')
+
+          s=read('Cargo.toml').replace('version = "0.2.27"','version = "0.2.28"').replace('path = "src/diagnostic_gate_full_crash.rs"','path = "src/lib.rs"')
+          write('Cargo.toml',s)
+
+          s=read('src/runtime/foundation/mod.rs')
+          s=s.replace('pub mod crash_report;','#[path = "crash_report_nodisk.rs"]\npub mod crash_report;')
+          s=s.replace('pub mod logging;','#[path = "logging_nodisk.rs"]\npub mod logging;')
+          s=s.replace('pub mod native_stdio;','#[path = "native_stdio_nodisk.rs"]\npub mod native_stdio;')
+          write('src/runtime/foundation/mod.rs',s)
+
+          for src,dst in [('885ef468ca41d6f1792448b7f0cfa5ecb06f3bf7:src/core/render/render_signal.rs','src/core/render/render_signal.rs'),('885ef468ca41d6f1792448b7f0cfa5ecb06f3bf7:src/bl_dummy_hwnd.rs','src/bl_dummy_hwnd.rs')]:
+              data=subprocess.check_output(['git','show',src])
+              p=root/dst; p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(data)
+          s=read('src/core/mod.rs')
+          if 'pub mod render_signal;' not in s:
+              s=s.replace('#[path = "render/d3d12_queue.rs"]\npub mod d3d12_queue;','#[path = "render/d3d12_queue.rs"]\npub mod d3d12_queue;\n#[path = "render/render_signal.rs"]\npub mod render_signal;')
+          write('src/core/mod.rs',s)
+
+          s=read('src/lib.rs')
+          if 'mod bl_dummy_hwnd;' not in s: s=s.replace('mod bl;\n','mod bl;\nmod bl_dummy_hwnd;\n',1)
+          marker='''    logging::scoped_info_message(\n        "runtime-ready",\n        "Delayed Mod readiness uses OEP/process/window stability only; no D3D/DXGI device, swapchain, Present, or dummy HWND hook is installed.",\n    );'''
+          replacement='''    if !core::render_signal::install() {\n        logging::warn_message("Render Present observer unavailable; runtime_ready remains the delayed-Mod readiness source.");\n    }\n    logging::scoped_info_message(\n        "runtime-ready",\n        "Delayed Mod readiness remains OEP/process/window based; Present is restored only as the Mod render-frame observer.",\n    );'''
+          if marker not in s: raise SystemExit('runtime-ready marker not found')
+          s=s.replace(marker,replacement)
+          s=s.replace('    runtime::foundation::crash_report::spawn_external_logger(utils::loader_module_handle());\n','')
+          write('src/lib.rs',s)
+
+          s=read('src/config.rs')
+          s=s.replace('const DEFAULT_REDIRECTION_ROOT: &str = "Minecraft Bedrock";','const DEFAULT_REDIRECTION_ROOT: &str = "";')
+          s=s.replace('            let default_config = Config::default();\n            let _ = default_config.save();\n            return default_config;','            return Config::default();')
+          s=s.replace('                    let _ = cfg.save();\n','')
+          s=s.replace('        let default_config = Config::default();\n        let _ = default_config.save();\n        default_config','        Config::default()')
+          s=re.sub(r'    pub fn save\(&self\) -> std::io::Result<\(\)> \{.*?\n    \}\n\n    pub fn reset_to_defaults', '    pub fn save(&self) -> std::io::Result<()> {\n        Self::apply_update(self);\n        Ok(())\n    }\n\n    pub fn reset_to_defaults', s, flags=re.S)
+          s=s.replace('assert_eq!(config.redirection_root, DEFAULT_REDIRECTION_ROOT);','assert_eq!(config.redirection_root, "");').replace('assert_eq!(parsed.redirection_root, DEFAULT_REDIRECTION_ROOT);','assert_eq!(parsed.redirection_root, "");')
+          write('src/config.rs',s)
+
+          s=read('src/core/file_redirection.rs')
+          old='''fn default_redirection_root(config: &Config, game_dir: &Path) -> Option<String> {\n    let configured = config.redirection_root.trim();\n    if configured.is_empty() {\n        Some(canonicalize_lexical_windows_path(\n            &game_dir.join("Minecraft Bedrock").to_string_lossy(),\n        ))\n    } else {\n        let (namespace, path) = resolve_configured_path(game_dir, configured)?;\n        Some(apply_windows_namespace(namespace, &path))\n    }\n}'''
+          new='''fn default_redirection_root(config: &Config, _game_dir: &Path) -> Option<String> {\n    let configured = config.redirection_root.trim();\n    if configured.is_empty() {\n        return None;\n    }\n    let (namespace, stripped) = split_windows_namespace(configured);\n    if !is_absolute_windows_path(&stripped) {\n        return None;\n    }\n    Some(apply_windows_namespace(\n        namespace,\n        &canonicalize_lexical_windows_path(&stripped),\n    ))\n}'''
+          if old not in s: raise SystemExit('default_redirection_root block not found')
+          write('src/core/file_redirection.rs',s.replace(old,new))
+
+          s=read('src/core/preloader_proxy.rs')
+          s=re.sub(r'fn publish_status\(status: ProxyStatus<\'_>\) \{.*?\n\}', 'fn publish_status(_status: ProxyStatus<\'_>) {\n    // no-disk diagnostic mode: status remains in live diagnostics only.\n}', s, flags=re.S)
+          write('src/core/preloader_proxy.rs',s)
+
+          s=read('src/core/loader.rs')
+          s=re.sub(r'fn write_native_status_file\(summary: NativePreloadSummary, reports: &\[NativeLoadReport\]\) -> PathBuf \{.*?\n\}', 'fn write_native_status_file(_summary: NativePreloadSummary, _reports: &[NativeLoadReport]) -> PathBuf {\n    PathBuf::from("<memory-only>")\n}', s, flags=re.S)
+          s=s.replace('    lines.push("See logs\\\\latest.log and logs\\\\native-load-status.json for details.".to_string());','    lines.push("Details are available through the live console/debug diagnostic stream.".to_string());')
+          s=s.replace('    lines.push("Detailed status: logs\\\\native-load-status.json".to_string());','    lines.push("Detailed status is memory-only in this diagnostic build.".to_string());')
+          s=re.sub(r'fn ensure_mods_dir\(game_dir: &Path\) -> PathBuf \{.*?\n\}', 'fn ensure_mods_dir(game_dir: &Path) -> PathBuf {\n    game_dir.join("mods")\n}', s, flags=re.S)
+          start=s.index('fn package_loose_dll('); end=s.index('\nfn load_preload_mods',start)
+          repl='''fn package_loose_dll(_mods_dir: &Path, entry_path: &Path) -> Option<PreloadMod> {\n    let file_stem = entry_path.file_stem()?.to_string_lossy().to_string();\n    Some(PreloadMod {\n        id: file_stem.clone(),\n        name: file_stem,\n        version: None,\n        kind: MOD_TYPE_PRELOAD_NATIVE.to_string(),\n        dll_path: entry_path.to_path_buf(),\n        log_aliases: Vec::new(),\n        required: false,\n        verify_exports: Vec::new(),\n        verify_modules: Vec::new(),\n        notify_success: false,\n    })\n}\n'''
+          write('src/core/loader.rs',s[:start]+repl+s[end:])
+
+          s=read('src/bl/host.rs')
+          s=s.replace('        BL_PATH_CACHE_DIR => get_exe_directory().join("mods").join(".bl-cache"),','        BL_PATH_CACHE_DIR => std::env::temp_dir().join("BLoader").join("cache"),')
+          s=s.replace('    if kind == BL_PATH_CACHE_DIR {\n        let _ = std::fs::create_dir_all(&path);\n    }\n','')
+          write('src/bl/host.rs',s)
+
+          for p in ['docs/releases/0.2.28-branch-marker.tmp','IGNORE.tmp','SHOULD_DELETE.tmp']:
+              q=root/p
+              if q.exists(): q.unlink()
+          '@ | Set-Content -Path prepare_028.py -Encoding utf8
+          python prepare_028.py
+          Remove-Item prepare_028.py -Force
+          cargo fmt --all
+      - name: Commit product source and remove one-shot workflow
+        shell: pwsh
+        run: |
+          Remove-Item '.github/workflows/prepare-0.2.28-no-disk.yml' -Force
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'refactor: restore runtime without disk diagnostics'
+          git push origin HEAD:work/0.2.28-no-disk-runtime
