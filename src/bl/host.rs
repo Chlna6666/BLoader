@@ -12,16 +12,15 @@ use crate::bl::abi::{
     BL_API_VERSION_1, BL_EVENT_BLOCK_ACTION, BL_EVENT_BOOTSTRAP_COMPLETE, BL_EVENT_CHAT,
     BL_EVENT_CREATED_LEVEL, BL_EVENT_KEY, BL_EVENT_LOCAL_PLAYER_BOUND, BL_EVENT_PLAYER_ACTION,
     BL_EVENT_RENDER_FRAME, BL_EVENT_RESOURCE_RELOAD, BL_EVENT_SET_LOCAL_PLAYER_AS_INIT,
-    BL_EVENT_SHUTDOWN, BL_EVENT_START_GAME_PACKET, BL_EVENT_TICK,
-    BL_EVENT_WORLD_ENTER, BL_LOG_DEBUG, BL_LOG_ERROR, BL_LOG_WARN, BL_PATH_CACHE_DIR,
-    BL_PATH_GAME_DIR, BL_PATH_MODS_DIR, BL_PATH_UI_RESOURCE_PACK_DIR, BL_REGISTRY_EVENT,
-    BL_REGISTRY_FEATURE_PANEL, BL_REGISTRY_FEATURE_TOGGLE, BL_REGISTRY_RESOURCE,
-    BL_REGISTRY_TEXT_PANEL, BL_REGISTRY_UI_PANEL, BlEventCallback, BlHostApiV1,
-    BlResourceCallback, BlStringView,
+    BL_EVENT_SHUTDOWN, BL_EVENT_START_GAME_PACKET, BL_EVENT_TICK, BL_EVENT_WORLD_ENTER,
+    BL_LOG_DEBUG, BL_LOG_ERROR, BL_LOG_WARN, BL_PATH_CACHE_DIR, BL_PATH_GAME_DIR, BL_PATH_MODS_DIR,
+    BL_PATH_UI_RESOURCE_PACK_DIR, BL_REGISTRY_EVENT, BL_REGISTRY_FEATURE_PANEL,
+    BL_REGISTRY_FEATURE_TOGGLE, BL_REGISTRY_RESOURCE, BL_REGISTRY_TEXT_PANEL, BL_REGISTRY_UI_PANEL,
+    BlEventCallback, BlHostApiV1, BlResourceCallback, BlStringView,
 };
-use crate::runtime::foundation::{crash_report, logging, mod_diagnostics};
 #[cfg(feature = "panel-ui")]
 use crate::bl::abi::{BlFeatureToggleCallback, BlTextCallback, BlUiCallback};
+use crate::runtime::foundation::{crash_report, logging, mod_diagnostics};
 use crate::utils::get_exe_directory;
 
 #[derive(Clone)]
@@ -265,18 +264,19 @@ unsafe extern "system" fn host_get_path(kind: u32, out_path: *mut u8, out_len: u
     let path = match kind {
         BL_PATH_GAME_DIR => get_exe_directory(),
         BL_PATH_MODS_DIR => get_exe_directory().join("mods"),
-        BL_PATH_CACHE_DIR => get_exe_directory().join("mods").join(".bl-cache"),
+        BL_PATH_CACHE_DIR => PathBuf::new(),
         BL_PATH_UI_RESOURCE_PACK_DIR => PathBuf::new(),
         _ => PathBuf::new(),
     };
-    if kind == BL_PATH_CACHE_DIR {
-        let _ = std::fs::create_dir_all(&path);
-    }
     copy_path(path, out_path, out_len)
 }
 
 unsafe extern "system" fn host_get_host_version(out_buf: *mut u8, out_len: usize) -> usize {
-    copy_text(crate::runtime::foundation::build_info::VERSION, out_buf, out_len)
+    copy_text(
+        crate::runtime::foundation::build_info::VERSION,
+        out_buf,
+        out_len,
+    )
 }
 
 unsafe extern "system" fn host_resolve_symbol(_name: BlStringView) -> usize {
@@ -318,12 +318,10 @@ unsafe extern "system" fn host_get_runtime_info(
         | "mapping.module_name"
         | "mapping.pack_id"
         | "mapping.public_symbols" => String::new(),
-        "client.instance"
-        | "client.local_player"
-        | "client.level" => "0".to_string(),
-        "client.ready"
-        | "client.local_player_ready"
-        | "client_instance.ready" => "false".to_string(),
+        "client.instance" | "client.local_player" | "client.level" => "0".to_string(),
+        "client.ready" | "client.local_player_ready" | "client_instance.ready" => {
+            "false".to_string()
+        }
         "client.status" => "disabled".to_string(),
         "ui.native_hud.status" | "ui.native_hud.mode" | "ui.native_hud.reason" => {
             "disabled".to_string()
@@ -611,11 +609,17 @@ fn run_mod_callback_safely(owner_name: &str, callback_kind: &str, f: impl FnOnce
     };
     // A Mod callback can replace SetUnhandledExceptionFilter. Re-arm after every
     // callback so the next native crash remains attributable.
-    crash_report::rearm_unhandled_filter(&format!("after-mod-callback:{owner_name}:{callback_kind}"));
+    crash_report::rearm_unhandled_filter(&format!(
+        "after-mod-callback:{owner_name}:{callback_kind}"
+    ));
     if let Err(payload) = result {
         let details = panic_payload_to_string(payload.as_ref());
         if let Some(identity) = identity.as_ref() {
-            mod_diagnostics::mark_crashed(identity, callback_kind, &format!("Rust panic: {details}"));
+            mod_diagnostics::mark_crashed(
+                identity,
+                callback_kind,
+                &format!("Rust panic: {details}"),
+            );
         }
         crash_report::capture_rust_panic(
             &format!("mod={owner_name} callback={callback_kind} detail={details}"),
@@ -788,7 +792,12 @@ pub fn render_feature_panel_inline(
     let (owner_name, callback_ptr, user_data) = callback;
     let callback: BlUiCallback = unsafe { std::mem::transmute(callback_ptr) };
     run_mod_callback_safely(&owner_name, "feature_panel", || {
-        crate::bl::ui::host_render_inline_panel(panel_key, rect, callback, user_data as *mut c_void);
+        crate::bl::ui::host_render_inline_panel(
+            panel_key,
+            rect,
+            callback,
+            user_data as *mut c_void,
+        );
     });
     true
 }

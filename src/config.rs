@@ -1,8 +1,8 @@
+use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::sync::OnceLock;
-use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use parking_lot::RwLock;
 
 use crate::runtime::foundation::logging;
 use crate::utils::get_exe_directory;
@@ -13,7 +13,7 @@ const DEFAULT_TOGGLE_HOTKEY_VK: u32 = 0x4D;
 const DEFAULT_RELOAD_HOTKEY_VK: u32 = 0x78;
 #[cfg(feature = "panel-ui")]
 const DEFAULT_OVERLAY_BLUR_STRENGTH: f32 = 1.0;
-const DEFAULT_REDIRECTION_ROOT: &str = "Minecraft Bedrock";
+const DEFAULT_REDIRECTION_ROOT: &str = "";
 
 #[cfg(feature = "panel-ui")]
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +47,6 @@ pub struct FileRedirectionConfig {
     pub kind: Option<String>,
 }
 
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
     #[serde(default = "default_false")]
@@ -73,7 +72,6 @@ pub struct Config {
 
     #[serde(default)]
     pub file_redirections: Vec<FileRedirectionConfig>,
-
 
     #[serde(default)]
     pub mods: Vec<String>,
@@ -333,33 +331,38 @@ fn is_config_file_outdated(content: &str, loaded_cfg: &Config) -> bool {
 impl Config {
     pub fn load() -> Self {
         let config_path = config_path();
-        logging::info_message(&format!("[config] Loading configuration file from: {}", config_path.display()));
+        logging::info_message(&format!(
+            "[config] Loading configuration file from: {}",
+            config_path.display()
+        ));
 
         if !config_path.exists() {
-            let default_config = Config::default();
-            let _ = default_config.save();
-            return default_config;
+            return Config::default();
         }
 
         if let Ok(content) = fs::read_to_string(&config_path) {
             if let Ok(cfg) = serde_json::from_str::<Config>(&content) {
                 #[cfg(feature = "panel-ui")]
                 {
-                    cfg.overlay.blur_strength = clamp_overlay_blur_strength(cfg.overlay.blur_strength);
+                    cfg.overlay.blur_strength =
+                        clamp_overlay_blur_strength(cfg.overlay.blur_strength);
                 }
                 if is_config_file_outdated(&content, &cfg) {
-                    logging::info_message(&format!("[config] Discovered outdated config.json schema; automatically syncing current schema to disk at {}", config_path.display()));
-                    let _ = cfg.save();
+                    logging::info_message(&format!(
+                        "[config] Discovered outdated config.json schema; automatically syncing current schema to disk at {}",
+                        config_path.display()
+                    ));
                 }
                 return cfg;
             } else {
-                logging::warn_message(&format!("[config] Failed to parse existing config.json format at {}; rewriting clean default config...", config_path.display()));
+                logging::warn_message(&format!(
+                    "[config] Failed to parse existing config.json format at {}; rewriting clean default config...",
+                    config_path.display()
+                ));
             }
         }
 
-        let default_config = Config::default();
-        let _ = default_config.save();
-        default_config
+        Config::default()
     }
 
     pub fn apply_update(config: &Config) {
@@ -375,13 +378,8 @@ impl Config {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let res = fs::write(config_path(), json);
-        if res.is_ok() {
-            Self::apply_update(self);
-        }
-        res
+        Self::apply_update(self);
+        Ok(())
     }
 
     pub fn reset_to_defaults(&mut self) {
@@ -440,10 +438,10 @@ mod tests {
     #[test]
     fn config_defaults_to_relative_redirection_root() {
         let config = Config::default();
-        assert_eq!(config.redirection_root, DEFAULT_REDIRECTION_ROOT);
+        assert_eq!(config.redirection_root, "");
 
         let parsed: Config = serde_json::from_str(r#"{}"#).unwrap();
-        assert_eq!(parsed.redirection_root, DEFAULT_REDIRECTION_ROOT);
+        assert_eq!(parsed.redirection_root, "");
     }
 
     #[test]

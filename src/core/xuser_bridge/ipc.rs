@@ -4,13 +4,16 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use core::ffi::c_void;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::{mem, ptr, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    mem, ptr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{
     abi::{
-        XUserLocalId, XUSER_AGE_GROUP_ADULT, XUSER_AGE_GROUP_CHILD,
-        XUSER_AGE_GROUP_TEEN, XUSER_AGE_GROUP_UNKNOWN,
+        XUSER_AGE_GROUP_ADULT, XUSER_AGE_GROUP_CHILD, XUSER_AGE_GROUP_TEEN,
+        XUSER_AGE_GROUP_UNKNOWN, XUserLocalId,
     },
     crypto::SigningKey,
 };
@@ -258,8 +261,8 @@ fn parse_session(payload: &[u8]) -> Result<Session, String> {
     let signing_key = SigningKey::import_private_blob(mem::take(&mut private_blob))?;
     private_blob.zeroize();
 
-    let xuid = parse_nonzero_decimal(&document.xbl_xuid)
-        .ok_or_else(|| "invalid XUID".to_string())?;
+    let xuid =
+        parse_nonzero_decimal(&document.xbl_xuid).ok_or_else(|| "invalid XUID".to_string())?;
     let local_id = parse_nonzero_decimal(&document.xbl_uhs).unwrap_or(xuid);
     if document.xbl_gamertag.trim().is_empty() {
         return Err("empty gamertag".to_string());

@@ -4,7 +4,6 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     if env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
-
         let mut res = winres::WindowsResource::new();
         let pkg_version = env::var("CARGO_PKG_VERSION").unwrap();
         let version_win = format!("{}.0", pkg_version);

@@ -394,7 +394,8 @@ unsafe fn load_and_verify_native(
             module_handle: None,
             state: NativeLoadState::Failed,
             stage: "entry_validation".to_string(),
-            detail: "DLL entry does not exist, is not a file, or does not end with .dll".to_string(),
+            detail: "DLL entry does not exist, is not a file, or does not end with .dll"
+                .to_string(),
             verified_exports: Vec::new(),
             verified_modules: Vec::new(),
             elapsed_ms: started.elapsed().as_millis(),
@@ -528,8 +529,9 @@ unsafe fn load_and_verify_native(
             module_handle: Some(format!("0x{:X}", module.0 as usize)),
             state: NativeLoadState::Failed,
             stage: "module_path_query".to_string(),
-            detail: "LoadLibrary returned a module handle but GetModuleFileNameW could not resolve it"
-                .to_string(),
+            detail:
+                "LoadLibrary returned a module handle but GetModuleFileNameW could not resolve it"
+                    .to_string(),
             verified_exports: Vec::new(),
             verified_modules: Vec::new(),
             elapsed_ms: started.elapsed().as_millis(),
@@ -549,8 +551,9 @@ unsafe fn load_and_verify_native(
             module_handle: Some(format!("0x{:X}", module.0 as usize)),
             state: NativeLoadState::Failed,
             stage: "module_path_verification".to_string(),
-            detail: "LoadLibrary returned a different module path; probable same-name module collision"
-                .to_string(),
+            detail:
+                "LoadLibrary returned a different module path; probable same-name module collision"
+                    .to_string(),
             verified_exports: Vec::new(),
             verified_modules: Vec::new(),
             elapsed_ms: started.elapsed().as_millis(),
@@ -798,7 +801,10 @@ pub fn publish_native_preload_reports() -> NativePreloadSummary {
                 logging::scoped_info_message("native-loader", &format!("LOAD_SUCCESS | {message}"));
             }
             NativeLoadState::Failed => {
-                logging::scoped_error_message("native-loader", &format!("LOAD_FAILURE | {message}"));
+                logging::scoped_error_message(
+                    "native-loader",
+                    &format!("LOAD_FAILURE | {message}"),
+                );
             }
         }
     }
@@ -820,44 +826,11 @@ pub fn publish_native_preload_reports() -> NativePreloadSummary {
     summary
 }
 
-fn write_native_status_file(summary: NativePreloadSummary, reports: &[NativeLoadReport]) -> PathBuf {
-    let status_path = PathBuf::from("logs").join("native-load-status.json");
-    let _ = fs::create_dir_all("logs");
-    let status_document = serde_json::json!({
-        "summary": summary,
-        "reports": reports,
-    });
-    match serde_json::to_vec_pretty(&status_document) {
-        Ok(data) => {
-            let temp_path = status_path.with_extension("json.tmp");
-            match fs::write(&temp_path, data) {
-                Ok(()) => {
-                    let _ = fs::remove_file(&status_path);
-                    if let Err(error) = fs::rename(&temp_path, &status_path) {
-                        logging::scoped_error_message(
-                            "native-loader",
-                            &format!(
-                                "failed to publish status file {}: {error}",
-                                status_path.display()
-                            ),
-                        );
-                    }
-                }
-                Err(error) => logging::scoped_error_message(
-                    "native-loader",
-                    &format!(
-                        "failed to write native load status temp file {}: {error}",
-                        temp_path.display()
-                    ),
-                ),
-            }
-        }
-        Err(error) => logging::scoped_error_message(
-            "native-loader",
-            &format!("failed to serialize native load status: {error}"),
-        ),
-    }
-    status_path
+fn write_native_status_file(
+    _summary: NativePreloadSummary,
+    _reports: &[NativeLoadReport],
+) -> PathBuf {
+    PathBuf::from("<memory-only>")
 }
 
 pub fn required_native_failure_message() -> Option<String> {
@@ -875,7 +848,8 @@ pub fn required_native_failure_message() -> Option<String> {
 
     let mut lines = vec![
         "One or more required native modules failed to load or verify.".to_string(),
-        "The game may continue, but the requested runtime/mod functionality is not active.".to_string(),
+        "The game may continue, but the requested runtime/mod functionality is not active."
+            .to_string(),
         String::new(),
     ];
     for report in failures.iter().take(8) {
@@ -885,7 +859,9 @@ pub fn required_native_failure_message() -> Option<String> {
         ));
     }
     lines.push(String::new());
-    lines.push("See logs\\latest.log and logs\\native-load-status.json for details.".to_string());
+    lines.push(
+        "Details are available through the live console/debug diagnostic stream.".to_string(),
+    );
     Some(lines.join("\n"))
 }
 
@@ -908,17 +884,26 @@ pub fn native_success_notification_message() -> Option<String> {
         return None;
     }
 
-    let mut lines = vec!["Native module loading verified successfully:".to_string(), String::new()];
+    let mut lines = vec![
+        "Native module loading verified successfully:".to_string(),
+        String::new(),
+    ];
     for report in successes.iter().take(8) {
         lines.push(format!(
             "- {}: {} | {}",
             report.name,
-            report.resolved_path.as_deref().unwrap_or(&report.expected_path),
-            report.module_handle.as_deref().unwrap_or("handle unavailable")
+            report
+                .resolved_path
+                .as_deref()
+                .unwrap_or(&report.expected_path),
+            report
+                .module_handle
+                .as_deref()
+                .unwrap_or("handle unavailable")
         ));
     }
     lines.push(String::new());
-    lines.push("Detailed status: logs\\native-load-status.json".to_string());
+    lines.push("Detailed status is memory-only in this diagnostic build.".to_string());
     Some(lines.join("\n"))
 }
 
@@ -941,12 +926,7 @@ pub unsafe fn load_mods(game_dir: &Path) -> bool {
 }
 
 fn ensure_mods_dir(game_dir: &Path) -> PathBuf {
-    let mods_dir = game_dir.join("mods");
-    if !mods_dir.exists() {
-        let _ = fs::create_dir_all(&mods_dir);
-        logging::warn_message("Mods directory created, no mods loaded.");
-    }
-    mods_dir
+    game_dir.join("mods")
 }
 
 fn discover_mods(mods_dir: &Path) -> DiscoveredMods {
@@ -1126,76 +1106,14 @@ fn discover_loose_dll(mods_dir: &Path, entry_path: &Path, discovered: &mut Disco
     discovered.preload.push(packaged);
 }
 
-fn package_loose_dll(mods_dir: &Path, entry_path: &Path) -> Option<PreloadMod> {
+fn package_loose_dll(_mods_dir: &Path, entry_path: &Path) -> Option<PreloadMod> {
     let file_stem = entry_path.file_stem()?.to_string_lossy().to_string();
-    let file_name = entry_path.file_name()?.to_string_lossy().to_string();
-    let target_dir = mods_dir.join(&file_stem);
-    let target_dll = target_dir.join(&file_name);
-    let target_manifest = target_dir.join("manifest.json");
-
-    logging::info_message(&format!("Auto-packaging found: {}", file_name));
-
-    if !target_dir.exists() && fs::create_dir(&target_dir).is_err() {
-        logging::error_message(&format!("Failed to create package dir for {}", file_stem));
-        return None;
-    }
-
-    if !target_dll.exists() {
-        if let Err(error) = fs::rename(entry_path, &target_dll) {
-            logging::error_message(&format!("Failed to move DLL {}: {}", file_name, error));
-            return None;
-        }
-    } else {
-        logging::warn_message(&format!(
-            "Target DLL {} already exists, skipping move.",
-            target_dll.display()
-        ));
-    }
-
-    if !target_manifest.exists() {
-        let manifest = ModManifest {
-            id: Some(file_stem.clone()),
-            name: file_stem.clone(),
-            entry: file_name.clone(),
-            version: None,
-            author: None,
-            description: None,
-            mod_type: MOD_TYPE_PRELOAD_NATIVE.to_string(),
-            api_version: None,
-            inject_delay_ms: None,
-            inject_min_frames: None,
-            inject_ready: None,
-            requires_symbol_pack: false,
-            required_symbols: Vec::new(),
-            required: false,
-            verify_exports: Vec::new(),
-            verify_modules: Vec::new(),
-            notify_success: false,
-            log_aliases: Vec::new(),
-        };
-
-        match serde_json::to_string_pretty(&manifest) {
-            Ok(json) => {
-                if let Err(error) = fs::write(&target_manifest, json) {
-                    logging::error_message(&format!(
-                        "Failed to generate manifest for {}: {}",
-                        file_stem, error
-                    ));
-                }
-            }
-            Err(error) => logging::error_message(&format!(
-                "Failed to serialize manifest for {}: {}",
-                file_stem, error
-            )),
-        }
-    }
-
     Some(PreloadMod {
         id: file_stem.clone(),
         name: file_stem,
         version: None,
         kind: MOD_TYPE_PRELOAD_NATIVE.to_string(),
-        dll_path: target_dll,
+        dll_path: entry_path.to_path_buf(),
         log_aliases: Vec::new(),
         required: false,
         verify_exports: Vec::new(),
@@ -1374,7 +1292,7 @@ fn is_dll_path(path: &Path) -> bool {
         && path
             .extension()
             .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("dll"))
-        == Some(true)
+            == Some(true)
 }
 
 fn dll_key(path: &Path) -> String {
@@ -1436,10 +1354,13 @@ unsafe fn load_library(preload: &PreloadMod, phase: &str, silent_success: bool) 
     } else if success && report.notify_success {
         visible_title = Some("BLoader Native Module Loaded");
         visible_message = Some(format!(
-            "Native module '{}' was loaded and verified successfully.\n\nPhase: {}\nPath: {}\nHandle: {}\n\nDetailed status: logs\\native-load-status.json",
+            "Native module '{}' was loaded and verified successfully.\n\nPhase: {}\nPath: {}\nHandle: {}\n\nDetailed status is memory-only in this diagnostic build.",
             report.name,
             report.phase,
-            report.resolved_path.as_deref().unwrap_or(&report.expected_path),
+            report
+                .resolved_path
+                .as_deref()
+                .unwrap_or(&report.expected_path),
             report.module_handle.as_deref().unwrap_or("unavailable"),
         ));
     } else {
@@ -1466,13 +1387,11 @@ unsafe fn load_library(preload: &PreloadMod, phase: &str, silent_success: bool) 
             .spawn(move || {
                 if success {
                     crate::runtime::foundation::error_dialog::show_native_load_success(
-                        &title,
-                        &message,
+                        &title, &message,
                     );
                 } else {
                     crate::runtime::foundation::error_dialog::show_native_load_error(
-                        &title,
-                        &message,
+                        &title, &message,
                     );
                 }
             });
@@ -1523,10 +1442,9 @@ mod tests {
 
     #[test]
     fn hot_inject_defaults_to_stable_window_readiness() {
-        let manifest = parse_manifest_json(
-            r#"{"name":"HotProbe","entry":"probe.dll","type":"hot-inject"}"#,
-        )
-        .expect("hot manifest must parse");
+        let manifest =
+            parse_manifest_json(r#"{"name":"HotProbe","entry":"probe.dll","type":"hot-inject"}"#)
+                .expect("hot manifest must parse");
         assert_eq!(resolve_hot_ready_level(&manifest), ReadyLevel::StableWindow);
     }
 

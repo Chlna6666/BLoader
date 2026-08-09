@@ -6,15 +6,11 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 
-use windows::core::{PCSTR, PCWSTR};
-use windows::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE,
-};
-use windows::Win32::System::Console::{
-    SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
-};
+use windows::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+use windows::Win32::System::Console::{STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId};
+use windows::core::{PCSTR, PCWSTR};
 
 use crate::runtime::foundation::{logging, mod_diagnostics};
 use mod_diagnostics::ModIdentity;
@@ -105,7 +101,11 @@ pub unsafe fn capture_library_load<T>(
     f: impl FnOnce() -> T,
 ) -> T {
     let _active = ActiveCaptureGuard::push(identity, phase);
-    mod_diagnostics::record_lifecycle(identity, "stdio_capture_begin", &format!("phase={phase} mode=memory-pipe"));
+    mod_diagnostics::record_lifecycle(
+        identity,
+        "stdio_capture_begin",
+        &format!("phase={phase} mode=memory-pipe"),
+    );
     let result = f();
     mod_diagnostics::record_lifecycle(identity, "stdio_capture_ready", phase);
     result
@@ -332,7 +332,9 @@ impl CrtRedirect {
                 _saved_stderr: saved_stderr,
             });
         }
-        Self { _bindings: bindings }
+        Self {
+            _bindings: bindings,
+        }
     }
 }
 
@@ -388,11 +390,21 @@ unsafe fn resolve_crt_apis() -> Vec<(String, CrtApi)> {
         let Ok(module) = GetModuleHandleW(PCWSTR(wide.as_ptr())) else {
             continue;
         };
-        let Some(dup) = proc(module, b"_dup\0") else { continue; };
-        let Some(dup2) = proc(module, b"_dup2\0") else { continue; };
-        let Some(close) = proc(module, b"_close\0") else { continue; };
-        let Some(open_osfhandle) = proc(module, b"_open_osfhandle\0") else { continue; };
-        let Some(flushall) = proc(module, b"_flushall\0") else { continue; };
+        let Some(dup) = proc(module, b"_dup\0") else {
+            continue;
+        };
+        let Some(dup2) = proc(module, b"_dup2\0") else {
+            continue;
+        };
+        let Some(close) = proc(module, b"_close\0") else {
+            continue;
+        };
+        let Some(open_osfhandle) = proc(module, b"_open_osfhandle\0") else {
+            continue;
+        };
+        let Some(flushall) = proc(module, b"_flushall\0") else {
+            continue;
+        };
         let iob_func = proc(module, b"__acrt_iob_func\0").map(|value| std::mem::transmute(value));
         let setvbuf = proc(module, b"setvbuf\0").map(|value| std::mem::transmute(value));
         result.push((

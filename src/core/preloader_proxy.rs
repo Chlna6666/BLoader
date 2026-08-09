@@ -141,7 +141,8 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
         let resolved = canonical_or_original(&crate::utils::get_module_path(module.0 as usize));
         if paths_equivalent(&expected, &resolved) {
             mod_diagnostics::mark_loaded(&identity, module.0 as usize, "preloader_preexisting");
-            let detail = "PreLoader was already loaded from the requested package; proxy ownership accepted";
+            let detail =
+                "PreLoader was already loaded from the requested package; proxy ownership accepted";
             logging::write_bootstrap_marker(&format!(
                 "preloader.priority.preexisting module=0x{:X} path={}",
                 module.0 as usize,
@@ -205,7 +206,8 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
     // initialization; changing global CRT state around that work can race the
     // already-starting Minecraft process.
     let load_result = {
-        let _scope = mod_diagnostics::enter_scope(&identity, "LoadLibrary:preloader_priority_early");
+        let _scope =
+            mod_diagnostics::enter_scope(&identity, "LoadLibrary:preloader_priority_early");
         let wide = wide_null(expected.as_os_str());
         LoadLibraryW(PCWSTR(wide.as_ptr()))
     };
@@ -379,10 +381,6 @@ fn wide_null(value: &std::ffi::OsStr) -> Vec<u16> {
     value.encode_wide().chain(Some(0)).collect()
 }
 
-fn publish_status(status: ProxyStatus<'_>) {
-    let path = PathBuf::from("logs").join("preloader-status.json");
-    let _ = fs::create_dir_all("logs");
-    if let Ok(data) = serde_json::to_vec_pretty(&status) {
-        let _ = fs::write(path, data);
-    }
+fn publish_status(_status: ProxyStatus<'_>) {
+    // no-disk diagnostic build: status is live only.
 }

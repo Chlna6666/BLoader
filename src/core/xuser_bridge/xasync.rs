@@ -4,8 +4,8 @@ use core::ffi::{c_char, c_void};
 
 use super::{
     abi::{
-        E_FAIL, E_POINTER, HResult, XAsyncBlock, XAsyncProvider, CLSID_XTHREADING_IMPL,
-        IID_IXTHREADING_IMPL,
+        CLSID_XTHREADING_IMPL, E_FAIL, E_POINTER, HResult, IID_IXTHREADING_IMPL, XAsyncBlock,
+        XAsyncProvider,
     },
     call_original_query,
 };
@@ -21,8 +21,11 @@ struct XThreadingVtable {
     add_ref: usize,
     release: unsafe extern "system" fn(*mut XThreadingInterface) -> u32,
     async_get_status: usize,
-    async_get_result_size:
-        unsafe extern "system" fn(*mut XThreadingInterface, *mut XAsyncBlock, *mut usize) -> HResult,
+    async_get_result_size: unsafe extern "system" fn(
+        *mut XThreadingInterface,
+        *mut XAsyncBlock,
+        *mut usize,
+    ) -> HResult,
     async_cancel: usize,
     async_run: usize,
     async_begin: unsafe extern "system" fn(
@@ -117,22 +120,13 @@ pub unsafe fn schedule(async_block: *mut XAsyncBlock, delay_ms: u32) -> HResult 
     unsafe { (threading.vtable().async_schedule)(threading.0, async_block, delay_ms) }
 }
 
-pub unsafe fn complete(
-    async_block: *mut XAsyncBlock,
-    result: HResult,
-    required_size: usize,
-) {
+pub unsafe fn complete(async_block: *mut XAsyncBlock, result: HResult, required_size: usize) {
     if async_block.is_null() {
         return;
     }
     if let Ok(threading) = ThreadingHandle::acquire() {
         unsafe {
-            (threading.vtable().async_complete)(
-                threading.0,
-                async_block,
-                result,
-                required_size,
-            );
+            (threading.vtable().async_complete)(threading.0, async_block, result, required_size);
         }
     }
 }

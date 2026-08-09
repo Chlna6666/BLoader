@@ -220,9 +220,7 @@ unsafe fn install_hook(
     original_slot: &AtomicUsize,
 ) {
     let Some(target) = GetProcAddress(module, name) else {
-        logging::warn_message(&format!(
-            "[overlay-input] user32 export not found: {label}"
-        ));
+        logging::warn_message(&format!("[overlay-input] user32 export not found: {label}"));
         return;
     };
 
@@ -350,9 +348,7 @@ unsafe extern "system" fn detour_set_capture(hwnd: HWND) -> HWND {
 }
 
 unsafe extern "system" fn detour_set_cursor_pos(x: i32, y: i32) -> BOOL {
-    if OVERLAY_ACTIVE.load(Ordering::Acquire)
-        && !arcui_hook::dx12::cursor_warp_bypass_active()
-    {
+    if OVERLAY_ACTIVE.load(Ordering::Acquire) && !arcui_hook::dx12::cursor_warp_bypass_active() {
         // Minecraft recenters the hardware cursor for camera look. Pretend the
         // request succeeded while ArcUI owns input, otherwise the pointer is
         // pulled back to the game centre every frame.
@@ -401,9 +397,7 @@ fn spawn_gameinput_probe() {
 
 fn mark_gameinput_barrier_ready() {
     if !GAMEINPUT_BARRIER_READY.swap(true, Ordering::AcqRel) {
-        logging::info_message(
-            "[overlay-input] GameInput keyboard/mouse reading barrier active",
-        );
+        logging::info_message("[overlay-input] GameInput keyboard/mouse reading barrier active");
     }
 }
 

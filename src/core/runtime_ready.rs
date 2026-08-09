@@ -126,8 +126,7 @@ pub fn wait_for(level: ReadyLevel, timeout: Duration) -> bool {
                         STABLE_WINDOW_DURATION.as_millis()
                     ),
                 );
-            } else if candidate_since
-                .is_some_and(|since| since.elapsed() >= STABLE_WINDOW_DURATION)
+            } else if candidate_since.is_some_and(|since| since.elapsed() >= STABLE_WINDOW_DURATION)
             {
                 logging::scoped_info_message(
                     "runtime-ready",
@@ -254,8 +253,14 @@ mod tests {
 
     #[test]
     fn parses_manifest_ready_levels() {
-        assert_eq!(ReadyLevel::from_manifest("process"), Some(ReadyLevel::Process));
-        assert_eq!(ReadyLevel::from_manifest("window"), Some(ReadyLevel::Window));
+        assert_eq!(
+            ReadyLevel::from_manifest("process"),
+            Some(ReadyLevel::Process)
+        );
+        assert_eq!(
+            ReadyLevel::from_manifest("window"),
+            Some(ReadyLevel::Window)
+        );
         assert_eq!(
             ReadyLevel::from_manifest("stable-window"),
             Some(ReadyLevel::StableWindow)

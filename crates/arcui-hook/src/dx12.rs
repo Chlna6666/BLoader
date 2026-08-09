@@ -61,9 +61,9 @@ use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, WaitF
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, ClipCursor, DefWindowProcW, GWLP_WNDPROC, GetForegroundWindow,
     GetWindowThreadProcessId, HTCLIENT, IDC_ARROW, LoadCursorW, MA_ACTIVATEANDEAT, PostMessageW,
-    SetCursor, SetCursorPos, SetWindowLongPtrW, ShowCursor,
-    WM_INPUT, WM_KEYUP, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYUP, WM_XBUTTONUP,
+    SetCursor, SetCursorPos, SetWindowLongPtrW, ShowCursor, WM_INPUT, WM_KEYUP, WM_LBUTTONUP,
+    WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_SYSKEYUP, WM_XBUTTONUP,
 };
 use windows::core::{BOOL, IUnknown, Interface, w};
 use windows_numerics::Vector2;
@@ -845,12 +845,8 @@ fn resolve_input_window(swap_chain: &IDXGISwapChain3) -> HWND {
 
     // Exact ChiyanMap-compatible class-name fallback, but do not accidentally
     // subclass another Minecraft process.
-    let minecraft = unsafe {
-        FindWindowW(
-            windows::core::w!("Minecraft").as_ptr(),
-            std::ptr::null(),
-        )
-    };
+    let minecraft =
+        unsafe { FindWindowW(windows::core::w!("Minecraft").as_ptr(), std::ptr::null()) };
     if window_belongs_to_current_process(minecraft) {
         return minecraft;
     }
@@ -1260,14 +1256,8 @@ fn schedule_cursor_warp(delay: Duration) {
         let packed_x = (client_x as i16 as u16) as u32;
         let packed_y = (client_y as i16 as u16) as u32;
         let packed = packed_x | (packed_y << 16);
-        let _ = unsafe {
-            PostMessageW(
-                Some(hwnd),
-                WM_MOUSEMOVE,
-                WPARAM(0),
-                LPARAM(packed as isize),
-            )
-        };
+        let _ =
+            unsafe { PostMessageW(Some(hwnd), WM_MOUSEMOVE, WPARAM(0), LPARAM(packed as isize)) };
     });
 }
 

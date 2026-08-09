@@ -6,13 +6,11 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::{
     abi::{
-        E_FAIL, E_INVALIDARG, E_NOT_SUFFICIENT_BUFFER, E_POINTER, HResult, S_OK,
-        TokenData, TokenHeader, TokenUtf16Data, TokenUtf16Header, XAsyncBlock,
-        XAsyncOp, XAsyncProviderData, XUserHandle,
+        E_FAIL, E_INVALIDARG, E_NOT_SUFFICIENT_BUFFER, E_POINTER, HResult, S_OK, TokenData,
+        TokenHeader, TokenUtf16Data, TokenUtf16Header, XAsyncBlock, XAsyncOp, XAsyncProviderData,
+        XUserHandle,
     },
-    session,
-    xasync,
-    xuser,
+    session, xasync, xuser,
 };
 
 const TOKEN_OPTIONS_MASK: u32 = 0x03;
@@ -121,10 +119,8 @@ impl TokenContext {
         let policy_header_values =
             select_policy_header_values(&headers, &policy.extra_header_names);
 
-        let authorization_text = Zeroizing::new(format!(
-            "XBL3.0 x={};{}",
-            token.user_hash, token.token
-        ));
+        let authorization_text =
+            Zeroizing::new(format!("XBL3.0 x={};{}", token.user_hash, token.token));
         let mut authorization = authorization_text.as_bytes().to_vec();
         authorization.push(0);
         let mut authorization_utf16 = authorization_text.encode_utf16().collect::<Vec<_>>();
@@ -161,18 +157,13 @@ impl TokenContext {
             .collect::<Vec<_>>();
         let body_to_sign = &self.body[..self.body.len().min(self.max_body_bytes)];
 
-        let signature_text = Zeroizing::new(
-            session()
-                .ok_or(E_FAIL)?
-                .signing_key
-                .sign_request(
-                    &self.method,
-                    &self.request_target,
-                    authorization,
-                    &policy_header_values,
-                    body_to_sign,
-                )?,
-        );
+        let signature_text = Zeroizing::new(session().ok_or(E_FAIL)?.signing_key.sign_request(
+            &self.method,
+            &self.request_target,
+            authorization,
+            &policy_header_values,
+            body_to_sign,
+        )?);
         self.body.zeroize();
         self.body.clear();
         self.policy_header_values.zeroize();
@@ -691,11 +682,15 @@ fn url_host(url: &str) -> Option<String> {
         .find_map(|(index, character)| matches!(character, '/' | '?' | '#').then_some(index))
         .unwrap_or(authority.len());
     let authority = &authority[..end];
-    let host_port = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
     let host = if let Some(value) = host_port.strip_prefix('[') {
         value.split_once(']')?.0
     } else {
-        host_port.split_once(':').map_or(host_port, |(host, _)| host)
+        host_port
+            .split_once(':')
+            .map_or(host_port, |(host, _)| host)
     };
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }

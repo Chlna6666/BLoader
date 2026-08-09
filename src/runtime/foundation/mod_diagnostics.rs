@@ -71,10 +71,14 @@ fn active_scopes() -> &'static Mutex<Vec<ActiveScope>> {
 
 pub fn default_aliases(id: &str, name: &str, dll_path: &Path, extra: &[String]) -> Vec<String> {
     let mut aliases = Vec::new();
-    for value in [Some(id), Some(name), dll_path.file_stem().and_then(|value| value.to_str())]
-        .into_iter()
-        .flatten()
-        .chain(extra.iter().map(String::as_str))
+    for value in [
+        Some(id),
+        Some(name),
+        dll_path.file_stem().and_then(|value| value.to_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(extra.iter().map(String::as_str))
     {
         let normalized = value.trim();
         if normalized.is_empty()
@@ -151,7 +155,11 @@ pub fn mark_failed(identity: &ModIdentity, phase: &str, detail: &str) {
     let _ = write_registry_snapshot();
 }
 
-fn update_identity(identity: &ModIdentity, module_handle: Option<String>, state: &str) -> ModIdentity {
+fn update_identity(
+    identity: &ModIdentity,
+    module_handle: Option<String>,
+    state: &str,
+) -> ModIdentity {
     let mut registry = mods().lock().unwrap_or_else(|error| error.into_inner());
     if let Some(existing) = registry
         .iter_mut()
@@ -209,7 +217,6 @@ impl Drop for ModScopeGuard {
         }
     }
 }
-
 
 pub fn active_scope_for_thread(thread_id: u32) -> Option<ActiveScopeSnapshot> {
     let scopes = active_scopes().try_lock().ok()?;
@@ -296,9 +303,10 @@ pub fn resolve_output_owner(line: &str) -> Option<ModIdentity> {
     let mut candidates = registry
         .iter()
         .filter(|identity| {
-            identity.aliases.iter().any(|alias| {
-                alias.len() >= 4 && lower.contains(&alias.to_ascii_lowercase())
-            })
+            identity
+                .aliases
+                .iter()
+                .any(|alias| alias.len() >= 4 && lower.contains(&alias.to_ascii_lowercase()))
         })
         .cloned();
     let first = candidates.next()?;
@@ -354,7 +362,9 @@ pub fn identify_address(address: usize) -> Option<ModIdentity> {
 }
 
 pub fn first_identity_for_addresses(addresses: &[usize]) -> Option<ModIdentity> {
-    addresses.iter().find_map(|address| identify_address(*address))
+    addresses
+        .iter()
+        .find_map(|address| identify_address(*address))
 }
 
 pub fn inventory_text() -> String {
@@ -476,5 +486,6 @@ fn canonical_text(path: &Path) -> String {
 }
 
 fn paths_equal_text(left: &str, right: &str) -> bool {
-    left.replace('/', "\\").eq_ignore_ascii_case(&right.replace('/', "\\"))
+    left.replace('/', "\\")
+        .eq_ignore_ascii_case(&right.replace('/', "\\"))
 }

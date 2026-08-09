@@ -3,7 +3,10 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use core::ffi::c_void;
 use sha2::{Digest, Sha256};
-use std::{ptr, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    ptr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use zeroize::Zeroize;
 
 use super::abi::{E_FAIL, E_INVALIDARG, HResult};
@@ -84,12 +87,7 @@ impl SigningKey {
         let blob_type = wide("ECCPRIVATEBLOB");
         let mut algorithm = ptr::null_mut();
         let status = unsafe {
-            BCryptOpenAlgorithmProvider(
-                &mut algorithm,
-                algorithm_name.as_ptr(),
-                ptr::null(),
-                0,
-            )
+            BCryptOpenAlgorithmProvider(&mut algorithm, algorithm_name.as_ptr(), ptr::null(), 0)
         };
         if status != 0 {
             blob.zeroize();

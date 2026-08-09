@@ -2,11 +2,11 @@ use std::io::{self, Write};
 use std::sync::OnceLock;
 
 use chrono::Local;
-use tracing::{debug, error, info, trace, warn, Level};
+use tracing::{Level, debug, error, info, trace, warn};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{fmt, EnvFilter, Layer};
+use tracing_subscriber::{EnvFilter, Layer, fmt};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::WriteFile;
 use windows::Win32::System::Console::{
@@ -46,11 +46,15 @@ impl Write for LiveWriter {
         }
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 pub fn init(level: &str) {
-    if LOGGING_READY.get().is_some() { return; }
+    if LOGGING_READY.get().is_some() {
+        return;
+    }
     let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
     let layer = fmt::layer()
         .with_target(false)
@@ -60,55 +64,118 @@ pub fn init(level: &str) {
         .with_filter(filter);
     let _ = tracing_subscriber::registry().with(layer).try_init();
     let _ = LOGGING_READY.set(());
-    write_bootstrap_marker(&format!("logging.init.ready level={level} sink=console+debug no_disk=true"));
+    write_bootstrap_marker(&format!(
+        "logging.init.ready level={level} sink=console+debug no_disk=true"
+    ));
 }
 
-pub fn is_ready() -> bool { LOGGING_READY.get().is_some() }
+pub fn is_ready() -> bool {
+    LOGGING_READY.get().is_some()
+}
 
 pub fn captured_mod_output(mod_name: &str, _mod_id: &str, stream: &str, message: &str) {
     log_message(Level::INFO, mod_name, &format!("{stream} | {message}"));
 }
 
 pub fn captured_process_output(stream: &str, message: &str) {
-    log_message(Level::INFO, "native-stdio", &format!("{stream} | {message}"));
+    log_message(
+        Level::INFO,
+        "native-stdio",
+        &format!("{stream} | {message}"),
+    );
 }
 
 pub fn set_console_handle(handle: HANDLE) {
     let _ = CONSOLE_HANDLE.set(SendHandle(handle));
     enable_console_ansi(handle);
-    write_bootstrap_marker(&format!("logging.console.ready handle=0x{:X}", handle.0 as usize));
+    write_bootstrap_marker(&format!(
+        "logging.console.ready handle=0x{:X}",
+        handle.0 as usize
+    ));
 }
 
-pub fn startup_banner(loader_name: &str, loader_version: &str, application_name: &str, application_version: &str, locale: &str) {
-    log_message(Level::INFO, "bootstrap", &format!("{loader_name} v{loader_version} | host={application_name} v{application_version} | locale={locale} | diagnostics=memory-only"));
+pub fn startup_banner(
+    loader_name: &str,
+    loader_version: &str,
+    application_name: &str,
+    application_version: &str,
+    locale: &str,
+) {
+    log_message(
+        Level::INFO,
+        "bootstrap",
+        &format!(
+            "{loader_name} v{loader_version} | host={application_name} v{application_version} | locale={locale} | diagnostics=memory-only"
+        ),
+    );
 }
 
-pub fn info_message(message: &str) { log_message(Level::INFO, "loader", message); }
-pub fn warn_message(message: &str) { log_message(Level::WARN, "loader", message); }
-pub fn error_message(message: &str) { log_message(Level::ERROR, "loader", message); }
-pub fn debug_message(message: &str) { log_message(Level::DEBUG, "loader", message); }
-pub fn trace_message(message: &str) { log_message(Level::TRACE, "loader", message); }
-pub fn scoped_info_message(scope: &str, message: &str) { log_message(Level::INFO, scope, message); }
-pub fn scoped_warn_message(scope: &str, message: &str) { log_message(Level::WARN, scope, message); }
-pub fn scoped_error_message(scope: &str, message: &str) { log_message(Level::ERROR, scope, message); }
-pub fn scoped_debug_message(scope: &str, message: &str) { log_message(Level::DEBUG, scope, message); }
-pub fn scoped_trace_message(scope: &str, message: &str) { log_message(Level::TRACE, scope, message); }
-pub fn emergency_error_message(scope: &str, message: &str) { emergency_log_message(Level::ERROR, scope, message); }
-pub fn emergency_warn_message(scope: &str, message: &str) { emergency_log_message(Level::WARN, scope, message); }
-pub fn emergency_info_message(scope: &str, message: &str) { emergency_log_message(Level::INFO, scope, message); }
+pub fn info_message(message: &str) {
+    log_message(Level::INFO, "loader", message);
+}
+pub fn warn_message(message: &str) {
+    log_message(Level::WARN, "loader", message);
+}
+pub fn error_message(message: &str) {
+    log_message(Level::ERROR, "loader", message);
+}
+pub fn debug_message(message: &str) {
+    log_message(Level::DEBUG, "loader", message);
+}
+pub fn trace_message(message: &str) {
+    log_message(Level::TRACE, "loader", message);
+}
+pub fn scoped_info_message(scope: &str, message: &str) {
+    log_message(Level::INFO, scope, message);
+}
+pub fn scoped_warn_message(scope: &str, message: &str) {
+    log_message(Level::WARN, scope, message);
+}
+pub fn scoped_error_message(scope: &str, message: &str) {
+    log_message(Level::ERROR, scope, message);
+}
+pub fn scoped_debug_message(scope: &str, message: &str) {
+    log_message(Level::DEBUG, scope, message);
+}
+pub fn scoped_trace_message(scope: &str, message: &str) {
+    log_message(Level::TRACE, scope, message);
+}
+pub fn emergency_error_message(scope: &str, message: &str) {
+    emergency_log_message(Level::ERROR, scope, message);
+}
+pub fn emergency_warn_message(scope: &str, message: &str) {
+    emergency_log_message(Level::WARN, scope, message);
+}
+pub fn emergency_info_message(scope: &str, message: &str) {
+    emergency_log_message(Level::INFO, scope, message);
+}
 
 pub fn write_bootstrap_marker(message: &str) {
-    let line = format!("[{}] [BOOT] {}\r\n", Local::now().format("%Y-%m-%d %H:%M:%S%.3f"), message);
+    let line = format!(
+        "[{}] [BOOT] {}\r\n",
+        Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+        message
+    );
     write_debug_string(&line);
     write_bytes_to_console(line.as_bytes());
 }
 
 fn log_message(level: Level, scope: &str, message: &str) {
-    if is_ready() { emit_event(level, scope, message); } else { emergency_log_message(level, scope, message); }
+    if is_ready() {
+        emit_event(level, scope, message);
+    } else {
+        emergency_log_message(level, scope, message);
+    }
 }
 
 fn emergency_log_message(level: Level, scope: &str, message: &str) {
-    let line = format!("[{}] [{}] [{}] {}\r\n", Local::now().format("%Y-%m-%d %H:%M:%S%.3f"), level_label(level), scope, message);
+    let line = format!(
+        "[{}] [{}] [{}] {}\r\n",
+        Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+        level_label(level),
+        scope,
+        message
+    );
     write_bytes_to_console(line.as_bytes());
     write_debug_string(&line);
 }
@@ -125,27 +192,51 @@ fn emit_event(level: Level, scope: &str, message: &str) {
 }
 
 fn level_label(level: Level) -> &'static str {
-    match level { Level::ERROR => "ERROR", Level::WARN => "WARN", Level::INFO => "INFO", Level::DEBUG => "DEBUG", Level::TRACE => "TRACE" }
+    match level {
+        Level::ERROR => "ERROR",
+        Level::WARN => "WARN",
+        Level::INFO => "INFO",
+        Level::DEBUG => "DEBUG",
+        Level::TRACE => "TRACE",
+    }
 }
 
 fn write_bytes_to_console(bytes: &[u8]) {
-    if bytes.is_empty() { return; }
-    let Some(handle) = CONSOLE_HANDLE.get().map(|v| v.0) else { return; };
-    if handle.is_invalid() { return; }
-    unsafe { let mut written = 0; let _ = WriteFile(handle, Some(bytes), Some(&mut written), None); }
+    if bytes.is_empty() {
+        return;
+    }
+    let Some(handle) = CONSOLE_HANDLE.get().map(|v| v.0) else {
+        return;
+    };
+    if handle.is_invalid() {
+        return;
+    }
+    unsafe {
+        let mut written = 0;
+        let _ = WriteFile(handle, Some(bytes), Some(&mut written), None);
+    }
 }
 
 fn enable_console_ansi(handle: HANDLE) {
-    if handle.is_invalid() { return; }
+    if handle.is_invalid() {
+        return;
+    }
     unsafe {
         let mut mode = CONSOLE_MODE(0);
         if GetConsoleMode(handle, &mut mode).is_ok() {
-            let _ = SetConsoleMode(handle, mode | ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            let _ = SetConsoleMode(
+                handle,
+                mode | ENABLE_PROCESSED_OUTPUT
+                    | ENABLE_WRAP_AT_EOL_OUTPUT
+                    | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+            );
         }
     }
 }
 
 fn write_debug_string(line: &str) {
     let wide: Vec<u16> = line.encode_utf16().chain(Some(0)).collect();
-    unsafe { OutputDebugStringW(wide.as_ptr()); }
+    unsafe {
+        OutputDebugStringW(wide.as_ptr());
+    }
 }

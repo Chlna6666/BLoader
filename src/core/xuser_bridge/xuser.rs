@@ -8,18 +8,17 @@ mod lifecycle;
 
 use super::{
     abi::{
-        E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_NOT_SUFFICIENT_BUFFER,
-        E_POINTER, Guid, HResult, IID_IUNKNOWN, IID_IXUSER_ADD_WITH_UI,
-        IID_IXUSER_BASE, IID_IXUSER_GAMERTAG, IID_IXUSER_MSA, IID_IXUSER_PLATFORM,
-        IID_IXUSER_SIGN_OUT, IID_IXUSER_STORE, S_OK, XAsyncBlock, XAsyncOp,
-        XAsyncProviderData, XUserGamertagVtable, XUserHandle, XUserLocalId,
-        XUserVtable, XUSER_STATE_SIGNED_IN,
+        E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_NOT_SUFFICIENT_BUFFER, E_NOTIMPL, E_POINTER, Guid,
+        HResult, IID_IUNKNOWN, IID_IXUSER_ADD_WITH_UI, IID_IXUSER_BASE, IID_IXUSER_GAMERTAG,
+        IID_IXUSER_MSA, IID_IXUSER_PLATFORM, IID_IXUSER_SIGN_OUT, IID_IXUSER_STORE, S_OK,
+        XAsyncBlock, XAsyncOp, XAsyncProviderData, XUSER_STATE_SIGNED_IN, XUserGamertagVtable,
+        XUserHandle, XUserLocalId, XUserVtable,
     },
     bridge_info, bridge_warn, session, token, xasync,
 };
 use lifecycle::{
     E_GAMEUSER_SIGNED_OUT, E_GAMEUSER_USER_NOT_FOUND, XTaskQueueRegistrationToken,
-    XUserChangeEventCallback, XUSER_STATE_SIGNING_OUT,
+    XUSER_STATE_SIGNING_OUT, XUserChangeEventCallback,
 };
 
 #[repr(C)]
@@ -166,10 +165,7 @@ unsafe extern "system" fn compare(
     i32::from(user1 != user2)
 }
 
-unsafe extern "system" fn get_max_users(
-    _interface: *mut c_void,
-    max_users: *mut u32,
-) -> HResult {
+unsafe extern "system" fn get_max_users(_interface: *mut c_void, max_users: *mut u32) -> HResult {
     if max_users.is_null() {
         return E_POINTER;
     }
@@ -439,11 +435,7 @@ unsafe extern "system" fn check_privilege(
     if lifecycle::state() != XUSER_STATE_SIGNED_IN {
         return E_GAMEUSER_SIGNED_OUT;
     }
-    let allowed = privilege >= 0
-        && session()
-            .unwrap()
-            .privileges
-            .contains(&(privilege as u32));
+    let allowed = privilege >= 0 && session().unwrap().privileges.contains(&(privilege as u32));
     unsafe {
         has_privilege.write(u8::from(allowed));
         deny_reason.write(0);
@@ -458,9 +450,7 @@ unsafe extern "system" fn register_for_change_event(
     callback: Option<XUserChangeEventCallback>,
     registration_token: *mut XTaskQueueRegistrationToken,
 ) -> HResult {
-    unsafe {
-        lifecycle::register_for_change_event(context, callback, registration_token)
-    }
+    unsafe { lifecycle::register_for_change_event(context, callback, registration_token) }
 }
 
 unsafe extern "system" fn unregister_for_change_event(

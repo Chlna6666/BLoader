@@ -90,11 +90,7 @@ unsafe extern "system" {
         context_length: *mut u32,
     ) -> i32;
     #[link_name = "CopyContext"]
-    fn copy_context(
-        destination: *mut CONTEXT,
-        context_flags: u32,
-        source: *const CONTEXT,
-    ) -> i32;
+    fn copy_context(destination: *mut CONTEXT, context_flags: u32, source: *const CONTEXT) -> i32;
 }
 
 /// Arms a one-byte INT3 gate at the host executable's original entry point.
@@ -109,9 +105,7 @@ unsafe extern "system" {
 /// later consumed by RtlRestoreContext.
 pub unsafe fn install_for_process_start(static_process_attach: bool) -> bool {
     if !static_process_attach {
-        logging::write_bootstrap_marker(
-            "premain-gate.skipped reason=dynamic-load-or-late-attach",
-        );
+        logging::write_bootstrap_marker("premain-gate.skipped reason=dynamic-load-or-late-attach");
         return false;
     }
 
@@ -217,12 +211,7 @@ unsafe fn initialize_saved_context() -> Option<(*mut CONTEXT, u32, u32)> {
     // the base-context fallback.
     context = ptr::null_mut();
     context_length = SAVED_CONTEXT_BUFFER_SIZE as u32;
-    if initialize_context(
-        buffer,
-        CONTEXT_ALL_AMD64,
-        &mut context,
-        &mut context_length,
-    ) != 0
+    if initialize_context(buffer, CONTEXT_ALL_AMD64, &mut context, &mut context_length) != 0
         && !context.is_null()
     {
         return Some((context, CONTEXT_ALL_AMD64, context_length));
@@ -236,9 +225,7 @@ unsafe fn initialize_saved_context() -> Option<(*mut CONTEXT, u32, u32)> {
 /// The handler restores the OEP byte, copies processor state with CopyContext,
 /// redirects RIP to the ordinary trampoline, and returns. No BLoader bootstrap,
 /// logging, allocation, or third-party loading is performed here.
-unsafe extern "system" fn pre_main_vectored_handler(
-    exception: *mut EXCEPTION_POINTERS,
-) -> i32 {
+unsafe extern "system" fn pre_main_vectored_handler(exception: *mut EXCEPTION_POINTERS) -> i32 {
     if !GATE_ARMED.load(Ordering::Acquire)
         || exception.is_null()
         || (*exception).ExceptionRecord.is_null()
@@ -434,7 +421,10 @@ unsafe fn pe_entry_point(image_base: usize) -> Option<usize> {
 
     let optional = nt.checked_add(4 + 20)?;
     let magic = read_u16(optional)?;
-    if !matches!(magic, IMAGE_NT_OPTIONAL_HDR32_MAGIC | IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+    if !matches!(
+        magic,
+        IMAGE_NT_OPTIONAL_HDR32_MAGIC | IMAGE_NT_OPTIONAL_HDR64_MAGIC
+    ) {
         return None;
     }
 

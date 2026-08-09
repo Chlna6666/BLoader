@@ -287,7 +287,6 @@ unsafe fn bootstrap(
     runtime::foundation::logging::write_bootstrap_marker("bootstrap.config.loaded");
     runtime::foundation::logging::init(&config.log_level);
     runtime::foundation::logging::write_bootstrap_marker("bootstrap.logging.ready");
-    runtime::foundation::crash_report::spawn_external_logger(utils::loader_module_handle());
     runtime::foundation::i18n::init(&config);
     runtime::foundation::logging::write_bootstrap_marker("bootstrap.i18n.ready");
 

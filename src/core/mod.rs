@@ -1,5 +1,7 @@
 pub mod console;
 pub mod file_redirection;
+#[cfg(feature = "panel-ui")]
+pub mod global_input;
 pub mod loader;
 pub mod network_hook;
 pub mod pre_main_gate;
@@ -7,8 +9,6 @@ pub mod preloader_proxy;
 pub mod runtime_ready;
 #[path = "xuser_bridge/mod.rs"]
 pub mod xuser_bridge;
-#[cfg(feature = "panel-ui")]
-pub mod global_input;
 
 #[path = "render/d3d12_queue.rs"]
 pub mod d3d12_queue;

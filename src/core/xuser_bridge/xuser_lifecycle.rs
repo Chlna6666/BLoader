@@ -5,8 +5,7 @@ use minhook::MinHook;
 use std::{
     cell::Cell,
     collections::HashMap,
-    mem,
-    ptr,
+    mem, ptr,
     sync::{
         Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -15,7 +14,7 @@ use std::{
 };
 
 use super::super::{
-    abi::{E_FAIL, E_POINTER, HResult, S_OK, XUserLocalId, XUSER_STATE_SIGNED_IN},
+    abi::{E_FAIL, E_POINTER, HResult, S_OK, XUSER_STATE_SIGNED_IN, XUserLocalId},
     bridge_info, bridge_warn, session,
 };
 
@@ -36,8 +35,7 @@ pub struct XTaskQueueRegistrationToken {
     pub token: u64,
 }
 
-pub type XUserChangeEventCallback =
-    unsafe extern "system" fn(*mut c_void, XUserLocalId, u32);
+pub type XUserChangeEventCallback = unsafe extern "system" fn(*mut c_void, XUserLocalId, u32);
 
 type RtlExitUserProcessFn = unsafe extern "system" fn(i32);
 
@@ -237,11 +235,9 @@ pub fn duplicate_active_handle() -> HResult {
 }
 
 pub fn release_user_handle() -> Option<usize> {
-    let previous = USER_HANDLE_COUNT.fetch_update(
-        Ordering::AcqRel,
-        Ordering::Acquire,
-        |count| (count != 0).then_some(count - 1),
-    );
+    let previous = USER_HANDLE_COUNT.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+        (count != 0).then_some(count - 1)
+    });
     match previous {
         Ok(count) => {
             // Closing the final title-owned handle is not an account sign-out.
@@ -411,8 +407,7 @@ fn install_process_exit_hook() -> Result<(), String> {
 
     bridge_info(&format!(
         "已安装正常退出生命周期 Hook | target=ntdll!RtlExitUserProcess | address=0x{:X} | trampoline=0x{:X}",
-        target as usize,
-        trampoline as usize
+        target as usize, trampoline as usize
     ));
     Ok(())
 }
@@ -488,10 +483,7 @@ pub unsafe fn register_for_change_event(
     S_OK
 }
 
-pub unsafe fn unregister_for_change_event(
-    token: XTaskQueueRegistrationToken,
-    wait: u8,
-) -> u8 {
+pub unsafe fn unregister_for_change_event(token: XTaskQueueRegistrationToken, wait: u8) -> u8 {
     if token.token == 0 {
         return 1;
     }
@@ -521,9 +513,7 @@ pub unsafe fn unregister_for_change_event(
         && USER_WAS_ADDED.load(Ordering::Acquire)
         && !PROCESS_SHUTDOWN_STARTED.load(Ordering::Acquire)
     {
-        bridge_info(
-            "最后一个 XUser 变更订阅正在注销；在移除回调前派发 SigningOut 生命周期",
-        );
+        bridge_info("最后一个 XUser 变更订阅正在注销；在移除回调前派发 SigningOut 生命周期");
         begin_sign_out("last-change-registration-unregister");
     }
 
@@ -596,11 +586,9 @@ pub unsafe fn close_sign_out_deferral_handle(deferral: *mut c_void) {
         return;
     }
     drop(deferral);
-    let previous = SIGNOUT_DEFERRALS.fetch_update(
-        Ordering::AcqRel,
-        Ordering::Acquire,
-        |count| (count != 0).then_some(count - 1),
-    );
+    let previous = SIGNOUT_DEFERRALS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+        (count != 0).then_some(count - 1)
+    });
     if matches!(previous, Ok(1)) {
         try_complete_sign_out();
     }

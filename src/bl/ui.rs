@@ -1827,14 +1827,7 @@ fn render_network_settings_card(
         return;
     }
 
-    draw_panel_surface_clipped(
-        ui,
-        rect,
-        OVERLAY_CARD_BG,
-        OVERLAY_BORDER,
-        14.0,
-        clip_rect,
-    );
+    draw_panel_surface_clipped(ui, rect, OVERLAY_CARD_BG, OVERLAY_BORDER, 14.0, clip_rect);
 
     let mut changed = false;
 
@@ -1964,7 +1957,11 @@ fn render_network_settings_card(
     let mut hex_x = rect.min.x + 220.0;
     for &hb in &hex_presets {
         let h_rect = Rect::from_min_size(Vec2::new(hex_x, row3_y), Vec2::new(btn_width, btn_h));
-        let label = if hb == 0 { "Off".to_string() } else { format!("{}B", hb) };
+        let label = if hb == 0 {
+            "Off".to_string()
+        } else {
+            format!("{}B", hb)
+        };
         let colors = if runtime.config.network_log_hex_bytes == hb {
             BUTTON_COLORS
         } else {

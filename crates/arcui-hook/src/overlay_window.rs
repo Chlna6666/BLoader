@@ -5,19 +5,19 @@ use std::time::Duration;
 
 use arcui_core::Rect;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{ClientToScreen, GetStockObject, BLACK_BRUSH, HBRUSH};
+use windows::Win32::Graphics::Gdi::{BLACK_BRUSH, ClientToScreen, GetStockObject, HBRUSH};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, HTCLIENT, HWND_TOPMOST, HWND_TOP,
-    IDC_ARROW, IsWindowVisible, LWA_ALPHA, LoadCursorW, MA_ACTIVATE, MSG, PM_REMOVE, PeekMessageW,
-    PostQuitMessage, RegisterClassExW, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetCursor,
-    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, TranslateMessage,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GWL_STYLE, GetClientRect, GetParent,
+    GetWindowLongW, HTCLIENT, HWND_TOP, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, LWA_ALPHA,
+    LoadCursorW, MA_ACTIVATE, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassExW,
+    SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetCursor, SetForegroundWindow,
+    SetLayeredWindowAttributes, SetParent, SetWindowLongW, SetWindowPos, TranslateMessage,
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
     WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP,
-    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP, WS_CHILD, GetParent, SetParent,
-    GetWindowLongW, SetWindowLongW, GWL_STYLE,
+    WNDCLASSEXW, WS_CHILD, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{BOOL, w};
 
@@ -109,7 +109,7 @@ fn sync_capture_window(hwnd: HWND) {
     let Some(target) = target else {
         return;
     };
-    
+
     // Set parent dynamically to hook onto the game window
     unsafe {
         if GetParent(hwnd).unwrap_or_default() != target {
@@ -153,15 +153,7 @@ fn sync_capture_window(hwnd: HWND) {
     }
 
     unsafe {
-        let _ = SetWindowPos(
-            hwnd,
-            Some(HWND_TOP),
-            0,
-            0,
-            width,
-            height,
-            SWP_SHOWWINDOW,
-        );
+        let _ = SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, width, height, SWP_SHOWWINDOW);
         let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
     }
 }
@@ -315,9 +307,10 @@ fn force_foreground(hwnd: HWND) {
         if foreground == hwnd {
             return;
         }
-        let foreground_thread = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(foreground, None);
+        let foreground_thread =
+            windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(foreground, None);
         let our_thread = windows::Win32::System::Threading::GetCurrentThreadId();
-        
+
         if foreground_thread != our_thread {
             AttachThreadInput(foreground_thread, our_thread, BOOL(1));
             windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);

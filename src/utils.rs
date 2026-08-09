@@ -4,10 +4,10 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::Environment::SetCurrentDirectoryW;
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
+use windows::core::PCWSTR;
 
 static LOADER_MODULE: AtomicUsize = AtomicUsize::new(0);
 
@@ -31,12 +31,7 @@ struct VsFixedFileInfo {
 #[link(name = "version")]
 unsafe extern "system" {
     fn GetFileVersionInfoSizeW(filename: *const u16, handle: *mut u32) -> u32;
-    fn GetFileVersionInfoW(
-        filename: *const u16,
-        handle: u32,
-        len: u32,
-        data: *mut c_void,
-    ) -> i32;
+    fn GetFileVersionInfoW(filename: *const u16, handle: u32, len: u32, data: *mut c_void) -> i32;
     fn VerQueryValueW(
         block: *const c_void,
         sub_block: *const u16,

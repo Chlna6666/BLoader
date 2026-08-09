@@ -12,9 +12,9 @@ use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetWindowThreadProcessId, HHOOK,
     KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_REMOVE, PeekMessageW, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEWHEEL, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 use crate::runtime::foundation::logging;
@@ -156,7 +156,9 @@ fn global_input_thread() {
         logging::warn_message("[global-input] mouse hook unavailable");
     }
     if !keyboard_hook.is_invalid() || !mouse_hook.is_invalid() {
-        logging::info_message("[global-input] low-level keyboard/mouse observers armed (non-blocking)");
+        logging::info_message(
+            "[global-input] low-level keyboard/mouse observers armed (non-blocking)",
+        );
     }
 
     let mut message = MSG::default();

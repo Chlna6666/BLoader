@@ -10,8 +10,7 @@ use crate::runtime::foundation::{build_info, error_dialog, logging, mod_diagnost
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static DIALOG_SHOWN: AtomicBool = AtomicBool::new(false);
 
-type InvalidParameterHandler =
-    unsafe extern "C" fn(*const u16, *const u16, *const u16, u32, usize);
+type InvalidParameterHandler = unsafe extern "C" fn(*const u16, *const u16, *const u16, u32, usize);
 type PurecallHandler = unsafe extern "C" fn();
 
 unsafe extern "C" {
@@ -111,7 +110,10 @@ unsafe fn emit_exception(phase: &str, exception: *const EXCEPTION_POINTERS, show
         (0u32, 0usize)
     } else {
         let record = &*(*exception).ExceptionRecord;
-        (record.ExceptionCode.0 as u32, record.ExceptionAddress as usize)
+        (
+            record.ExceptionCode.0 as u32,
+            record.ExceptionAddress as usize,
+        )
     };
     let active = mod_diagnostics::active_context_text();
     let message = format!(
@@ -145,7 +147,9 @@ fn emit_manual_failure(phase: &str, details: &str, show_dialog: bool) {
     {
         error_dialog::show_fatal_error(
             "BLoader Runtime Failure",
-            &format!("{details}\n\nNo crash file or minidump was written by this diagnostic build."),
+            &format!(
+                "{details}\n\nNo crash file or minidump was written by this diagnostic build."
+            ),
         );
     }
 }

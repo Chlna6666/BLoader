@@ -127,8 +127,7 @@ pub struct XAsyncProviderData {
     pub context: *mut c_void,
 }
 
-pub type XAsyncProvider =
-    unsafe extern "system" fn(XAsyncOp, *const XAsyncProviderData) -> HResult;
+pub type XAsyncProvider = unsafe extern "system" fn(XAsyncOp, *const XAsyncProviderData) -> HResult;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

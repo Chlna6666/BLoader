@@ -41,8 +41,7 @@ unsafe extern "system" {
 }
 
 type WineGetStringFn = unsafe extern "C" fn() -> *const c_char;
-type WineGetHostVersionFn =
-    unsafe extern "C" fn(*mut *const c_char, *mut *const c_char);
+type WineGetHostVersionFn = unsafe extern "C" fn(*mut *const c_char, *mut *const c_char);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeKind {

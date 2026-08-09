@@ -61,16 +61,18 @@ pub unsafe fn load_bl_mod(
             mod_diagnostics::mark_failed(&identity, "entry_verification", detail);
             logging::scoped_error_message(
                 &format!("mod:{name}"),
-                &format!("BL_LOAD_FAILURE | id={manifest_id} path={} {detail}", path.display()),
+                &format!(
+                    "BL_LOAD_FAILURE | id={manifest_id} path={} {detail}",
+                    path.display()
+                ),
             );
             return false;
         }
     };
 
     let main_fn: BlModMainFn = std::mem::transmute(entry);
-    let api = host::with_active_mod_identity(&identity, "bl_mod_main_v1", || {
-        main_fn(host::host_api())
-    });
+    let api =
+        host::with_active_mod_identity(&identity, "bl_mod_main_v1", || main_fn(host::host_api()));
     if api.is_null() {
         let detail = "bl_mod_main_v1 returned null API";
         mod_diagnostics::mark_failed(&identity, "bl_mod_main_v1", detail);
