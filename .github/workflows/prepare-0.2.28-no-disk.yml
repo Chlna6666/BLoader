@@ -20,7 +20,7 @@ jobs:
         shell: pwsh
         run: |
           @'
-          import pathlib, re, subprocess
+          import pathlib, re
           root = pathlib.Path('.')
           def read(p): return (root/p).read_text(encoding='utf-8')
           def write(p,s):
@@ -35,20 +35,8 @@ jobs:
           s=s.replace('pub mod native_stdio;','#[path = "native_stdio_nodisk.rs"]\npub mod native_stdio;')
           write('src/runtime/foundation/mod.rs',s)
 
-          for src,dst in [('885ef468ca41d6f1792448b7f0cfa5ecb06f3bf7:src/core/render/render_signal.rs','src/core/render/render_signal.rs'),('885ef468ca41d6f1792448b7f0cfa5ecb06f3bf7:src/bl_dummy_hwnd.rs','src/bl_dummy_hwnd.rs')]:
-              data=subprocess.check_output(['git','show',src])
-              p=root/dst; p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(data)
-          s=read('src/core/mod.rs')
-          if 'pub mod render_signal;' not in s:
-              s=s.replace('#[path = "render/d3d12_queue.rs"]\npub mod d3d12_queue;','#[path = "render/d3d12_queue.rs"]\npub mod d3d12_queue;\n#[path = "render/render_signal.rs"]\npub mod render_signal;')
-          write('src/core/mod.rs',s)
-
           s=read('src/lib.rs')
-          if 'mod bl_dummy_hwnd;' not in s: s=s.replace('mod bl;\n','mod bl;\nmod bl_dummy_hwnd;\n',1)
-          marker='''    logging::scoped_info_message(\n        "runtime-ready",\n        "Delayed Mod readiness uses OEP/process/window stability only; no D3D/DXGI device, swapchain, Present, or dummy HWND hook is installed.",\n    );'''
-          replacement='''    if !core::render_signal::install() {\n        logging::warn_message("Render Present observer unavailable; runtime_ready remains the delayed-Mod readiness source.");\n    }\n    logging::scoped_info_message(\n        "runtime-ready",\n        "Delayed Mod readiness remains OEP/process/window based; Present is restored only as the Mod render-frame observer.",\n    );'''
-          if marker not in s: raise SystemExit('runtime-ready marker not found')
-          s=s.replace(marker,replacement)
+          # No graphics hooks in 0.2.28. runtime_ready remains the sole delayed-Mod readiness source.
           s=s.replace('    runtime::foundation::crash_report::spawn_external_logger(utils::loader_module_handle());\n','')
           write('src/lib.rs',s)
 
@@ -68,7 +56,7 @@ jobs:
           write('src/core/file_redirection.rs',s.replace(old,new))
 
           s=read('src/core/preloader_proxy.rs')
-          s=re.sub(r'fn publish_status\(status: ProxyStatus<\'_>\) \{.*?\n\}', 'fn publish_status(_status: ProxyStatus<\'_>) {\n    // no-disk diagnostic mode: status remains in live diagnostics only.\n}', s, flags=re.S)
+          s=re.sub(r'fn publish_status\(status: ProxyStatus<\'_>\) \{.*?\n\}', 'fn publish_status(_status: ProxyStatus<\'_>) {\n    // no-disk diagnostic mode: live diagnostics only.\n}', s, flags=re.S)
           write('src/core/preloader_proxy.rs',s)
 
           s=read('src/core/loader.rs')
@@ -81,7 +69,7 @@ jobs:
           write('src/core/loader.rs',s[:start]+repl+s[end:])
 
           s=read('src/bl/host.rs')
-          s=s.replace('        BL_PATH_CACHE_DIR => get_exe_directory().join("mods").join(".bl-cache"),','        BL_PATH_CACHE_DIR => std::env::temp_dir().join("BLoader").join("cache"),')
+          s=s.replace('        BL_PATH_CACHE_DIR => get_exe_directory().join("mods").join(".bl-cache"),','        BL_PATH_CACHE_DIR => PathBuf::new(),')
           s=s.replace('    if kind == BL_PATH_CACHE_DIR {\n        let _ = std::fs::create_dir_all(&path);\n    }\n','')
           write('src/bl/host.rs',s)
 
