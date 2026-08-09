@@ -1,0 +1,1 @@
+Temporary validation marker for BLoader 0.2.19 runtime readiness. Do not merge.
