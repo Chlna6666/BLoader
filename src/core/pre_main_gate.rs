@@ -214,8 +214,9 @@ unsafe extern "system" fn pre_main_vectored_handler(
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
+    crate::core::runtime_ready::mark_oep_released("pre-main-gate");
     logging::write_bootstrap_marker(&format!(
-        "premain-gate.complete execution=inline-single-thread oep=0x{entry_point:X} thread={current_thread_id} byte_restored={} bootstrap_completed={}",
+        "premain-gate.complete execution=inline-single-thread oep=0x{entry_point:X} thread={current_thread_id} byte_restored={} bootstrap_completed={} runtime_ready_signal=oep-released",
         BYTE_RESTORED.load(Ordering::Acquire),
         BOOTSTRAP_COMPLETED.load(Ordering::Acquire),
     ));
