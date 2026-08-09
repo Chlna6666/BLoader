@@ -1,0 +1,124 @@
+name: Build 0.2.25 minimal static attach once
+
+on:
+  push:
+    branches:
+      - work/0.2.25-minimal-static-attach
+    paths:
+      - .github/workflows/build-minimal-static-attach-once.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust MSVC target
+        shell: pwsh
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          rustc --version
+          cargo --version
+
+      - name: Apply minimal static-attach diagnostic mode
+        shell: pwsh
+        run: |
+          $path = 'src/lib.rs'
+          $source = Get-Content -Raw -Path $path
+
+          $pattern = '(?s)#\[unsafe\(no_mangle\)\]\r?\npub unsafe extern "system" fn DllMain\(.*?\r?\n\}\r?\n\r?\n/// Invoked directly by the OEP VEH'
+          $replacement = @'
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn DllMain(
+    hinstance: HINSTANCE,
+    call_reason: u32,
+    _reserved: *const c_void,
+) -> i32 {
+    if call_reason == DLL_PROCESS_ATTACH {
+        // 0.2.25 diagnostic build: keep only the BedrockBoot-compatible
+        // process CWD normalization plus our module handle. Deliberately do
+        // nothing else before Minecraft reaches its original OEP.
+        let _ = utils::set_exe_cwd();
+        utils::set_loader_module_handle(hinstance.0 as usize);
+        return 1;
+    }
+
+    1
+}
+
+/// Invoked directly by the OEP VEH
+'@
+          $updated = [regex]::Replace($source, $pattern, $replacement, 1)
+          if ($updated -eq $source) {
+            throw 'DllMain replacement did not match current src/lib.rs'
+          }
+          $updated = $updated.Replace('use std::thread;' + [Environment]::NewLine, '')
+          $updated = $updated.Replace('use windows::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};', 'use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;')
+          Set-Content -Path $path -Value $updated -Encoding utf8NoBOM
+
+          $cargoPath = 'Cargo.toml'
+          $cargo = Get-Content -Raw -Path $cargoPath
+          if (-not $cargo.Contains('version = "0.2.24"')) {
+            throw 'Expected BLoader version 0.2.24 before diagnostic bump'
+          }
+          $cargo = $cargo.Replace('version = "0.2.24"', 'version = "0.2.25"')
+          Set-Content -Path $cargoPath -Value $cargo -Encoding utf8NoBOM
+
+          New-Item -ItemType Directory -Force -Path 'docs/releases' | Out-Null
+          @'
+# BLoader 0.2.25
+
+Diagnostic UWP startup isolation build.
+
+For a static PE-import process attach, `DllMain` now performs only:
+
+1. `SetCurrentDirectoryW` to the directory containing `Minecraft.Windows.exe`.
+2. Stores the BLoader module handle.
+3. Returns `TRUE` immediately.
+
+The static startup path intentionally does **not** install the OEP gate, VEH/crash handlers, tracing/logging, stdio capture, XUser bridge, MinHook, file/network hooks, runtime readiness, configuration loading, Mod loading, or worker threads. This release is intended to determine whether old UWP startup crashes are caused by BLoader runtime initialization or merely by the static PE import itself.
+'@ | Set-Content -Path 'docs/releases/0.2.25.md' -Encoding utf8NoBOM
+
+      - name: Format
+        shell: pwsh
+        run: cargo fmt --all
+
+      - name: Test library
+        shell: pwsh
+        run: cargo test --lib --target x86_64-pc-windows-msvc
+
+      - name: Build release DLL
+        shell: pwsh
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          $dll = 'target/x86_64-pc-windows-msvc/release/BLoader.dll'
+          if (-not (Test-Path $dll)) { throw 'BLoader.dll was not produced' }
+          New-Item -ItemType Directory -Force -Path 'dist' | Out-Null
+          Copy-Item $dll 'dist/BLoader.dll'
+          $hash = (Get-FileHash 'dist/BLoader.dll' -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path 'dist/BLoader.dll.sha256' -Value $hash -Encoding ascii
+          Write-Host "BLoader.dll SHA256=$hash"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BLoader-0.2.25-minimal-static-attach-windows-x64
+          path: dist/*
+
+      - name: Commit product changes and remove one-shot workflow
+        shell: pwsh
+        run: |
+          Remove-Item '.github/workflows/build-minimal-static-attach-once.yml' -Force
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'diag: minimal static attach for BLoader 0.2.25'
+          git push origin HEAD:work/0.2.25-minimal-static-attach
