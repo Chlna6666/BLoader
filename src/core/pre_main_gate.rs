@@ -1,6 +1,5 @@
 use std::cell::UnsafeCell;
 use std::ffi::c_void;
-use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
@@ -19,6 +18,16 @@ const EXCEPTION_BREAKPOINT_CODE: u32 = 0x8000_0003;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 const PREMAIN_FAILURE_EXIT_CODE: u32 = 0xE017_0001;
 
+// x64 CONTEXT state flags. CONTEXT_XSTATE is deliberately requested separately:
+// Microsoft documents that it is not part of CONTEXT_ALL and that XState-aware
+// contexts require InitializeContext/CopyContext rather than a fixed-size struct copy.
+const CONTEXT_AMD64: u32 = 0x0010_0000;
+const CONTEXT_ALL_AMD64: u32 = CONTEXT_AMD64 | 0x0000_001F;
+const CONTEXT_XSTATE_AMD64: u32 = CONTEXT_AMD64 | 0x0000_0040;
+const CONTEXT_XSTATE_COMPONENT_BIT: u32 = 0x0000_0040;
+const CONTEXT_MAX_CAPTURE_FLAGS: u32 = CONTEXT_ALL_AMD64 | CONTEXT_XSTATE_AMD64;
+const SAVED_CONTEXT_BUFFER_SIZE: usize = 64 * 1024;
+
 static ENTRY_POINT: AtomicUsize = AtomicUsize::new(0);
 static STARTUP_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static ORIGINAL_BYTE: AtomicU8 = AtomicU8::new(0);
@@ -29,15 +38,22 @@ static BOOTSTRAP_STARTED: AtomicBool = AtomicBool::new(false);
 static BOOTSTRAP_COMPLETED: AtomicBool = AtomicBool::new(false);
 static CONTEXT_SAVED: AtomicBool = AtomicBool::new(false);
 static VEH_HANDLE: AtomicUsize = AtomicUsize::new(0);
+static SAVED_CONTEXT_PTR: AtomicUsize = AtomicUsize::new(0);
+static SAVED_CONTEXT_CAPACITY_FLAGS: AtomicU32 = AtomicU32::new(0);
+static SOURCE_CONTEXT_FLAGS: AtomicU32 = AtomicU32::new(0);
+static COPIED_CONTEXT_FLAGS: AtomicU32 = AtomicU32::new(0);
+static SAVED_CONTEXT_LENGTH: AtomicU32 = AtomicU32::new(0);
 
-struct SavedContextSlot(UnsafeCell<MaybeUninit<CONTEXT>>);
+#[repr(align(64))]
+struct SavedContextBuffer(UnsafeCell<[u8; SAVED_CONTEXT_BUFFER_SIZE]>);
 
-// The slot is written exactly once by the process startup thread while the gate
-// owns the OEP and is read later by the same thread in `pre_main_dispatch`.
-unsafe impl Sync for SavedContextSlot {}
+// The buffer is initialized once while the process startup thread owns the gate,
+// then written by that same thread's VEH and finally read by the same thread in
+// pre_main_dispatch. Atomics publish the initialized CONTEXT pointer/state.
+unsafe impl Sync for SavedContextBuffer {}
 
-static SAVED_CONTEXT: SavedContextSlot =
-    SavedContextSlot(UnsafeCell::new(MaybeUninit::uninit()));
+static SAVED_CONTEXT_BUFFER: SavedContextBuffer =
+    SavedContextBuffer(UnsafeCell::new([0; SAVED_CONTEXT_BUFFER_SIZE]));
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -65,24 +81,32 @@ unsafe extern "system" {
     #[link_name = "RemoveVectoredExceptionHandler"]
     fn remove_vectored_exception_handler(handle: *mut c_void) -> u32;
     #[link_name = "RtlRestoreContext"]
-    fn rtl_restore_context(context_record: *const CONTEXT, exception_record: *const c_void);
+    fn rtl_restore_context(context_record: *mut CONTEXT, exception_record: *const c_void);
+    #[link_name = "InitializeContext"]
+    fn initialize_context(
+        buffer: *mut c_void,
+        context_flags: u32,
+        context: *mut *mut CONTEXT,
+        context_length: *mut u32,
+    ) -> i32;
+    #[link_name = "CopyContext"]
+    fn copy_context(
+        destination: *mut CONTEXT,
+        context_flags: u32,
+        source: *const CONTEXT,
+    ) -> i32;
 }
 
 /// Arms a one-byte INT3 gate at the host executable's original entry point.
 ///
-/// BLoader is statically imported by the BMCBL PE patch. `DllMain` only installs
+/// BLoader is statically imported by the BMCBL PE patch. DllMain only installs
 /// this gate while the Windows loader lock is held. No third-party DLL is loaded
-/// from `DllMain`.
+/// from DllMain.
 ///
-/// When the startup thread reaches Minecraft's OEP the VEH performs only the
-/// minimum exception work required to hand execution to `pre_main_dispatch`:
-/// restore the original OEP byte, copy the machine CONTEXT, redirect RIP, and
-/// return. The complete BLoader bootstrap then runs after the VEH has returned,
-/// in ordinary startup-thread execution context. `RtlRestoreContext` finally
-/// restores the original register/stack state and resumes Minecraft at its OEP.
-///
-/// Dynamic `LoadLibrary` injection is intentionally excluded because the host OEP
-/// may already have executed by the time BLoader is attached.
+/// The saved processor context is backed by an InitializeContext-created buffer.
+/// This is important on x64 systems where an exception CONTEXT can carry XState;
+/// a raw fixed-size CONTEXT copy is not a valid XState context and can fail when
+/// later consumed by RtlRestoreContext.
 pub unsafe fn install_for_process_start(static_process_attach: bool) -> bool {
     if !static_process_attach {
         logging::write_bootstrap_marker(
@@ -114,6 +138,13 @@ pub unsafe fn install_for_process_start(static_process_attach: bool) -> bool {
         return false;
     }
 
+    let Some((saved_context, capacity_flags, context_length)) = initialize_saved_context() else {
+        logging::write_bootstrap_marker(
+            "premain-gate.install.failed reason=context-buffer-initialize",
+        );
+        return false;
+    };
+
     ENTRY_POINT.store(entry_point, Ordering::Release);
     ORIGINAL_BYTE.store(original_byte, Ordering::Release);
     STARTUP_THREAD_ID.store(get_current_thread_id(), Ordering::Release);
@@ -123,11 +154,17 @@ pub unsafe fn install_for_process_start(static_process_attach: bool) -> bool {
     BOOTSTRAP_COMPLETED.store(false, Ordering::Release);
     CONTEXT_SAVED.store(false, Ordering::Release);
     VEH_HANDLE.store(0, Ordering::Release);
+    SAVED_CONTEXT_PTR.store(saved_context as usize, Ordering::Release);
+    SAVED_CONTEXT_CAPACITY_FLAGS.store(capacity_flags, Ordering::Release);
+    SAVED_CONTEXT_LENGTH.store(context_length, Ordering::Release);
+    SOURCE_CONTEXT_FLAGS.store(0, Ordering::Release);
+    COPIED_CONTEXT_FLAGS.store(0, Ordering::Release);
 
     let handler = AddVectoredExceptionHandler(1, Some(pre_main_vectored_handler));
     if handler.is_null() {
         logging::write_bootstrap_marker("premain-gate.install.failed reason=veh-install");
         ENTRY_POINT.store(0, Ordering::Release);
+        SAVED_CONTEXT_PTR.store(0, Ordering::Release);
         return false;
     }
     VEH_HANDLE.store(handler as usize, Ordering::Release);
@@ -141,12 +178,13 @@ pub unsafe fn install_for_process_start(static_process_attach: bool) -> bool {
             "premain-gate.install.failed reason=oep-patch oep=0x{entry_point:X}"
         ));
         ENTRY_POINT.store(0, Ordering::Release);
+        SAVED_CONTEXT_PTR.store(0, Ordering::Release);
         return false;
     }
 
     GATE_ARMED.store(true, Ordering::Release);
     logging::write_bootstrap_marker(&format!(
-        "premain-gate.armed mode=oep-int3-context-trampoline oep=0x{entry_point:X} startup_thread={}",
+        "premain-gate.armed mode=oep-int3-xstate-context-trampoline oep=0x{entry_point:X} startup_thread={} context_capacity_flags=0x{capacity_flags:08X} context_buffer_len={context_length}",
         STARTUP_THREAD_ID.load(Ordering::Acquire),
     ));
     true
@@ -156,11 +194,48 @@ pub fn is_armed() -> bool {
     GATE_ARMED.load(Ordering::Acquire)
 }
 
+/// Initialize an aligned context destination once before the breakpoint fires.
+/// Prefer CONTEXT_ALL|CONTEXT_XSTATE and fall back to base CONTEXT_ALL only if
+/// the platform does not support XState initialization.
+unsafe fn initialize_saved_context() -> Option<(*mut CONTEXT, u32, u32)> {
+    let buffer = SAVED_CONTEXT_BUFFER.0.get().cast::<c_void>();
+
+    let mut context = ptr::null_mut::<CONTEXT>();
+    let mut context_length = SAVED_CONTEXT_BUFFER_SIZE as u32;
+    if initialize_context(
+        buffer,
+        CONTEXT_MAX_CAPTURE_FLAGS,
+        &mut context,
+        &mut context_length,
+    ) != 0
+        && !context.is_null()
+    {
+        return Some((context, CONTEXT_MAX_CAPTURE_FLAGS, context_length));
+    }
+
+    // InitializeContext may have touched the length on failure. Reset it before
+    // the base-context fallback.
+    context = ptr::null_mut();
+    context_length = SAVED_CONTEXT_BUFFER_SIZE as u32;
+    if initialize_context(
+        buffer,
+        CONTEXT_ALL_AMD64,
+        &mut context,
+        &mut context_length,
+    ) != 0
+        && !context.is_null()
+    {
+        return Some((context, CONTEXT_ALL_AMD64, context_length));
+    }
+
+    None
+}
+
 /// First-chance VEH for the OEP breakpoint.
 ///
-/// Keep this handler allocation-free and synchronization-free. Windows explicitly
-/// recommends that vectored exception handlers only inspect/update exception state
-/// and return. The real bootstrap is intentionally not called from here.
+/// The handler restores the OEP byte, copies processor state with CopyContext,
+/// redirects RIP to the ordinary trampoline, and returns. No BLoader bootstrap,
+/// logging, allocation, or third-party loading is performed here.
 unsafe extern "system" fn pre_main_vectored_handler(
     exception: *mut EXCEPTION_POINTERS,
 ) -> i32 {
@@ -208,16 +283,32 @@ unsafe extern "system" fn pre_main_vectored_handler(
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
-    let context = (*exception).ContextRecord;
+    let source_context = (*exception).ContextRecord;
     let saved_context = saved_context_ptr();
-    ptr::copy_nonoverlapping(context, saved_context, 1);
+    if saved_context.is_null() {
+        let _ = terminate_process(get_current_process(), PREMAIN_FAILURE_EXIT_CODE);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    let source_flags = (*source_context).ContextFlags.0;
+    let capacity_flags = SAVED_CONTEXT_CAPACITY_FLAGS.load(Ordering::Acquire);
+    let copy_flags = source_flags & capacity_flags & CONTEXT_MAX_CAPTURE_FLAGS;
+    SOURCE_CONTEXT_FLAGS.store(source_flags, Ordering::Release);
+    COPIED_CONTEXT_FLAGS.store(copy_flags, Ordering::Release);
+
+    // CopyContext is required for XState-aware contexts. A raw memcpy of only the
+    // fixed CONTEXT structure loses the extended state area and its alignment.
+    if copy_flags == 0 || copy_context(saved_context, copy_flags, source_context) == 0 {
+        let _ = terminate_process(get_current_process(), PREMAIN_FAILURE_EXIT_CODE);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
 
     #[cfg(target_arch = "x86_64")]
     {
-        // The breakpoint exception may report RIP after the one-byte INT3. The
-        // context restored after bootstrap must restart at the original OEP.
+        // Breakpoint exceptions can report RIP after the one-byte INT3. Restart
+        // from the restored original OEP after the bootstrap completes.
         (*saved_context).Rip = entry_point as u64;
-        (*context).Rip = pre_main_dispatch as usize as u64;
+        (*source_context).Rip = pre_main_dispatch as *const () as usize as u64;
     }
 
     #[cfg(not(target_arch = "x86_64"))]
@@ -229,13 +320,13 @@ unsafe extern "system" fn pre_main_vectored_handler(
     CONTEXT_SAVED.store(true, Ordering::Release);
 
     // The OEP byte is restored and the live context now points at the ordinary
-    // trampoline. Disable the gate before returning so no nested exception can
-    // ever be treated as a second gate hit.
+    // trampoline. Disable the gate before returning so nested exceptions cannot
+    // be mistaken for another OEP hit.
     GATE_ARMED.store(false, Ordering::Release);
     EXCEPTION_CONTINUE_EXECUTION
 }
 
-/// Ordinary execution target entered only after the VEH returned to the Windows
+/// Ordinary execution target entered after the OEP VEH returns to the Windows
 /// exception dispatcher. This function never returns through the Rust ABI.
 unsafe extern "system" fn pre_main_dispatch() -> ! {
     let current_thread_id = get_current_thread_id();
@@ -257,8 +348,12 @@ unsafe extern "system" fn pre_main_dispatch() -> ! {
         true
     };
 
+    let source_flags = SOURCE_CONTEXT_FLAGS.load(Ordering::Acquire);
+    let copied_flags = COPIED_CONTEXT_FLAGS.load(Ordering::Acquire);
+    let xstate_copied = copied_flags & CONTEXT_XSTATE_COMPONENT_BIT != 0;
+    let context_length = SAVED_CONTEXT_LENGTH.load(Ordering::Acquire);
     logging::write_bootstrap_marker(&format!(
-        "premain-gate.dispatch.begin execution=post-veh-trampoline oep=0x{entry_point:X} thread={current_thread_id} veh_removed={handler_removed}"
+        "premain-gate.dispatch.begin execution=post-veh-trampoline oep=0x{entry_point:X} thread={current_thread_id} veh_removed={handler_removed} source_context_flags=0x{source_flags:08X} copied_context_flags=0x{copied_flags:08X} xstate_copied={xstate_copied} context_buffer_len={context_length}"
     ));
 
     let bootstrap_ok = crate::run_bootstrap_on_startup_thread();
@@ -273,23 +368,27 @@ unsafe extern "system" fn pre_main_dispatch() -> ! {
     crate::core::runtime_ready::mark_oep_released("pre-main-gate-trampoline");
 
     logging::write_bootstrap_marker(&format!(
-        "premain-gate.complete execution=post-veh-trampoline oep=0x{entry_point:X} thread={current_thread_id} byte_restored={} bootstrap_completed={} runtime_ready_signal=oep-released",
+        "premain-gate.complete execution=post-veh-trampoline oep=0x{entry_point:X} thread={current_thread_id} byte_restored={} bootstrap_completed={} runtime_ready_signal=oep-released xstate_copied={xstate_copied}",
         BYTE_RESTORED.load(Ordering::Acquire),
         BOOTSTRAP_COMPLETED.load(Ordering::Acquire),
     ));
     logging::write_bootstrap_marker(&format!(
-        "premain-gate.context.restore oep=0x{entry_point:X} thread={current_thread_id} method=RtlRestoreContext"
+        "premain-gate.context.restore oep=0x{entry_point:X} thread={current_thread_id} method=RtlRestoreContext copied_context_flags=0x{copied_flags:08X} xstate_copied={xstate_copied}"
     ));
 
-    rtl_restore_context(saved_context_ptr() as *const CONTEXT, ptr::null());
+    let saved_context = saved_context_ptr();
+    if saved_context.is_null() {
+        terminate_for_gate_failure();
+    }
+    rtl_restore_context(saved_context, ptr::null());
 
-    // RtlRestoreContext is specified not to return. If it ever does, fail closed
-    // rather than executing with the trampoline's temporary register state.
+    // RtlRestoreContext must not return. If it does, do not continue with the
+    // trampoline's temporary register state.
     terminate_for_gate_failure();
 }
 
 fn saved_context_ptr() -> *mut CONTEXT {
-    SAVED_CONTEXT.0.get().cast::<CONTEXT>()
+    SAVED_CONTEXT_PTR.load(Ordering::Acquire) as *mut CONTEXT
 }
 
 unsafe fn terminate_for_gate_failure() -> ! {
