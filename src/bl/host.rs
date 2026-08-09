@@ -265,10 +265,13 @@ unsafe extern "system" fn host_get_path(kind: u32, out_path: *mut u8, out_len: u
     let path = match kind {
         BL_PATH_GAME_DIR => get_exe_directory(),
         BL_PATH_MODS_DIR => get_exe_directory().join("mods"),
-        BL_PATH_CACHE_DIR => PathBuf::new(),
+        BL_PATH_CACHE_DIR => get_exe_directory().join("mods").join(".bl-cache"),
         BL_PATH_UI_RESOURCE_PACK_DIR => PathBuf::new(),
         _ => PathBuf::new(),
     };
+    if kind == BL_PATH_CACHE_DIR {
+        let _ = std::fs::create_dir_all(&path);
+    }
     copy_path(path, out_path, out_len)
 }
 

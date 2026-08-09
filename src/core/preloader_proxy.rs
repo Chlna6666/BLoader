@@ -379,6 +379,10 @@ fn wide_null(value: &std::ffi::OsStr) -> Vec<u16> {
     value.encode_wide().chain(Some(0)).collect()
 }
 
-fn publish_status(_status: ProxyStatus<'_>) {
-    // no-disk diagnostic build: status is live only.
+fn publish_status(status: ProxyStatus<'_>) {
+    let path = PathBuf::from("logs").join("preloader-status.json");
+    let _ = fs::create_dir_all("logs");
+    if let Ok(data) = serde_json::to_vec_pretty(&status) {
+        let _ = fs::write(path, data);
+    }
 }

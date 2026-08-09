@@ -1,11 +1,9 @@
 pub mod build_info;
-#[path = "crash_report_nodisk.rs"]
 pub mod crash_report;
 pub mod error_dialog;
 pub mod i18n;
-#[path = "logging_nodisk.rs"]
+#[path = "logging_full_debug.rs"]
 pub mod logging;
 pub mod mod_diagnostics;
-#[path = "native_stdio_nodisk.rs"]
 pub mod native_stdio;
 pub mod runtime_environment;
