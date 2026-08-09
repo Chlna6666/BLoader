@@ -226,7 +226,7 @@ pub fn find_game_window() -> Option<ReadySnapshot> {
     unsafe extern "system" fn enum_top(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let data = &mut *(lparam.0 as *mut EnumData);
         consider_window(hwnd, data);
-        let _ = EnumChildWindows(hwnd, Some(enum_child), lparam);
+        let _ = EnumChildWindows(Some(hwnd), Some(enum_child), lparam);
         BOOL(1)
     }
 
