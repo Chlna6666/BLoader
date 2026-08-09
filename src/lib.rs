@@ -5,7 +5,7 @@
 use std::ffi::c_void;
 use std::panic::{self, PanicHookInfo};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HINSTANCE;
 use windows::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
@@ -112,17 +112,13 @@ pub unsafe extern "system" fn DllMain(
                 runtime::foundation::build_info::PROFILE,
             ));
 
+            // Never load xgameruntime.dll or install MinHook while DllMain owns
+            // the Windows loader lock. The OEP gate guarantees a pre-main phase
+            // after DllMain returns, so the XUser bridge can still be ready before
+            // Minecraft executes its first instruction without violating loader-lock
+            // constraints.
             runtime::foundation::logging::write_bootstrap_marker(
-                "dllmain.xuser_bridge.begin mode=pipe_gated",
-            );
-            // BMCBL creates the PID-scoped pipe before resuming the process.
-            // No pipe means this performs one immediate failed open and returns
-            // without loading xgameruntime or installing MinHook. A valid pipe
-            // is consumed synchronously so QueryApiImpl is ready before the
-            // executable can enter its normal GDK initialization path.
-            core::xuser_bridge::initialize_before_mods();
-            runtime::foundation::logging::write_bootstrap_marker(
-                "dllmain.xuser_bridge.done",
+                "dllmain.xuser_bridge.deferred target=premain-after-loader-lock",
             );
 
             if gate_armed {
@@ -189,6 +185,14 @@ fn run_bootstrap_late_attach() {
 }
 
 fn run_bootstrap_sequence(execution_mode: &'static str) -> bool {
+    runtime::foundation::logging::write_bootstrap_marker(&format!(
+        "bootstrap.xuser_bridge.premain.begin execution={execution_mode} loader_lock=released"
+    ));
+    core::xuser_bridge::initialize_before_mods();
+    runtime::foundation::logging::write_bootstrap_marker(&format!(
+        "bootstrap.xuser_bridge.premain.done execution={execution_mode} loader_lock=released"
+    ));
+
     runtime::foundation::crash_report::install();
 
     let premain_result =
@@ -236,8 +240,7 @@ unsafe fn prepare_premain_preloads(
     let preloader_summary = core::preloader_proxy::try_load(&game_dir);
     runtime::foundation::logging::write_bootstrap_marker(&format!(
         "bootstrap.preloader.premain.done discovered={} state={:?} execution={execution_mode}",
-        preloader_summary.discovered,
-        preloader_summary.state,
+        preloader_summary.discovered, preloader_summary.state,
     ));
 
     runtime::foundation::logging::write_bootstrap_marker(&format!(
@@ -288,18 +291,27 @@ unsafe fn bootstrap(
     runtime::foundation::i18n::init(&config);
     runtime::foundation::logging::write_bootstrap_marker("bootstrap.i18n.ready");
 
-    logging::info_message("Minecraft symbol subsystem: disabled (not compiled in lightweight build).");
+    logging::info_message(
+        "Minecraft symbol subsystem: disabled (not compiled in lightweight build).",
+    );
 
-    if config.enable_debug_console {
-        core::console::init_console();
-        runtime::foundation::logging::write_bootstrap_marker("bootstrap.console.ready");
+    if execution_mode == "oep-gated-startup-thread" {
+        schedule_post_oep_runtime_io(config.enable_debug_console);
+    } else {
+        if config.enable_debug_console {
+            unsafe {
+                core::console::init_console();
+            }
+            runtime::foundation::logging::write_bootstrap_marker("bootstrap.console.ready");
+        }
+        // Late attachment happens after the host CRT has already initialized, so
+        // process-wide stdio capture may be installed immediately in that mode.
+        runtime::foundation::native_stdio::install_process_capture();
     }
 
-    // Process-wide capture is installed only after PreLoader/delegated preloads
-    // complete. In the strict static-start path this still happens before the
-    // original Minecraft OEP resumes, but never while a third-party DllMain is
-    // actively executing.
-    runtime::foundation::native_stdio::install_process_capture();
+    // Replay any diagnostics captured before tracing became available. In the
+    // static PE-import path the process-wide CRT/stdout rebinding itself is
+    // intentionally deferred until after Minecraft's OEP has started.
     runtime::foundation::native_stdio::flush_pending();
     core::xuser_bridge::publish_pending_logs();
     setup_panic_hook();
@@ -312,8 +324,8 @@ unsafe fn bootstrap(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("<unknown>");
-    let application_version = utils::current_application_version()
-        .unwrap_or_else(|| "unknown".to_string());
+    let application_version =
+        utils::current_application_version().unwrap_or_else(|| "unknown".to_string());
 
     let current_locale = runtime::foundation::i18n::current_locale();
     logging::startup_banner(
@@ -451,6 +463,54 @@ unsafe fn bootstrap(
 
     if config.enable_debug_console {
         core::console::start_input_listener();
+    }
+}
+
+const POST_OEP_RUNTIME_IO_DELAY_MS: u64 = 1_500;
+
+fn schedule_post_oep_runtime_io(enable_debug_console: bool) {
+    runtime::foundation::logging::write_bootstrap_marker(&format!(
+        "bootstrap.runtime_io.deferred until=oep+{}ms console={} stdio=process-crt",
+        POST_OEP_RUNTIME_IO_DELAY_MS, enable_debug_console,
+    ));
+
+    match thread::Builder::new()
+        .name("bloader-post-oep-runtime-io".to_string())
+        .spawn(move || {
+            if !core::runtime_ready::wait_for(
+                core::runtime_ready::ReadyLevel::Process,
+                Duration::from_secs(10),
+            ) {
+                runtime::foundation::logging::write_bootstrap_marker(
+                    "post-oep.runtime_io.skipped reason=oep-release-timeout",
+                );
+                return;
+            }
+
+            core::runtime_ready::wait_until_oep_delay(POST_OEP_RUNTIME_IO_DELAY_MS);
+
+            if enable_debug_console {
+                unsafe {
+                    core::console::init_console();
+                }
+                runtime::foundation::logging::write_bootstrap_marker("post-oep.console.ready");
+            }
+
+            unsafe {
+                runtime::foundation::native_stdio::install_process_capture();
+            }
+            runtime::foundation::native_stdio::flush_pending();
+            runtime::foundation::logging::write_bootstrap_marker(&format!(
+                "post-oep.runtime_io.ready delay_ms={} console={} stdio=process-crt",
+                POST_OEP_RUNTIME_IO_DELAY_MS, enable_debug_console,
+            ));
+        }) {
+        Ok(_) => runtime::foundation::logging::write_bootstrap_marker(
+            "bootstrap.runtime_io.defer.spawn.ok",
+        ),
+        Err(error) => runtime::foundation::logging::write_bootstrap_marker(&format!(
+            "bootstrap.runtime_io.defer.spawn.failed error={error}"
+        )),
     }
 }
 

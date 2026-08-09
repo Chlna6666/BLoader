@@ -1,20 +1,20 @@
 // src/core/network_hook.rs
+use parking_lot::RwLock;
 use std::ffi::c_void;
 use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
-use parking_lot::RwLock;
 
-use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::Aes256;
+use aes::cipher::{BlockDecrypt, KeyInit};
 use minhook::MinHook;
 use sha2::{Digest, Sha256};
 
-use windows::core::{PCSTR, s};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKET, WSABUF, ntohs,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows::core::{PCSTR, s};
 
 use crate::config::Config;
 use crate::runtime::foundation::logging;
@@ -47,19 +47,65 @@ static ORIGINAL_WSARECVFROM: AtomicUsize = AtomicUsize::new(0);
 type SocketFn = unsafe extern "system" fn(i32, i32, i32) -> SOCKET;
 type WsaSocketFn = unsafe extern "system" fn(i32, i32, i32, *mut c_void, u32, u32) -> SOCKET;
 type ConnectFn = unsafe extern "system" fn(SOCKET, *const SOCKADDR, i32) -> i32;
-type WsaConnectFn = unsafe extern "system" fn(SOCKET, *const SOCKADDR, i32, *mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32;
+type WsaConnectFn = unsafe extern "system" fn(
+    SOCKET,
+    *const SOCKADDR,
+    i32,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+) -> i32;
 type BindFn = unsafe extern "system" fn(SOCKET, *const SOCKADDR, i32) -> i32;
 type ListenFn = unsafe extern "system" fn(SOCKET, i32) -> i32;
 type AcceptFn = unsafe extern "system" fn(SOCKET, *mut SOCKADDR, *mut i32) -> SOCKET;
-type WsaAcceptFn = unsafe extern "system" fn(SOCKET, *mut SOCKADDR, *mut i32, *mut c_void, usize) -> SOCKET;
+type WsaAcceptFn =
+    unsafe extern "system" fn(SOCKET, *mut SOCKADDR, *mut i32, *mut c_void, usize) -> SOCKET;
 type SendFn = unsafe extern "system" fn(SOCKET, *const u8, i32, i32) -> i32;
 type RecvFn = unsafe extern "system" fn(SOCKET, *mut u8, i32, i32) -> i32;
 type SendToFn = unsafe extern "system" fn(SOCKET, *const u8, i32, i32, *const SOCKADDR, i32) -> i32;
-type RecvFromFn = unsafe extern "system" fn(SOCKET, *mut u8, i32, i32, *mut SOCKADDR, *mut i32) -> i32;
-type WsaSendFn = unsafe extern "system" fn(SOCKET, *const WSABUF, u32, *mut u32, u32, *mut c_void, *mut c_void) -> i32;
-type WsaRecvFn = unsafe extern "system" fn(SOCKET, *const WSABUF, u32, *mut u32, *mut u32, *mut c_void, *mut c_void) -> i32;
-type WsaSendToFn = unsafe extern "system" fn(SOCKET, *const WSABUF, u32, *mut u32, u32, *const SOCKADDR, i32, *mut c_void, *mut c_void) -> i32;
-type WsaRecvFromFn = unsafe extern "system" fn(SOCKET, *const WSABUF, u32, *mut u32, *mut u32, *mut SOCKADDR, *mut i32, *mut c_void, *mut c_void) -> i32;
+type RecvFromFn =
+    unsafe extern "system" fn(SOCKET, *mut u8, i32, i32, *mut SOCKADDR, *mut i32) -> i32;
+type WsaSendFn = unsafe extern "system" fn(
+    SOCKET,
+    *const WSABUF,
+    u32,
+    *mut u32,
+    u32,
+    *mut c_void,
+    *mut c_void,
+) -> i32;
+type WsaRecvFn = unsafe extern "system" fn(
+    SOCKET,
+    *const WSABUF,
+    u32,
+    *mut u32,
+    *mut u32,
+    *mut c_void,
+    *mut c_void,
+) -> i32;
+type WsaSendToFn = unsafe extern "system" fn(
+    SOCKET,
+    *const WSABUF,
+    u32,
+    *mut u32,
+    u32,
+    *const SOCKADDR,
+    i32,
+    *mut c_void,
+    *mut c_void,
+) -> i32;
+type WsaRecvFromFn = unsafe extern "system" fn(
+    SOCKET,
+    *const WSABUF,
+    u32,
+    *mut u32,
+    *mut u32,
+    *mut SOCKADDR,
+    *mut i32,
+    *mut c_void,
+    *mut c_void,
+) -> i32;
 
 static P2P_REDIRECTION_ENABLED: AtomicBool = AtomicBool::new(false);
 static P2P_TARGET_IP: RwLock<String> = RwLock::new(String::new());
@@ -135,15 +181,30 @@ pub fn get_listen_port() -> u16 {
     LISTEN_PORT.load(Ordering::SeqCst)
 }
 
+fn hooks_requested(config: &Config) -> bool {
+    config.enable_network_hooks || config.enable_p2p_redirection
+}
+
 pub fn install(config: &Config) -> bool {
     update_config(config);
+
+    if !hooks_requested(config) {
+        if HOOK_INSTALLED.load(Ordering::SeqCst) {
+            logging::info_message(
+                "[net-hook] Runtime features disabled; existing detours remain pass-through.",
+            );
+        } else {
+            logging::info_message(
+                "[net-hook] Hook installation skipped: network hooks and P2P redirection are both disabled.",
+            );
+        }
+        return true;
+    }
 
     if HOOK_INSTALLED.swap(true, Ordering::SeqCst) {
         logging::info_message(&format!(
             "[net-hook] Config updated. Enabled={}, ListenPort={}, IgnorePorts={:?}",
-            config.enable_network_hooks,
-            config.network_listen_port,
-            config.network_ignore_ports
+            config.enable_network_hooks, config.network_listen_port, config.network_ignore_ports
         ));
         return true;
     }
@@ -184,23 +245,125 @@ unsafe fn install_net_hooks() -> usize {
 
     let mut installed = 0;
 
-    installed += hook_ws2_export(module, s!("socket"), "socket", detour_socket as *mut c_void, &ORIGINAL_SOCKET);
-    installed += hook_ws2_export(module, s!("WSASocketW"), "WSASocketW", detour_wsa_socket_w as *mut c_void, &ORIGINAL_WSASOCKETW);
-    installed += hook_ws2_export(module, s!("WSASocketA"), "WSASocketA", detour_wsa_socket_a as *mut c_void, &ORIGINAL_WSASOCKETA);
-    installed += hook_ws2_export(module, s!("connect"), "connect", detour_connect as *mut c_void, &ORIGINAL_CONNECT);
-    installed += hook_ws2_export(module, s!("WSAConnect"), "WSAConnect", detour_wsa_connect as *mut c_void, &ORIGINAL_WSACONNECT);
-    installed += hook_ws2_export(module, s!("bind"), "bind", detour_bind as *mut c_void, &ORIGINAL_BIND);
-    installed += hook_ws2_export(module, s!("listen"), "listen", detour_listen as *mut c_void, &ORIGINAL_LISTEN);
-    installed += hook_ws2_export(module, s!("accept"), "accept", detour_accept as *mut c_void, &ORIGINAL_ACCEPT);
-    installed += hook_ws2_export(module, s!("WSAAccept"), "WSAAccept", detour_wsa_accept as *mut c_void, &ORIGINAL_WSAACCEPT);
-    installed += hook_ws2_export(module, s!("send"), "send", detour_send as *mut c_void, &ORIGINAL_SEND);
-    installed += hook_ws2_export(module, s!("recv"), "recv", detour_recv as *mut c_void, &ORIGINAL_RECV);
-    installed += hook_ws2_export(module, s!("sendto"), "sendto", detour_sendto as *mut c_void, &ORIGINAL_SENDTO);
-    installed += hook_ws2_export(module, s!("recvfrom"), "recvfrom", detour_recvfrom as *mut c_void, &ORIGINAL_RECVFROM);
-    installed += hook_ws2_export(module, s!("WSASend"), "WSASend", detour_wsa_send as *mut c_void, &ORIGINAL_WSASEND);
-    installed += hook_ws2_export(module, s!("WSARecv"), "WSARecv", detour_wsa_recv as *mut c_void, &ORIGINAL_WSARECV);
-    installed += hook_ws2_export(module, s!("WSASendTo"), "WSASendTo", detour_wsa_send_to as *mut c_void, &ORIGINAL_WSASENDTO);
-    installed += hook_ws2_export(module, s!("WSARecvFrom"), "WSARecvFrom", detour_wsa_recv_from as *mut c_void, &ORIGINAL_WSARECVFROM);
+    installed += hook_ws2_export(
+        module,
+        s!("socket"),
+        "socket",
+        detour_socket as *mut c_void,
+        &ORIGINAL_SOCKET,
+    );
+    installed += hook_ws2_export(
+        module,
+        s!("WSASocketW"),
+        "WSASocketW",
+        detour_wsa_socket_w as *mut c_void,
+        &ORIGINAL_WSASOCKETW,
+    );
+    installed += hook_ws2_export(
+        module,
+        s!("WSASocketA"),
+        "WSASocketA",
+        detour_wsa_socket_a as *mut c_void,
+        &ORIGINAL_WSASOCKETA,
+    );
+    installed += hook_ws2_export(
+        module,
+        s!("connect"),
+        "connect",
+        detour_connect as *mut c_void,
+        &ORIGINAL_CONNECT,
+    );
+    installed += hook_ws2_export(
+        module,
+        s!("WSAConnect"),
+        "WSAConnect",
+        detour_wsa_connect as *mut c_void,
+        &ORIGINAL_WSACONNECT,
+    );
+    installed += hook_ws2_export(
+        module,
+        s!("bind"),
+        "bind",
+        detour_bind as *mut c_void,
+        &ORIGINAL_BIND,
+    );
+    installed += hook_ws2_export(
+        module,
+        s!("listen"),
+        "listen",
+        detour_listen as *mut c_void,
+        &ORIGINAL_LISTEN,
+    );
+    installed += hook_ws2_export(
+        module,
+        s!("accept"),
+        "accept",
+        detour_accept as *mut c_void,
+        &ORIGINAL_ACCEPT,
+    );
+    installed += hook_ws2_export(
+        module,
+        s!("WSAAccept"),
+        "WSAAccept",
+        detour_wsa_accept as *mut c_void,
+        &ORIGINAL_WSAACCEPT,
+    );
+    installed += hook_ws2_export(
+        module,
+        s!("send"),
+        "send",
+        detour_send as *mut c_void,
+        &ORIGINAL_SEND,
+    );
+    installed += hook_ws2_export(
+        module,
+        s!("recv"),
+        "recv",
+        detour_recv as *mut c_void,
+        &ORIGINAL_RECV,
+    );
+    installed += hook_ws2_export(
+        module,
+        s!("sendto"),
+        "sendto",
+        detour_sendto as *mut c_void,
+        &ORIGINAL_SENDTO,
+    );
+    installed += hook_ws2_export(
+        module,
+        s!("recvfrom"),
+        "recvfrom",
+        detour_recvfrom as *mut c_void,
+        &ORIGINAL_RECVFROM,
+    );
+    installed += hook_ws2_export(
+        module,
+        s!("WSASend"),
+        "WSASend",
+        detour_wsa_send as *mut c_void,
+        &ORIGINAL_WSASEND,
+    );
+    installed += hook_ws2_export(
+        module,
+        s!("WSARecv"),
+        "WSARecv",
+        detour_wsa_recv as *mut c_void,
+        &ORIGINAL_WSARECV,
+    );
+    installed += hook_ws2_export(
+        module,
+        s!("WSASendTo"),
+        "WSASendTo",
+        detour_wsa_send_to as *mut c_void,
+        &ORIGINAL_WSASENDTO,
+    );
+    installed += hook_ws2_export(
+        module,
+        s!("WSARecvFrom"),
+        "WSARecvFrom",
+        detour_wsa_recv_from as *mut c_void,
+        &ORIGINAL_WSARECVFROM,
+    );
 
     installed
 }
@@ -225,7 +388,9 @@ unsafe fn hook_ws2_export(
             1
         }
         Err(error) => {
-            logging::warn_message(&format!("[net-hook] Failed to hook {display_name}: {error:?}"));
+            logging::warn_message(&format!(
+                "[net-hook] Failed to hook {display_name}: {error:?}"
+            ));
             0
         }
     }
@@ -251,10 +416,22 @@ unsafe fn parse_sockaddr(addr: *const SOCKADDR, namelen: i32) -> Option<(String,
             let raw_bytes = in6_addr.sin6_addr.u.Byte;
             let ip = format!(
                 "{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
-                raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3],
-                raw_bytes[4], raw_bytes[5], raw_bytes[6], raw_bytes[7],
-                raw_bytes[8], raw_bytes[9], raw_bytes[10], raw_bytes[11],
-                raw_bytes[12], raw_bytes[13], raw_bytes[14], raw_bytes[15]
+                raw_bytes[0],
+                raw_bytes[1],
+                raw_bytes[2],
+                raw_bytes[3],
+                raw_bytes[4],
+                raw_bytes[5],
+                raw_bytes[6],
+                raw_bytes[7],
+                raw_bytes[8],
+                raw_bytes[9],
+                raw_bytes[10],
+                raw_bytes[11],
+                raw_bytes[12],
+                raw_bytes[13],
+                raw_bytes[14],
+                raw_bytes[15]
             );
             return Some((ip, port));
         }
@@ -304,7 +481,11 @@ fn parse_nethernet_packet(buf: &[u8]) -> Option<String> {
     // 1. Direct UTF-8 Plaintext check
     if let Ok(text) = std::str::from_utf8(buf) {
         let clean = text.trim_matches('\0').trim();
-        if clean.contains("CONNECT") || clean.contains("CANDIDATE") || clean.contains("MCPE") || clean.contains(';') {
+        if clean.contains("CONNECT")
+            || clean.contains("CANDIDATE")
+            || clean.contains("MCPE")
+            || clean.contains(';')
+        {
             return Some(format!("[NetherNet Plaintext] {}", clean));
         }
     }
@@ -326,7 +507,11 @@ fn parse_nethernet_packet(buf: &[u8]) -> Option<String> {
 
             if let Ok(text) = std::str::from_utf8(&decrypted) {
                 let clean = text.trim_matches('\0').trim();
-                if clean.contains("CONNECT") || clean.contains("CANDIDATE") || clean.contains("MCPE") || clean.contains(';') {
+                if clean.contains("CONNECT")
+                    || clean.contains("CANDIDATE")
+                    || clean.contains("MCPE")
+                    || clean.contains(';')
+                {
                     return Some(format!("[NetherNet Decrypted] {}", clean));
                 }
             }
@@ -336,7 +521,11 @@ fn parse_nethernet_packet(buf: &[u8]) -> Option<String> {
                 .filter(|&&b| (0x20..=0x7e).contains(&b))
                 .map(|&b| b as char)
                 .collect();
-            if printable.len() >= 8 && (printable.contains("CONNECT") || printable.contains("MCPE") || printable.contains("CANDIDATE")) {
+            if printable.len() >= 8
+                && (printable.contains("CONNECT")
+                    || printable.contains("MCPE")
+                    || printable.contains("CANDIDATE"))
+            {
                 return Some(format!("[NetherNet Printable] {}", printable));
             }
         }
@@ -348,7 +537,11 @@ fn parse_nethernet_packet(buf: &[u8]) -> Option<String> {
         .filter(|&&b| (0x20..=0x7e).contains(&b))
         .map(|&b| b as char)
         .collect();
-    if printable.len() >= 10 && (printable.contains("MCPE") || printable.contains("CONNECT") || printable.contains("CANDIDATE")) {
+    if printable.len() >= 10
+        && (printable.contains("MCPE")
+            || printable.contains("CONNECT")
+            || printable.contains("CANDIDATE"))
+    {
         return Some(format!("[Raw Printable] {}", printable));
     }
 
@@ -362,7 +555,10 @@ unsafe extern "system" fn detour_socket(af: i32, type_: i32, protocol: i32) -> S
     if ENABLED.load(Ordering::Relaxed) && s.0 != usize::MAX {
         logging::info_message(&format!(
             "[net-hook] SOCKET CREATED handle=0x{:X} family={} proto={} ({})",
-            s.0, format_af(af), format_socket_type(type_), protocol
+            s.0,
+            format_af(af),
+            format_socket_type(type_),
+            protocol
         ));
     }
 
@@ -383,7 +579,10 @@ unsafe extern "system" fn detour_wsa_socket_w(
     if ENABLED.load(Ordering::Relaxed) && s.0 != usize::MAX {
         logging::info_message(&format!(
             "[net-hook] WSASocketW CREATED handle=0x{:X} family={} proto={} ({})",
-            s.0, format_af(af), format_socket_type(type_), protocol
+            s.0,
+            format_af(af),
+            format_socket_type(type_),
+            protocol
         ));
     }
 
@@ -404,7 +603,10 @@ unsafe extern "system" fn detour_wsa_socket_a(
     if ENABLED.load(Ordering::Relaxed) && s.0 != usize::MAX {
         logging::info_message(&format!(
             "[net-hook] WSASocketA CREATED handle=0x{:X} family={} proto={} ({})",
-            s.0, format_af(af), format_socket_type(type_), protocol
+            s.0,
+            format_af(af),
+            format_socket_type(type_),
+            protocol
         ));
     }
 
@@ -420,14 +622,23 @@ unsafe extern "system" fn detour_connect(s: SOCKET, name: *const SOCKADDR, namel
             if !should_ignore_port(port) {
                 let listen_port = LISTEN_PORT.load(Ordering::Relaxed);
                 let is_listen_target = port == listen_port || port == 7551;
-                let tag = if port == 7551 { " ★NETHERNET-7551" } else if is_listen_target { " ★LISTEN-TARGET" } else { "" };
+                let tag = if port == 7551 {
+                    " ★NETHERNET-7551"
+                } else if is_listen_target {
+                    " ★LISTEN-TARGET"
+                } else {
+                    ""
+                };
                 logging::info_message(&format!(
                     "[net-hook] CONNECT socket=0x{:X} target={}:{} status={}{}",
                     s.0, ip, port, res, tag
                 ));
             }
         } else {
-            logging::info_message(&format!("[net-hook] CONNECT socket=0x{:X} status={}", s.0, res));
+            logging::info_message(&format!(
+                "[net-hook] CONNECT socket=0x{:X} status={}",
+                s.0, res
+            ));
         }
     }
 
@@ -451,7 +662,13 @@ unsafe extern "system" fn detour_wsa_connect(
             if !should_ignore_port(port) {
                 let listen_port = LISTEN_PORT.load(Ordering::Relaxed);
                 let is_listen_target = port == listen_port || port == 7551;
-                let tag = if port == 7551 { " ★NETHERNET-7551" } else if is_listen_target { " ★LISTEN-TARGET" } else { "" };
+                let tag = if port == 7551 {
+                    " ★NETHERNET-7551"
+                } else if is_listen_target {
+                    " ★LISTEN-TARGET"
+                } else {
+                    ""
+                };
                 logging::info_message(&format!(
                     "[net-hook] WSAConnect socket=0x{:X} target={}:{} status={}{}",
                     s.0, ip, port, res, tag
@@ -471,7 +688,13 @@ unsafe extern "system" fn detour_bind(s: SOCKET, name: *const SOCKADDR, namelen:
         let listen_port = LISTEN_PORT.load(Ordering::Relaxed);
         if let Some((ip, port)) = parse_sockaddr(name, namelen) {
             let matches_listen = port == listen_port || port == 7551;
-            let tag = if port == 7551 { " ★NETHERNET-7551-BIND" } else if matches_listen { " ★LISTEN_PORT_MATCH" } else { "" };
+            let tag = if port == 7551 {
+                " ★NETHERNET-7551-BIND"
+            } else if matches_listen {
+                " ★LISTEN_PORT_MATCH"
+            } else {
+                ""
+            };
             logging::info_message(&format!(
                 "[net-hook] BIND (PORT CREATION) socket=0x{:X} address={}:{} res={}{}",
                 s.0, ip, port, res, tag
@@ -499,7 +722,11 @@ unsafe extern "system" fn detour_listen(s: SOCKET, backlog: i32) -> i32 {
     res
 }
 
-unsafe extern "system" fn detour_accept(s: SOCKET, addr: *mut SOCKADDR, addrlen: *mut i32) -> SOCKET {
+unsafe extern "system" fn detour_accept(
+    s: SOCKET,
+    addr: *mut SOCKADDR,
+    addrlen: *mut i32,
+) -> SOCKET {
     let original: AcceptFn = mem::transmute(ORIGINAL_ACCEPT.load(Ordering::Acquire));
     let client_socket = original(s, addr, addrlen);
 
@@ -628,7 +855,13 @@ unsafe extern "system" fn detour_sendto(
                     s.0, target_str, nethernet_info
                 ));
             } else if verbose || max_hex > 0 || is_listen_target {
-                let tag = if port == 7551 { " ★NETHERNET-7551" } else if is_listen_target { " ★LISTEN-PORT" } else { "" };
+                let tag = if port == 7551 {
+                    " ★NETHERNET-7551"
+                } else if is_listen_target {
+                    " ★LISTEN-PORT"
+                } else {
+                    ""
+                };
                 let hex = format_hex_dump(buf, sent as usize, max_hex);
                 logging::info_message(&format!(
                     "[net-hook] SENDTO (UDP/TCP) socket=0x{:X} bytes={} target={}{}{}",
@@ -671,7 +904,13 @@ unsafe extern "system" fn detour_recvfrom(
                     s.0, src_str, nethernet_info
                 ));
             } else if verbose || max_hex > 0 || is_listen_src {
-                let tag = if port == 7551 { " ★NETHERNET-7551" } else if is_listen_src { " ★LISTEN-PORT" } else { "" };
+                let tag = if port == 7551 {
+                    " ★NETHERNET-7551"
+                } else if is_listen_src {
+                    " ★LISTEN-PORT"
+                } else {
+                    ""
+                };
                 let hex = format_hex_dump(buf, recvd as usize, max_hex);
                 logging::info_message(&format!(
                     "[net-hook] RECVFROM (UDP/TCP) socket=0x{:X} bytes={} src={}{}{}",
@@ -851,7 +1090,13 @@ unsafe extern "system" fn detour_wsa_send_to(
                         target_str, nethernet_info
                     ));
                 } else if verbose || max_hex > 0 || is_listen_target {
-                    let tag = if port == 7551 { " ★NETHERNET-7551" } else if is_listen_target { " ★LISTEN-PORT" } else { "" };
+                    let tag = if port == 7551 {
+                        " ★NETHERNET-7551"
+                    } else if is_listen_target {
+                        " ★LISTEN-PORT"
+                    } else {
+                        ""
+                    };
                     let hex = format_hex_dump(first_ptr, sent_bytes, max_hex);
                     logging::info_message(&format!(
                         "[net-hook] WSASendTo (UDP/TCP) socket=0x{:X} bytes={} target={}{}{}",
@@ -896,7 +1141,11 @@ unsafe extern "system" fn detour_wsa_recv_from(
             0
         };
 
-        let flen = if !lp_fromlen.is_null() { *lp_fromlen } else { 0 };
+        let flen = if !lp_fromlen.is_null() {
+            *lp_fromlen
+        } else {
+            0
+        };
         let port = parse_sockaddr(lp_from, flen).map(|(_, p)| p).unwrap_or(0);
         if !should_ignore_port(port) {
             let verbose = VERBOSE.load(Ordering::Relaxed);
@@ -920,7 +1169,13 @@ unsafe extern "system" fn detour_wsa_recv_from(
                         src_str, nethernet_info
                     ));
                 } else if verbose || max_hex > 0 || is_listen_src {
-                    let tag = if port == 7551 { " ★NETHERNET-7551" } else if is_listen_src { " ★LISTEN-PORT" } else { "" };
+                    let tag = if port == 7551 {
+                        " ★NETHERNET-7551"
+                    } else if is_listen_src {
+                        " ★LISTEN-PORT"
+                    } else {
+                        ""
+                    };
                     let hex = format_hex_dump(first_ptr, recvd_bytes, max_hex);
                     logging::info_message(&format!(
                         "[net-hook] WSARecvFrom (UDP/TCP) socket=0x{:X} bytes={} src={}{}{}",
@@ -932,4 +1187,29 @@ unsafe extern "system" fn detour_wsa_recv_from(
     }
 
     res
+}
+
+#[cfg(test)]
+mod install_policy_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_network_features_do_not_request_winsock_hooks() {
+        let config = Config::default();
+        assert!(!hooks_requested(&config));
+    }
+
+    #[test]
+    fn network_logging_requests_winsock_hooks() {
+        let mut config = Config::default();
+        config.enable_network_hooks = true;
+        assert!(hooks_requested(&config));
+    }
+
+    #[test]
+    fn p2p_redirection_requests_winsock_hooks() {
+        let mut config = Config::default();
+        config.enable_p2p_redirection = true;
+        assert!(hooks_requested(&config));
+    }
 }

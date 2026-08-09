@@ -117,9 +117,8 @@ pub fn initialize_before_mods() {
 }
 
 /// Replays XUser bridge diagnostics generated before the normal tracing and
-/// console pipeline became available. This makes loader-lock-time decisions
-/// visible in `latest.log` and the debug console instead of only in the
-/// bootstrap marker file.
+/// console pipeline became available. The bridge now initializes in the OEP-gated
+/// pre-main phase after the Windows loader lock has been released.
 pub fn publish_pending_logs() {
     let Some(queue) = PENDING_LOGS.get() else {
         return;
@@ -139,7 +138,7 @@ pub fn publish_pending_logs() {
     logging::scoped_info_message(
         "xuser-bridge",
         &format!(
-            "正在回放 {} 条早期 XUser Bridge 诊断；以下状态生成于 BLoader DllMain 阶段",
+            "正在回放 {} 条早期 XUser Bridge 诊断；以下状态生成于 BLoader pre-main 阶段（loader lock 已释放）",
             pending.len()
         ),
     );
@@ -195,10 +194,9 @@ fn install_hook(session: Session) -> Result<HookInstallReport, String> {
         target as usize
     ));
 
-    let trampoline = unsafe {
-        MinHook::create_hook(target, query_api_hook as *const () as *mut c_void)
-    }
-    .map_err(|status| format!("MinHook create failed: {status:?}"))?;
+    let trampoline =
+        unsafe { MinHook::create_hook(target, query_api_hook as *const () as *mut c_void) }
+            .map_err(|status| format!("MinHook create failed: {status:?}"))?;
     ORIGINAL_QUERY_API
         .set(trampoline as usize)
         .map_err(|_| "official QueryApiImpl trampoline was already installed".to_string())?;
@@ -310,11 +308,7 @@ fn system_runtime_path() -> Result<PathBuf, String> {
 fn same_windows_path(left: &Path, right: &Path) -> bool {
     left.to_string_lossy()
         .trim_start_matches(r"\\?\")
-        .eq_ignore_ascii_case(
-            right
-                .to_string_lossy()
-                .trim_start_matches(r"\\?\"),
-        )
+        .eq_ignore_ascii_case(right.to_string_lossy().trim_start_matches(r"\\?\"))
 }
 
 fn sanitize_gamertag(value: &str) -> String {
@@ -382,7 +376,10 @@ mod tests {
 
     #[test]
     fn gamertag_log_value_removes_control_characters() {
-        assert_eq!(sanitize_gamertag(" Civil\r\nRelic\t4341 "), "CivilRelic4341");
+        assert_eq!(
+            sanitize_gamertag(" Civil\r\nRelic\t4341 "),
+            "CivilRelic4341"
+        );
     }
 
     #[test]
