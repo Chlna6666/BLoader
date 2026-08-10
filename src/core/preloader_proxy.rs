@@ -7,7 +7,7 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows::core::PCWSTR;
 
-use crate::runtime::foundation::{crash_report, logging, mod_diagnostics};
+use crate::runtime::foundation::{crash_report, file_io_policy, logging, mod_diagnostics};
 
 const PRELOAD_TYPE: &str = "preload";
 const PRELOADER_DLL: &str = "PreLoader.dll";
@@ -197,13 +197,6 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
         expected.display()
     ));
 
-    // PreLoader is a bootstrap loader, not an ordinary native Mod. It must run
-    // before BLoader installs process-wide stdout/stderr capture. Do not wrap
-    // this LoadLibraryW call in capture_library_load(), because that function
-    // temporarily rewires process-global Win32 and CRT stdout/stderr handles.
-    // PreLoader/LeviLamina performs delay-load remapping and loader work during
-    // initialization; changing global CRT state around that work can race the
-    // already-starting Minecraft process.
     let load_result = {
         let _scope = mod_diagnostics::enter_scope(&identity, "LoadLibrary:preloader_priority_early");
         let wide = wide_null(expected.as_os_str());
@@ -380,6 +373,10 @@ fn wide_null(value: &std::ffi::OsStr) -> Vec<u16> {
 }
 
 fn publish_status(status: ProxyStatus<'_>) {
+    if !file_io_policy::writes_allowed() {
+        return;
+    }
+
     let path = PathBuf::from("logs").join("preloader-status.json");
     let _ = fs::create_dir_all("logs");
     if let Ok(data) = serde_json::to_vec_pretty(&status) {
