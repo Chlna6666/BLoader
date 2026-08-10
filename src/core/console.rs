@@ -6,7 +6,7 @@ use std::ptr::null_mut;
 use std::thread;
 use std::time::Duration;
 
-use crate::runtime::foundation::{build_info, console_branding, file_io_policy, logging};
+use crate::runtime::foundation::{build_info, console_branding, file_io_policy, i18n, logging};
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, WriteFile,
@@ -37,8 +37,6 @@ pub unsafe fn init_console() {
     set_runtime_console_title();
 
     if window.0 != null_mut() {
-        // Closing the console window can terminate a console-attached Minecraft
-        // process. Keep the runtime console intentionally non-destructive.
         let menu = GetSystemMenu(window, false);
         if !menu.is_invalid() {
             let _ = DeleteMenu(menu, SC_CLOSE, MF_BYCOMMAND);
@@ -83,18 +81,16 @@ pub unsafe fn init_console() {
             let _ = SetConsoleMode(h_conout, new_mode);
         }
 
-        // Register the handle first so all subsequent runtime logs use the same
-        // console sink. Then replace the legacy banner with the adaptive brand.
         logging::set_console_handle(h_conout);
         render_adaptive_branding(h_conout);
         crate::core::xuser_bridge::publish_pending_logs();
+        schedule_mod_summary();
     }
 
     if !h_conin.is_invalid() {
         let _ = SetStdHandle(STD_INPUT_HANDLE, h_conin);
         let mut mode = CONSOLE_MODE(0);
         if GetConsoleMode(h_conin, &mut mode).is_ok() {
-            // QuickEdit pauses a console process while the user is selecting text.
             let new_mode = CONSOLE_MODE(
                 (mode.0
                     | ENABLE_EXTENDED_FLAGS.0
@@ -133,9 +129,6 @@ fn render_adaptive_branding(handle: HANDLE) {
         "OutputDebugString"
     };
 
-    // Clear the old fixed banner emitted while the console handle is attached.
-    // VT is enabled before this point on supported Windows consoles. If a host
-    // does not support VT, we simply print the portable ASCII fallback below.
     if ansi {
         write_console(handle, "\x1b[0m\x1b[2J\x1b[H");
     }
@@ -150,6 +143,28 @@ fn render_adaptive_branding(handle: HANDLE) {
         write_console(handle, &line);
         write_console(handle, "\r\n");
     }
+}
+
+fn schedule_mod_summary() {
+    let _ = thread::Builder::new()
+        .name("bloader-console-mod-summary".to_string())
+        .spawn(|| {
+            // Covers both late-attach and OEP-delayed console creation without
+            // blocking Minecraft startup. The registry is already authoritative.
+            thread::sleep(Duration::from_millis(2_000));
+            let mods = crate::runtime::foundation::mod_diagnostics::all_mods();
+            let discovered = mods.len();
+            let loaded = mods.iter().filter(|m| m.state == "loaded").count();
+            let failed = mods
+                .iter()
+                .filter(|m| matches!(m.state.as_str(), "failed" | "crashed"))
+                .count();
+            let text = i18n::tr("console.mods.summary")
+                .replace("{discovered}", &discovered.to_string())
+                .replace("{loaded}", &loaded.to_string())
+                .replace("{failed}", &failed.to_string());
+            logging::info_message(&text);
+        });
 }
 
 fn visible_columns(handle: HANDLE) -> usize {
@@ -203,7 +218,6 @@ pub fn start_input_listener() {
     let _ = thread::Builder::new()
         .name("bloader-console-input".to_string())
         .spawn(|| {
-            // Reserved for interactive diagnostics.
             thread::sleep(Duration::from_millis(100));
         });
 }
