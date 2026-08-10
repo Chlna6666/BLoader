@@ -23,30 +23,27 @@ pub fn emit(configured_level: &str, effective_level: &str) {
         "console+OutputDebugString (file sinks disabled)"
     };
     let stdio_mode = if file_io_policy::writes_allowed() {
-        "file-tail+structured-console"
+        "file-tail+java-console"
     } else {
-        "memory-pipe+structured-console"
+        "memory-pipe+java-console"
     };
     let runtime_kind = runtime_environment::prime_detection();
 
-    logging::scoped_info_message(
+    // Identity/build/path detail stays in the complete DEBUG diagnostics. The
+    // interactive console already presents version/license/host in its ASCII
+    // banner and should not repeat the same metadata as several INFO lines.
+    logging::scoped_debug_message(
         "identity",
         &format!(
-            "{} v{} | {}",
+            "{} v{} | {} | license={} | open_source=true | repository={}",
             build_info::NAME,
             build_info::VERSION,
             build_info::DESCRIPTION,
-        ),
-    );
-    logging::scoped_info_message(
-        "identity",
-        &format!(
-            "license={} | open_source=true | repository={}",
             build_info::LICENSE,
             build_info::REPOSITORY,
         ),
     );
-    logging::scoped_info_message(
+    logging::scoped_debug_message(
         "host",
         &format!(
             "application={} | version={} | runtime={} | file_io={}",
@@ -56,7 +53,6 @@ pub fn emit(configured_level: &str, effective_level: &str) {
             file_io_policy::mode_label(),
         ),
     );
-
     logging::scoped_debug_message(
         "build",
         &format!(
@@ -107,7 +103,7 @@ pub fn emit(configured_level: &str, effective_level: &str) {
     logging::scoped_debug_message(
         "logging",
         &format!(
-            "configured_level={} | effective_level={} | sinks={} | console_layout=structured-v2 | file_writes_allowed={} | policy={}",
+            "configured_level={} | effective_level={} | sinks={} | console_layout=java-server-v1 | file_writes_allowed={} | policy={}",
             configured_level,
             effective_level,
             sink_summary,
@@ -131,7 +127,7 @@ pub fn emit(configured_level: &str, effective_level: &str) {
         logging::scoped_info_message(
             "compat",
             &format!(
-                "legacy UWP compatibility active for Minecraft {}: BLoader file creation/modification is disabled; logging remains available through structured console, OutputDebugString and anonymous-memory-pipe stdio capture",
+                "Legacy UWP {}: no file writes; Mod output uses memory pipes",
                 host_version,
             ),
         );
