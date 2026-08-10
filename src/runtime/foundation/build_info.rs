@@ -6,7 +6,10 @@
 pub const NAME: &str = "BLoader";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DESCRIPTION: &str = env!("CARGO_PKG_DESCRIPTION");
-pub const LICENSE: &str = env!("CARGO_PKG_LICENSE");
+/// Human-facing license label. Cargo uses the canonical SPDX identifier
+/// `GPL-3.0-only`; console/project output intentionally presents it as GPL-3.0.
+pub const LICENSE: &str = "GPL-3.0";
+pub const LICENSE_SPDX: &str = env!("CARGO_PKG_LICENSE");
 pub const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 pub const PROFILE: &str = "native-preload-mod-crash-diagnostics";
 
