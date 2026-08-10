@@ -81,8 +81,6 @@ pub unsafe fn init_console() {
             let _ = SetConsoleMode(h_conout, new_mode);
         }
 
-        // set_console_handle may flush bootstrap diagnostics, then the branding
-        // renderer clears the viewport and establishes the final console surface.
         logging::set_console_handle(h_conout);
         render_adaptive_branding(h_conout);
         emit_runtime_identity();
@@ -158,7 +156,7 @@ fn emit_runtime_identity() {
         &format!("{}: {}", i18n::tr("console.info.repository"), build_info::REPOSITORY),
     );
     logging::scoped_info_message(
-        "minecraft",
+        "game-stdio",
         &format!("{}: {host_version}", i18n::tr("console.info.version")),
     );
     logging::scoped_info_message(
@@ -199,19 +197,13 @@ fn replay_pre_main_load_state() {
         logging::scoped_info_message("mod:PreLoader", &i18n::tr("console.preloader.none"));
     }
 
-    logging::scoped_info_message(
-        "mod:Proxy",
-        &i18n::tr("console.proxy.route"),
-    );
+    logging::scoped_info_message("mod:Proxy", &i18n::tr("console.proxy.route"));
 }
 
 fn schedule_mod_inventory_replay() {
     let _ = thread::Builder::new()
         .name("bloader-console-mod-inventory".to_string())
         .spawn(|| {
-            // Console creation is intentionally delayed after OEP on the normal
-            // path. Replay the authoritative registry after regular Mod loading
-            // has had time to complete, so pre-console lifecycle events are visible.
             thread::sleep(Duration::from_millis(2_000));
             let mut mods = crate::runtime::foundation::mod_diagnostics::all_mods();
             mods.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
@@ -219,6 +211,14 @@ fn schedule_mod_inventory_replay() {
             for identity in &mods {
                 let scope = format!("mod:{}", identity.name);
                 let version = identity.version.as_deref().unwrap_or("unknown");
+                logging::scoped_info_message(
+                    &scope,
+                    &format!(
+                        "{} {version} ({})",
+                        i18n::tr("console.mod.discovered"),
+                        identity.kind
+                    ),
+                );
                 match identity.state.as_str() {
                     "loaded" => logging::scoped_info_message(
                         &scope,
@@ -236,10 +236,7 @@ fn schedule_mod_inventory_replay() {
                         &scope,
                         &i18n::tr("console.mod.loading"),
                     ),
-                    _ => logging::scoped_info_message(
-                        &scope,
-                        &format!("{} {version} ({})", i18n::tr("console.mod.discovered"), identity.kind),
-                    ),
+                    _ => {}
                 }
             }
 
