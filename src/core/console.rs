@@ -278,8 +278,8 @@ fn launch_windows_terminal_async() -> bool {
 /// Runtime entry used only by the rundll32 Windows Terminal bridge process.
 /// The command-line pointer is decoded defensively as ANSI or UTF-16 because
 /// rundll32 entry point conventions vary between legacy and Unicode exports.
-pub unsafe fn run_rundll32_console_bridge(cmdline: *const c_void) {
-    let Some(pipe_path) = unsafe { decode_bridge_cmdline(cmdline) } else {
+pub unsafe fn run_rundll32_console_bridge(cmdline: *const u8) {
+    let Some(pipe_path) = unsafe { decode_bridge_cmdline(cmdline.cast()) } else {
         return;
     };
     let pipe_path = pipe_path.trim().trim_matches('"');
@@ -320,9 +320,6 @@ pub unsafe fn run_rundll32_console_bridge(cmdline: *const c_void) {
         return;
     }
 
-    // Force predictable UTF-8 + VT processing in the lightweight rundll32 host.
-    // This keeps Chinese i18n text and 24-bit ANSI branding independent of the
-    // machine's legacy console code page.
     unsafe {
         let _ = SetConsoleOutputCP(65001);
         let mut mode = CONSOLE_MODE(0);
@@ -381,8 +378,6 @@ unsafe fn decode_bridge_cmdline(cmdline: *const c_void) -> Option<String> {
     }
 
     let bytes = cmdline.cast::<u8>();
-    // Named pipe arguments are ASCII. A zero second byte therefore identifies
-    // the UTF-16 representation unambiguously for the expected input.
     if unsafe { *bytes.add(1) } == 0 {
         let wide = cmdline.cast::<u16>();
         let mut len = 0usize;
