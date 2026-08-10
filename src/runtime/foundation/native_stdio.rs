@@ -122,7 +122,7 @@ fn pending_lines() -> &'static Mutex<Vec<CapturedLine>> {
     PENDING_LINES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn kept_files() -> &'static Mutex<Vec<KeptCaptureFiles>> {
+fn kept_files() -> &'static Mutex<Vec<KeptCaptureFiles>>> {
     KEPT_FILES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
@@ -237,19 +237,23 @@ unsafe fn capture_library_load_pipe<T>(
         PathBuf::from("<memory-pipe:stderr>"),
     );
 
+    // Drain concurrently while DllMain / Mod initialization is executing.
+    // Without active readers a verbose Mod can fill the anonymous-pipe buffer
+    // and deadlock the Minecraft startup thread before LoadLibrary returns.
+    spawn_pipe_reader(stdout_read, Some(identity.clone()), "stdout", false);
+    spawn_pipe_reader(stderr_read, Some(identity.clone()), "stderr", false);
+
     let result = f();
     redirect.flush();
     redirect.restore();
     let _ = SetStdHandle(STD_OUTPUT_HANDLE, original_stdout);
     let _ = SetStdHandle(STD_ERROR_HANDLE, original_stderr);
 
-    // Closing the write ends makes the one-shot readers finish after all CRT
-    // duplicates have been restored/closed. The read threads queue output when
-    // logging is not ready yet, so pre-main Mod text is replayed later.
+    // Restoring CRT descriptors closes BLoader's duplicates. Closing these final
+    // write handles then releases the one-shot pipe readers after queued bytes
+    // have been drained. Pre-main output remains queued until logging is ready.
     drop(stdout_write);
     drop(stderr_write);
-    spawn_pipe_reader(stdout_read, Some(identity.clone()), "stdout", false);
-    spawn_pipe_reader(stderr_read, Some(identity.clone()), "stderr", false);
     mod_diagnostics::record_lifecycle(identity, "stdio_capture_ready", "mode=memory-pipe");
     result
 }
@@ -343,14 +347,10 @@ unsafe fn install_process_pipe_capture() -> bool {
 fn create_pipe_pair() -> Option<(PipeHandle, PipeHandle)> {
     let mut read = std::ptr::null_mut();
     let mut write = std::ptr::null_mut();
-    let ok = unsafe {
-        create_pipe_raw(
-            &mut read,
-            &mut write,
-            std::ptr::null(),
-            64 * 1024,
-        )
-    };
+    // Let Windows choose the anonymous-pipe buffer size. Continuous readers are
+    // always installed before any producer runs, so correctness is independent
+    // of a large implementation-specific buffer.
+    let ok = unsafe { create_pipe_raw(&mut read, &mut write, std::ptr::null(), 0) };
     if ok == 0 || read.is_null() || write.is_null() {
         if !read.is_null() {
             unsafe {
@@ -416,8 +416,6 @@ fn read_pipe(read: PipeHandle, identity: Option<ModIdentity>, stream: &str, foll
             pending.clear();
         }
         if !follow && bytes_read < buffer.len() as u32 {
-            // One-shot captures still continue until the write end closes; this
-            // branch only gives the scheduler a chance to run the Mod loader.
             thread::yield_now();
         }
     }
