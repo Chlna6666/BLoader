@@ -279,7 +279,7 @@ fn launch_windows_terminal_async() -> bool {
 /// The command-line pointer is decoded defensively as ANSI or UTF-16 because
 /// rundll32 entry point conventions vary between legacy and Unicode exports.
 pub unsafe fn run_rundll32_console_bridge(cmdline: *const u8) {
-    let Some(pipe_path) = unsafe { decode_bridge_cmdline(cmdline.cast()) } else {
+    let Some(pipe_path) = (unsafe { decode_bridge_cmdline(cmdline.cast()) }) else {
         return;
     };
     let pipe_path = pipe_path.trim().trim_matches('"');
