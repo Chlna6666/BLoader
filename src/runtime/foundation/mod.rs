@@ -8,3 +8,4 @@ pub mod logging;
 pub mod mod_diagnostics;
 pub mod native_stdio;
 pub mod runtime_environment;
+pub mod startup_diagnostics;
