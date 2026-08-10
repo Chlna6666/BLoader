@@ -17,7 +17,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{PCSTR, PCWSTR};
 
-use crate::runtime::foundation::{logging, mod_diagnostics};
+use crate::runtime::foundation::{file_io_policy, logging, mod_diagnostics};
 use mod_diagnostics::ModIdentity;
 
 const O_TEXT: i32 = 0x4000;
@@ -91,6 +91,15 @@ fn active_captures() -> &'static Mutex<Vec<ActiveCaptureSnapshot>> {
 }
 
 pub unsafe fn capture_library_load<T>(identity: &ModIdentity, phase: &str, f: impl FnOnce() -> T) -> T {
+    if file_io_policy::legacy_uwp_no_write() {
+        mod_diagnostics::record_lifecycle(
+            identity,
+            "stdio_capture_skipped",
+            &format!("phase={phase} reason=legacy-uwp-no-file-write"),
+        );
+        return f();
+    }
+
     let capture_dir = PathBuf::from("logs").join("mod-output");
     let _ = fs::create_dir_all(&capture_dir);
     let base = format!("{}-{}", sanitize(&identity.id), sanitize(phase));
@@ -151,6 +160,13 @@ pub unsafe fn capture_library_load<T>(identity: &ModIdentity, phase: &str, f: im
 
 pub unsafe fn install_process_capture() {
     if PROCESS_CAPTURE_INSTALLED.set(()).is_err() {
+        return;
+    }
+
+    if file_io_policy::legacy_uwp_no_write() {
+        logging::write_bootstrap_marker(
+            "stdio-capture.process.skipped reason=legacy-uwp-no-file-write",
+        );
         return;
     }
 
@@ -352,6 +368,10 @@ fn emit_line(identity: Option<ModIdentity>, stream: &str, line: &str) {
 }
 
 fn open_capture_file(path: &Path) -> Option<File> {
+    if !file_io_policy::writes_allowed() {
+        return None;
+    }
+
     OpenOptions::new()
         .create(true)
         .append(true)
@@ -361,6 +381,10 @@ fn open_capture_file(path: &Path) -> Option<File> {
 }
 
 fn open_capture_file_truncated(path: &Path) -> Option<File> {
+    if !file_io_policy::writes_allowed() {
+        return None;
+    }
+
     OpenOptions::new()
         .create(true)
         .write(true)
