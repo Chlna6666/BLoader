@@ -5,10 +5,10 @@
 use std::ffi::c_void;
 use std::process::{Command, Stdio};
 use std::ptr::null_mut;
-use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use crate::runtime::foundation::{build_info, console_branding, file_io_policy, i18n, logging};
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
@@ -65,14 +65,10 @@ pub unsafe fn init_console() {
     let existing_window = GetConsoleWindow();
     let has_existing_console = existing_window.0 != null_mut();
 
-    // If Minecraft already has a terminal, keep it. Otherwise prefer a real
-    // Windows Terminal window. This avoids binding Minecraft to a legacy
-    // conhost just to display BLoader diagnostics.
-    if !has_existing_console && try_init_windows_terminal() {
-        logging::scoped_debug_message(
-            "console",
-            "runtime console ready | backend=windows-terminal | transport=named-pipe | close_isolated=true",
-        );
+    // This function is only called when enable_debug_console=true. If Minecraft
+    // already owns a console, reuse it. Otherwise launch Windows Terminal without
+    // blocking the startup path. Classic Console Host is only a spawn-time fallback.
+    if !has_existing_console && launch_windows_terminal_async() {
         return;
     }
 
@@ -91,8 +87,6 @@ unsafe fn init_classic_console(is_existing: bool) {
     set_runtime_console_title();
 
     if window.0 != null_mut() {
-        // Closing an attached classic console can terminate Minecraft itself.
-        // Keep the close command disabled for this fallback backend only.
         let menu = GetSystemMenu(window, false);
         if !menu.is_invalid() {
             let _ = DeleteMenu(menu, SC_CLOSE, MF_BYCOMMAND);
@@ -150,8 +144,6 @@ unsafe fn init_classic_console(is_existing: bool) {
         let _ = SetStdHandle(STD_INPUT_HANDLE, h_conin);
         let mut mode = CONSOLE_MODE(0);
         if GetConsoleMode(h_conin, &mut mode).is_ok() {
-            // Selection/copy is intentionally enabled in the fallback console.
-            // Windows Terminal does not need QuickEdit and is preferred above.
             let new_mode = CONSOLE_MODE(
                 mode.0
                     | ENABLE_EXTENDED_FLAGS.0
@@ -181,7 +173,7 @@ unsafe fn init_classic_console(is_existing: bool) {
     );
 }
 
-fn try_init_windows_terminal() -> bool {
+fn launch_windows_terminal_async() -> bool {
     let pid = unsafe { GetCurrentProcessId() };
     let pipe_leaf = format!("BLoader.Console.{pid}");
     let pipe_path = format!(r"\\.\pipe\{pipe_leaf}");
@@ -209,13 +201,16 @@ fn try_init_windows_terminal() -> bool {
         file_io_policy::host_version().unwrap_or("unknown")
     );
     let script = format!(
-        "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); \
-         $p=[IO.Pipes.NamedPipeClientStream]::new('.', '{pipe_leaf}', [IO.Pipes.PipeDirection]::In); \
-         try {{ $p.Connect(5000); $r=[IO.StreamReader]::new($p,[Text.UTF8Encoding]::new($false)); \
-         while (($l=$r.ReadLine()) -ne $null) {{ [Console]::Out.WriteLine($l) }} }} \
-         finally {{ if ($r) {{ $r.Dispose() }}; $p.Dispose() }}"
+        "$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);\
+$p=[IO.Pipes.NamedPipeClientStream]::new('.', '{pipe_leaf}', [IO.Pipes.PipeDirection]::In);\
+$r=$null;try{{$p.Connect(8000);$r=[IO.StreamReader]::new($p,[Text.UTF8Encoding]::new($false));\
+while(($l=$r.ReadLine())-ne $null){{[Console]::Out.WriteLine($l)}}}}finally{{if($r){{$r.Dispose()}};$p.Dispose()}}"
     );
+    let encoded_command = encode_powershell_command(&script);
 
+    // -EncodedCommand deliberately contains no ';'. Windows Terminal treats ';'
+    // in its own command line as a tab/pane command separator, which previously
+    // split the PowerShell script into several short-lived tabs.
     let spawned = Command::new("wt.exe")
         .args([
             "-w",
@@ -230,16 +225,15 @@ fn try_init_windows_terminal() -> bool {
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
-            "-Command",
-            &script,
+            "-EncodedCommand",
+            &encoded_command,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .is_ok();
+        .spawn();
 
-    if !spawned {
+    if spawned.is_err() {
         unsafe {
             close_handle_raw(raw_pipe);
         }
@@ -247,20 +241,25 @@ fn try_init_windows_terminal() -> bool {
     }
 
     let raw_value = raw_pipe as usize;
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let _ = thread::Builder::new()
-        .name("bloader-wt-pipe-connect".to_string())
+    let connector = thread::Builder::new()
+        .name("bloader-windows-terminal".to_string())
         .spawn(move || {
             let raw_pipe = raw_value as *mut c_void;
             let connected = unsafe {
                 ConnectNamedPipe(raw_pipe, null_mut()) != 0
                     || get_last_error_raw() == ERROR_PIPE_CONNECTED
             };
-            let _ = sender.send(connected);
-        });
+            if !connected {
+                unsafe {
+                    close_handle_raw(raw_pipe);
+                }
+                logging::scoped_warn_message(
+                    "console",
+                    "Windows Terminal started but the runtime log pipe did not connect; continuing without an interactive console.",
+                );
+                return;
+            }
 
-    match receiver.recv_timeout(Duration::from_secs(4)) {
-        Ok(true) => {
             let handle = HANDLE(raw_pipe);
             logging::set_console_stream_handle(handle, true);
             render_branding(handle, WINDOWS_TERMINAL_COLUMNS, true, false);
@@ -268,19 +267,33 @@ fn try_init_windows_terminal() -> bool {
             replay_pre_main_load_state();
             crate::core::xuser_bridge::publish_pending_logs();
             schedule_mod_inventory_replay();
-            unsafe {
-                crate::runtime::foundation::native_stdio::install_process_capture();
-            }
-            crate::runtime::foundation::native_stdio::flush_pending();
-            true
+            logging::scoped_debug_message(
+                "console",
+                "runtime console ready | backend=windows-terminal | transport=named-pipe | startup_blocking=false | close_isolated=true",
+            );
+        });
+
+    if connector.is_err() {
+        // wt.exe has already been started. Do not create a second Console Host
+        // window; that would reintroduce the flash/double-window bug.
+        unsafe {
+            close_handle_raw(raw_pipe);
         }
-        _ => {
-            unsafe {
-                close_handle_raw(raw_pipe);
-            }
-            false
-        }
+        logging::scoped_warn_message(
+            "console",
+            "Windows Terminal started but the connector thread could not be created.",
+        );
     }
+
+    true
+}
+
+fn encode_powershell_command(script: &str) -> String {
+    let mut utf16_le = Vec::with_capacity(script.len() * 2);
+    for unit in script.encode_utf16() {
+        utf16_le.extend_from_slice(&unit.to_le_bytes());
+    }
+    BASE64.encode(utf16_le)
 }
 
 fn configure_classic_scrollback(handle: HANDLE) {
@@ -480,4 +493,16 @@ pub fn start_input_listener() {
         .spawn(|| {
             thread::sleep(Duration::from_millis(100));
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn powershell_encoded_command_cannot_be_split_by_wt_semicolons() {
+        let encoded = encode_powershell_command("$a=1;$b=2;Write-Output $a");
+        assert!(!encoded.contains(';'));
+        assert!(encoded.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=')));
+    }
 }
