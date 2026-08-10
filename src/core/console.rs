@@ -19,7 +19,7 @@ use windows::Win32::System::Console::{
     ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
     ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WRAP_AT_EOL_OUTPUT, GetConsoleMode,
     GetConsoleScreenBufferInfo, GetConsoleWindow, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
-    STD_OUTPUT_HANDLE, SetConsoleMode, SetConsoleTitleW, SetStdHandle,
+    STD_OUTPUT_HANDLE, SetConsoleMode, SetConsoleOutputCP, SetConsoleTitleW, SetStdHandle,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -207,10 +207,6 @@ fn launch_windows_terminal_async() -> bool {
         loader_path.to_string_lossy()
     );
 
-    // Windows Terminal launches the system rundll32 host, which calls the tiny
-    // exported BLoaderConsoleBridge function in this same DLL. No PowerShell,
-    // cmd.exe, .NET, script parser, helper extraction or extra product binary is
-    // involved. The bridge copies the pipe byte stream to terminal stdout.
     let spawned = Command::new("wt.exe")
         .args([
             "-w",
@@ -237,9 +233,6 @@ fn launch_windows_terminal_async() -> bool {
         return false;
     }
 
-    // The native bridge retries opening the pipe briefly, so this server thread
-    // does not need a startup barrier or artificial sleep. This keeps the
-    // Minecraft runtime-I/O path non-blocking while eliminating shell races.
     let raw_value = raw_pipe as usize;
     let connector = thread::Builder::new()
         .name("bloader-windows-terminal".to_string())
@@ -274,7 +267,6 @@ fn launch_windows_terminal_async() -> bool {
         });
 
     if connector.is_err() {
-        // WT has already started; do not create a second classic console window.
         unsafe {
             close_handle_raw(raw_pipe);
         }
@@ -284,15 +276,13 @@ fn launch_windows_terminal_async() -> bool {
 }
 
 /// Runtime entry used only by the rundll32 Windows Terminal bridge process.
-/// The DLL's DllMain detects rundll32.exe and skips all Minecraft bootstrap work,
-/// leaving this function as a small native pipe -> stdout byte pump.
-pub unsafe fn run_rundll32_console_bridge(cmdline: *const u8) {
-    if cmdline.is_null() {
+/// The command-line pointer is decoded defensively as ANSI or UTF-16 because
+/// rundll32 entry point conventions vary between legacy and Unicode exports.
+pub unsafe fn run_rundll32_console_bridge(cmdline: *const c_void) {
+    let Some(pipe_path) = unsafe { decode_bridge_cmdline(cmdline) } else {
         return;
-    }
-
-    let raw = unsafe { CStr::from_ptr(cmdline.cast()) }.to_string_lossy();
-    let pipe_path = raw.trim().trim_matches('"');
+    };
+    let pipe_path = pipe_path.trim().trim_matches('"');
     if pipe_path.is_empty() || !pipe_path.starts_with(r"\\.\pipe\BLoader.Console.") {
         return;
     }
@@ -330,6 +320,25 @@ pub unsafe fn run_rundll32_console_bridge(cmdline: *const u8) {
         return;
     }
 
+    // Force predictable UTF-8 + VT processing in the lightweight rundll32 host.
+    // This keeps Chinese i18n text and 24-bit ANSI branding independent of the
+    // machine's legacy console code page.
+    unsafe {
+        let _ = SetConsoleOutputCP(65001);
+        let mut mode = CONSOLE_MODE(0);
+        if GetConsoleMode(stdout, &mut mode).is_ok() {
+            let _ = SetConsoleMode(
+                stdout,
+                CONSOLE_MODE(
+                    mode.0
+                        | ENABLE_PROCESSED_OUTPUT.0
+                        | ENABLE_WRAP_AT_EOL_OUTPUT.0
+                        | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0,
+                ),
+            );
+        }
+    }
+
     let mut buffer = [0u8; 16 * 1024];
     loop {
         let mut read = 0u32;
@@ -364,6 +373,35 @@ pub unsafe fn run_rundll32_console_bridge(cmdline: *const u8) {
     unsafe {
         close_handle_raw(pipe.0);
     }
+}
+
+unsafe fn decode_bridge_cmdline(cmdline: *const c_void) -> Option<String> {
+    if cmdline.is_null() {
+        return None;
+    }
+
+    let bytes = cmdline.cast::<u8>();
+    // Named pipe arguments are ASCII. A zero second byte therefore identifies
+    // the UTF-16 representation unambiguously for the expected input.
+    if unsafe { *bytes.add(1) } == 0 {
+        let wide = cmdline.cast::<u16>();
+        let mut len = 0usize;
+        while len < 32_768 && unsafe { *wide.add(len) } != 0 {
+            len += 1;
+        }
+        if len == 0 || len == 32_768 {
+            return None;
+        }
+        return Some(String::from_utf16_lossy(unsafe {
+            std::slice::from_raw_parts(wide, len)
+        }));
+    }
+
+    Some(
+        unsafe { CStr::from_ptr(cmdline.cast()) }
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 fn configure_classic_scrollback(handle: HANDLE) {
