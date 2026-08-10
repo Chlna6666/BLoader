@@ -81,10 +81,14 @@ pub unsafe fn init_console() {
             let _ = SetConsoleMode(h_conout, new_mode);
         }
 
+        // set_console_handle may flush bootstrap diagnostics, then the branding
+        // renderer clears the viewport and establishes the final console surface.
         logging::set_console_handle(h_conout);
         render_adaptive_branding(h_conout);
+        emit_runtime_identity();
+        replay_pre_main_load_state();
         crate::core::xuser_bridge::publish_pending_logs();
-        schedule_mod_summary();
+        schedule_mod_inventory_replay();
     }
 
     if !h_conin.is_invalid() {
@@ -122,6 +126,18 @@ pub unsafe fn init_console() {
 fn render_adaptive_branding(handle: HANDLE) {
     let ansi = console_has_vt(handle);
     let columns = visible_columns(handle);
+
+    if ansi {
+        write_console(handle, "\x1b[0m\x1b[2J\x1b[H");
+    }
+
+    for line in console_branding::render_banner(columns, ansi) {
+        write_console(handle, &line);
+        write_console(handle, "\r\n");
+    }
+}
+
+fn emit_runtime_identity() {
     let host_version = file_io_policy::host_version().unwrap_or("unknown");
     let debug_destination = if file_io_policy::writes_allowed() {
         "logs/latest.log"
@@ -129,30 +145,104 @@ fn render_adaptive_branding(handle: HANDLE) {
         "OutputDebugString"
     };
 
-    if ansi {
-        write_console(handle, "\x1b[0m\x1b[2J\x1b[H");
-    }
-
-    for line in console_branding::render_banner(
-        columns,
-        ansi,
-        host_version,
-        file_io_policy::mode_label(),
-        debug_destination,
-    ) {
-        write_console(handle, &line);
-        write_console(handle, "\r\n");
-    }
+    logging::scoped_info_message(
+        "loader",
+        &format!("{}: {}", i18n::tr("console.info.version"), build_info::VERSION),
+    );
+    logging::scoped_info_message(
+        "loader",
+        &format!("{}: {}", i18n::tr("console.info.license"), build_info::LICENSE),
+    );
+    logging::scoped_info_message(
+        "loader",
+        &format!("{}: {}", i18n::tr("console.info.repository"), build_info::REPOSITORY),
+    );
+    logging::scoped_info_message(
+        "minecraft",
+        &format!("{}: {host_version}", i18n::tr("console.info.version")),
+    );
+    logging::scoped_info_message(
+        "loader",
+        &format!(
+            "{}: {} | {}: {} | {}: {}",
+            i18n::tr("console.info.locale"),
+            i18n::current_locale(),
+            i18n::tr("console.banner.file_io"),
+            file_io_policy::mode_label(),
+            i18n::tr("console.banner.full_debug"),
+            debug_destination,
+        ),
+    );
 }
 
-fn schedule_mod_summary() {
+fn replay_pre_main_load_state() {
+    let mods = crate::runtime::foundation::mod_diagnostics::all_mods();
+    let preload_count = mods.iter().filter(|m| m.kind == "preload").count();
+    if preload_count > 0 {
+        logging::scoped_info_message(
+            "mod:PreLoader",
+            &i18n::tr("console.preloader.detected")
+                .replace("{count}", &preload_count.to_string()),
+        );
+        let loaded = mods
+            .iter()
+            .filter(|m| m.kind == "preload" && m.state == "loaded")
+            .count();
+        if loaded > 0 {
+            logging::scoped_info_message(
+                "mod:PreLoader",
+                &i18n::tr("console.preloader.active")
+                    .replace("{count}", &loaded.to_string()),
+            );
+        }
+    } else {
+        logging::scoped_info_message("mod:PreLoader", &i18n::tr("console.preloader.none"));
+    }
+
+    logging::scoped_info_message(
+        "mod:Proxy",
+        &i18n::tr("console.proxy.route"),
+    );
+}
+
+fn schedule_mod_inventory_replay() {
     let _ = thread::Builder::new()
-        .name("bloader-console-mod-summary".to_string())
+        .name("bloader-console-mod-inventory".to_string())
         .spawn(|| {
-            // Covers both late-attach and OEP-delayed console creation without
-            // blocking Minecraft startup. The registry is already authoritative.
+            // Console creation is intentionally delayed after OEP on the normal
+            // path. Replay the authoritative registry after regular Mod loading
+            // has had time to complete, so pre-console lifecycle events are visible.
             thread::sleep(Duration::from_millis(2_000));
-            let mods = crate::runtime::foundation::mod_diagnostics::all_mods();
+            let mut mods = crate::runtime::foundation::mod_diagnostics::all_mods();
+            mods.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+
+            for identity in &mods {
+                let scope = format!("mod:{}", identity.name);
+                let version = identity.version.as_deref().unwrap_or("unknown");
+                match identity.state.as_str() {
+                    "loaded" => logging::scoped_info_message(
+                        &scope,
+                        &format!("Loaded {version} ({})", identity.kind),
+                    ),
+                    "failed" => logging::scoped_error_message(
+                        &scope,
+                        &i18n::tr("console.mod.failed"),
+                    ),
+                    "crashed" => logging::scoped_error_message(
+                        &scope,
+                        &i18n::tr("console.mod.crashed"),
+                    ),
+                    "loading" => logging::scoped_info_message(
+                        &scope,
+                        &i18n::tr("console.mod.loading"),
+                    ),
+                    _ => logging::scoped_info_message(
+                        &scope,
+                        &format!("{} {version} ({})", i18n::tr("console.mod.discovered"), identity.kind),
+                    ),
+                }
+            }
+
             let discovered = mods.len();
             let loaded = mods.iter().filter(|m| m.state == "loaded").count();
             let failed = mods
