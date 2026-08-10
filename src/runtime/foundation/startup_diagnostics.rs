@@ -22,6 +22,11 @@ pub fn emit(configured_level: &str, effective_level: &str) {
     } else {
         "console+OutputDebugString (file sinks disabled)"
     };
+    let stdio_mode = if file_io_policy::writes_allowed() {
+        "file-tail+structured-console"
+    } else {
+        "memory-pipe+structured-console"
+    };
     let runtime_kind = runtime_environment::prime_detection();
 
     logging::scoped_info_message(
@@ -102,7 +107,7 @@ pub fn emit(configured_level: &str, effective_level: &str) {
     logging::scoped_debug_message(
         "logging",
         &format!(
-            "configured_level={} | effective_level={} | sinks={} | file_writes_allowed={} | policy={}",
+            "configured_level={} | effective_level={} | sinks={} | console_layout=structured-v2 | file_writes_allowed={} | policy={}",
             configured_level,
             effective_level,
             sink_summary,
@@ -113,9 +118,9 @@ pub fn emit(configured_level: &str, effective_level: &str) {
     logging::scoped_debug_message(
         "capabilities",
         &format!(
-            "crash_capture=VEH+SEH | external_crash_logger={} | native_stdio_capture={} | file_redirection={} | xuser_bridge=embedded | panel_ui={} | mc_symbols={}",
+            "crash_capture=VEH+SEH | external_crash_logger={} | native_stdio_capture={} | mod_output_attribution=true | file_redirection={} | xuser_bridge=embedded+communication-logging | xuser_secrets_logged=false | panel_ui={} | mc_symbols={}",
             file_io_policy::writes_allowed(),
-            file_io_policy::writes_allowed(),
+            stdio_mode,
             file_io_policy::writes_allowed(),
             cfg!(feature = "panel-ui"),
             cfg!(feature = "mc-symbols"),
@@ -126,7 +131,7 @@ pub fn emit(configured_level: &str, effective_level: &str) {
         logging::scoped_info_message(
             "compat",
             &format!(
-                "legacy UWP compatibility active for Minecraft {}: BLoader file creation/modification is disabled; diagnostics remain available through console and OutputDebugString",
+                "legacy UWP compatibility active for Minecraft {}: BLoader file creation/modification is disabled; logging remains available through structured console, OutputDebugString and anonymous-memory-pipe stdio capture",
                 host_version,
             ),
         );
