@@ -54,7 +54,7 @@ fn main() {
         res.set("LegalCopyright", "Copyright (C) 2026 Chlna6666");
         res.set(
             "Comments",
-            "Open source under GPL-3.0-or-later | https://github.com/Chlna6666/BLoader",
+            "Open source under GPL-3.0 | https://github.com/Chlna6666/BLoader",
         );
         res.compile().unwrap();
     }
