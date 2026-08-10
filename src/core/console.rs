@@ -5,6 +5,7 @@
 use std::ffi::c_void;
 use std::process::{Command, Stdio};
 use std::ptr::null_mut;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -64,9 +65,6 @@ pub unsafe fn init_console() {
     let existing_window = GetConsoleWindow();
     let has_existing_console = existing_window.0 != null_mut();
 
-    // This function is only called when enable_debug_console=true. If Minecraft
-    // already owns a console, reuse it. Otherwise launch Windows Terminal without
-    // blocking the startup path. Classic Console Host is only a spawn-time fallback.
     if !has_existing_console && launch_windows_terminal_async() {
         return;
     }
@@ -155,8 +153,6 @@ unsafe fn init_classic_console(is_existing: bool) {
         }
     }
 
-    // StdIO capture is intentionally not installed here. The runtime-I/O phase
-    // owns that operation so opening a console remains a lightweight UI action.
     logging::scoped_debug_message(
         "console",
         &format!(
@@ -191,46 +187,16 @@ fn launch_windows_terminal_async() -> bool {
         return false;
     }
 
-    let title = format!(
-        "BLoader {} | Minecraft {} | Runtime Console",
-        build_info::VERSION,
-        file_io_policy::host_version().unwrap_or("unknown")
-    );
-
-    // cmd.exe is used only as the lightest built-in raw pipe reader. `type`
-    // copies BLoader's UTF-8/ANSI byte stream directly to Windows Terminal;
-    // there is no PowerShell startup, script parsing, object pipeline or recoding.
-    let reader_args = windows_terminal_reader_args(&pipe_path);
-    let mut command = Command::new("wt.exe");
-    command.args([
-        "-w",
-        "new",
-        "--size",
-        "120,40",
-        "new-tab",
-        "--title",
-        title.as_str(),
-        "--suppressApplicationTitle",
-    ]);
-    command.args(&reader_args);
-    let spawned = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-
-    if spawned.is_err() {
-        unsafe {
-            close_handle_raw(raw_pipe);
-        }
-        return false;
-    }
-
+    // Arm ConnectNamedPipe before wt.exe starts. The previous order launched
+    // `type \\.\pipe\...` first, so the client could observe the only pipe
+    // instance before it entered the listening state and fail with ERROR_PIPE_BUSY.
     let raw_value = raw_pipe as usize;
+    let (armed_tx, armed_rx) = mpsc::sync_channel(0);
     let connector = thread::Builder::new()
         .name("bloader-windows-terminal".to_string())
         .spawn(move || {
             let raw_pipe = raw_value as *mut c_void;
+            let _ = armed_tx.send(());
             let connected = unsafe {
                 ConnectNamedPipe(raw_pipe, null_mut()) != 0
                     || get_last_error_raw() == ERROR_PIPE_CONNECTED
@@ -241,7 +207,7 @@ fn launch_windows_terminal_async() -> bool {
                 }
                 logging::scoped_warn_message(
                     "console",
-                    "Windows Terminal started but the runtime log pipe did not connect; continuing without an interactive console.",
+                    "Windows Terminal runtime log pipe connection failed; continuing without an interactive console.",
                 );
                 return;
             }
@@ -255,33 +221,71 @@ fn launch_windows_terminal_async() -> bool {
             schedule_mod_inventory_replay();
             logging::scoped_debug_message(
                 "console",
-                "runtime console ready | backend=windows-terminal | transport=named-pipe | reader=cmd-type | powershell=false | startup_blocking=false | close_isolated=true",
+                "runtime console ready | backend=windows-terminal | transport=named-pipe | server_armed_before_client=true | reader=cmd-type | powershell=false | startup_blocking=false | close_isolated=true",
             );
         });
 
     if connector.is_err() {
-        // wt.exe has already been started. Do not create a second Console Host
-        // window; that would reintroduce the flash/double-window bug.
         unsafe {
             close_handle_raw(raw_pipe);
         }
-        logging::scoped_warn_message(
-            "console",
-            "Windows Terminal started but the connector thread could not be created.",
-        );
+        return false;
+    }
+
+    // Wait only for the connector thread to reach the point immediately before
+    // ConnectNamedPipe, then yield a tiny scheduling window. This is not a game
+    // startup delay; it only orders the two console-side actors.
+    let _ = armed_rx.recv_timeout(Duration::from_millis(50));
+    thread::sleep(Duration::from_millis(2));
+
+    let title = format!(
+        "BLoader {} | Minecraft {} | Runtime Console",
+        build_info::VERSION,
+        file_io_policy::host_version().unwrap_or("unknown")
+    );
+    let reader_args = windows_terminal_reader_args(&pipe_path);
+    let mut command = Command::new("wt.exe");
+    command.args([
+        "-w",
+        "new",
+        "--size",
+        "120,40",
+        "new-tab",
+        "--title",
+        title.as_str(),
+        "--suppressApplicationTitle",
+    ]);
+    command.args(&reader_args);
+
+    // The reader also has a silent, bounded retry loop. It normally succeeds on
+    // the first attempt because the server is armed above; the loop only covers
+    // an extreme scheduler race and never prints ERROR_PIPE_BUSY to the terminal.
+    if command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_err()
+    {
+        // wt.exe itself is unavailable. The blocked connector owns raw_pipe and
+        // will be released when the process exits; return false so the caller can
+        // provide the classic Console Host fallback for this session.
+        return false;
     }
 
     true
 }
 
 fn windows_terminal_reader_args(pipe_path: &str) -> Vec<String> {
+    let command = format!(
+        "for /l %i in (1,1,512) do @(type \"{pipe_path}\" 2>nul && exit /b 0) & exit /b 1"
+    );
     vec![
         "cmd.exe".to_string(),
         "/d".to_string(),
         "/q".to_string(),
         "/c".to_string(),
-        "type".to_string(),
-        pipe_path.to_string(),
+        command,
     ]
 }
 
@@ -489,11 +493,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn windows_terminal_reader_is_shell_minimal_and_powershell_free() {
+    fn windows_terminal_reader_is_shell_minimal_and_hides_pipe_busy_race() {
         let args = windows_terminal_reader_args(r"\\.\pipe\BLoader.Console.1234");
         assert_eq!(args[0], "cmd.exe");
-        assert_eq!(&args[1..5], &["/d", "/q", "/c", "type"]);
+        assert_eq!(&args[1..4], &["/d", "/q", "/c"]);
+        assert!(args[4].contains("for /l"));
+        assert!(args[4].contains("2>nul"));
+        assert!(args[4].contains(r"\\.\pipe\BLoader.Console.1234"));
         assert!(args.iter().all(|arg| !arg.to_ascii_lowercase().contains("powershell")));
-        assert_eq!(args[5], r"\\.\pipe\BLoader.Console.1234");
     }
 }
