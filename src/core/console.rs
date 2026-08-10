@@ -8,7 +8,6 @@ use std::ptr::null_mut;
 use std::thread;
 use std::time::Duration;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use crate::runtime::foundation::{build_info, console_branding, file_io_policy, i18n, logging};
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
@@ -156,11 +155,8 @@ unsafe fn init_classic_console(is_existing: bool) {
         }
     }
 
-    if !h_conout.is_invalid() {
-        crate::runtime::foundation::native_stdio::install_process_capture();
-        crate::runtime::foundation::native_stdio::flush_pending();
-    }
-
+    // StdIO capture is intentionally not installed here. The runtime-I/O phase
+    // owns that operation so opening a console remains a lightweight UI action.
     logging::scoped_debug_message(
         "console",
         &format!(
@@ -200,34 +196,24 @@ fn launch_windows_terminal_async() -> bool {
         build_info::VERSION,
         file_io_policy::host_version().unwrap_or("unknown")
     );
-    let script = format!(
-        "$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);\
-$p=[IO.Pipes.NamedPipeClientStream]::new('.', '{pipe_leaf}', [IO.Pipes.PipeDirection]::In);\
-$r=$null;try{{$p.Connect(8000);$r=[IO.StreamReader]::new($p,[Text.UTF8Encoding]::new($false));\
-while(($l=$r.ReadLine())-ne $null){{[Console]::Out.WriteLine($l)}}}}finally{{if($r){{$r.Dispose()}};$p.Dispose()}}"
-    );
-    let encoded_command = encode_powershell_command(&script);
 
-    // -EncodedCommand deliberately contains no ';'. Windows Terminal treats ';'
-    // in its own command line as a tab/pane command separator, which previously
-    // split the PowerShell script into several short-lived tabs.
-    let spawned = Command::new("wt.exe")
-        .args([
-            "-w",
-            "new",
-            "--size",
-            "120,40",
-            "new-tab",
-            "--title",
-            &title,
-            "--suppressApplicationTitle",
-            "powershell.exe",
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-EncodedCommand",
-            &encoded_command,
-        ])
+    // cmd.exe is used only as the lightest built-in raw pipe reader. `type`
+    // copies BLoader's UTF-8/ANSI byte stream directly to Windows Terminal;
+    // there is no PowerShell startup, script parsing, object pipeline or recoding.
+    let reader_args = windows_terminal_reader_args(&pipe_path);
+    let mut command = Command::new("wt.exe");
+    command.args([
+        "-w",
+        "new",
+        "--size",
+        "120,40",
+        "new-tab",
+        "--title",
+        title.as_str(),
+        "--suppressApplicationTitle",
+    ]);
+    command.args(&reader_args);
+    let spawned = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -269,7 +255,7 @@ while(($l=$r.ReadLine())-ne $null){{[Console]::Out.WriteLine($l)}}}}finally{{if(
             schedule_mod_inventory_replay();
             logging::scoped_debug_message(
                 "console",
-                "runtime console ready | backend=windows-terminal | transport=named-pipe | startup_blocking=false | close_isolated=true",
+                "runtime console ready | backend=windows-terminal | transport=named-pipe | reader=cmd-type | powershell=false | startup_blocking=false | close_isolated=true",
             );
         });
 
@@ -288,12 +274,15 @@ while(($l=$r.ReadLine())-ne $null){{[Console]::Out.WriteLine($l)}}}}finally{{if(
     true
 }
 
-fn encode_powershell_command(script: &str) -> String {
-    let mut utf16_le = Vec::with_capacity(script.len() * 2);
-    for unit in script.encode_utf16() {
-        utf16_le.extend_from_slice(&unit.to_le_bytes());
-    }
-    BASE64.encode(utf16_le)
+fn windows_terminal_reader_args(pipe_path: &str) -> Vec<String> {
+    vec![
+        "cmd.exe".to_string(),
+        "/d".to_string(),
+        "/q".to_string(),
+        "/c".to_string(),
+        "type".to_string(),
+        pipe_path.to_string(),
+    ]
 }
 
 fn configure_classic_scrollback(handle: HANDLE) {
@@ -500,9 +489,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn powershell_encoded_command_cannot_be_split_by_wt_semicolons() {
-        let encoded = encode_powershell_command("$a=1;$b=2;Write-Output $a");
-        assert!(!encoded.contains(';'));
-        assert!(encoded.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=')));
+    fn windows_terminal_reader_is_shell_minimal_and_powershell_free() {
+        let args = windows_terminal_reader_args(r"\\.\pipe\BLoader.Console.1234");
+        assert_eq!(args[0], "cmd.exe");
+        assert_eq!(&args[1..5], &["/d", "/q", "/c", "type"]);
+        assert!(args.iter().all(|arg| !arg.to_ascii_lowercase().contains("powershell")));
+        assert_eq!(args[5], r"\\.\pipe\BLoader.Console.1234");
     }
 }
