@@ -5,6 +5,8 @@
 use std::ffi::{CStr, c_void};
 use std::process::{Command, Stdio};
 use std::ptr::null_mut;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -17,23 +19,26 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Console::{
     AllocConsole, CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS,
     ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WRAP_AT_EOL_OUTPUT, GetConsoleMode,
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WRAP_AT_EOL_OUTPUT, FreeConsole, GetConsoleMode,
     GetConsoleScreenBufferInfo, GetConsoleWindow, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
     STD_OUTPUT_HANDLE, SetConsoleMode, SetConsoleOutputCP, SetConsoleTitleW, SetStdHandle,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DeleteMenu, GetSystemMenu, MF_BYCOMMAND, SC_CLOSE, SW_SHOW, ShowWindow,
+    DeleteMenu, GetSystemMenu, IsWindowVisible, MF_BYCOMMAND, SC_CLOSE, SW_SHOW, ShowWindow,
 };
 use windows::core::PCWSTR;
 
-const WINDOWS_TERMINAL_DEFAULT_SIZE: &str = "120,40";
 const CLASSIC_SCROLLBACK_LINES: i16 = 12_000;
 const ERROR_PIPE_CONNECTED: u32 = 535;
 const PIPE_ACCESS_OUTBOUND: u32 = 0x0000_0002;
 const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
 const BRIDGE_OPEN_RETRIES: usize = 750;
 const BRIDGE_OPEN_RETRY_MS: u64 = 2;
+const WINDOWS_TERMINAL_HANDSHAKE_TIMEOUT_MS: u64 = 1_200;
+const BACKEND_PENDING: u8 = 0;
+const BACKEND_WINDOWS_TERMINAL: u8 = 1;
+const BACKEND_CLASSIC: u8 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -65,20 +70,40 @@ unsafe extern "system" {
 
 pub unsafe fn init_console() {
     let existing_window = GetConsoleWindow();
-    let has_existing_console = existing_window.0 != null_mut();
+    let has_associated_console = existing_window.0 != null_mut();
+    let has_visible_console = has_associated_console && IsWindowVisible(existing_window).as_bool();
 
-    if !has_existing_console && launch_windows_terminal_async() {
+    logging::write_bootstrap_marker(&format!(
+        "console.visibility.probe associated={} visible={}",
+        has_associated_console, has_visible_console
+    ));
+
+    if has_visible_console {
+        init_classic_console(true);
         return;
     }
 
-    init_classic_console(has_existing_console);
+    // A pseudoconsole/ConPTY can return a non-null GetConsoleWindow HWND that is
+    // only a message-queue endpoint and is not locally visible. Do not treat that
+    // HWND as a usable runtime console; prefer an explicit Windows Terminal.
+    if launch_windows_terminal_async() {
+        return;
+    }
+
+    init_classic_console(false);
 }
 
-unsafe fn init_classic_console(is_existing: bool) {
+unsafe fn init_classic_console(is_existing_visible: bool) {
     let mut window = GetConsoleWindow();
-    if is_existing {
+    if is_existing_visible {
         let _ = ShowWindow(window, SW_SHOW);
     } else {
+        // If Minecraft inherited a hidden console or pseudoconsole, AllocConsole
+        // would fail while that association exists. Detach first, then create a
+        // real locally visible fallback console.
+        if window.0 != null_mut() {
+            let _ = FreeConsole();
+        }
         let _ = AllocConsole();
         window = GetConsoleWindow();
     }
@@ -168,7 +193,7 @@ unsafe fn init_classic_console(is_existing: bool) {
         "console",
         &format!(
             "runtime console ready | backend=console-host-fallback | source={} | quick_edit=true | scrollback={} | columns={} | file_io={}",
-            if is_existing { "existing" } else { "allocated" },
+            if is_existing_visible { "existing-visible" } else { "allocated-visible" },
             CLASSIC_SCROLLBACK_LINES,
             visible_columns(h_conout),
             file_io_policy::mode_label(),
@@ -195,43 +220,43 @@ fn launch_windows_terminal_async() -> bool {
         )
     };
     if raw_pipe.is_null() || raw_pipe as isize == -1 {
+        logging::write_bootstrap_marker("console.windows_terminal.pipe.create.failed fallback=classic");
         return false;
     }
 
     let loader_path = crate::utils::get_module_path(crate::utils::loader_module_handle());
     let Some(loader_dir) = loader_path.parent() else {
         unsafe { close_handle_raw(raw_pipe); }
+        logging::write_bootstrap_marker("console.windows_terminal.loader_dir.missing fallback=classic");
         return false;
     };
     let Some(loader_name) = loader_path.file_name().and_then(|name| name.to_str()) else {
         unsafe { close_handle_raw(raw_pipe); }
+        logging::write_bootstrap_marker("console.windows_terminal.loader_name.invalid fallback=classic");
         return false;
     };
     if loader_name.contains(',') {
         unsafe { close_handle_raw(raw_pipe); }
+        logging::write_bootstrap_marker("console.windows_terminal.loader_name.comma fallback=classic");
         return false;
     }
 
-    // Do not pass the absolute DLL path to rundll32. A path containing spaces is
-    // ambiguous when the required `dll,EntryPoint` syntax is forwarded through
-    // wt.exe. Instead make WT start in the DLL directory and pass only the file
-    // name, which keeps the rundll32 token unambiguous.
-    let bridge_entry = format!("{loader_name},BLoaderConsoleBridge");
+    // Make the DLL path explicit relative to WT's starting directory. This avoids
+    // both absolute-path quoting ambiguity and DLL-search-policy differences.
+    let bridge_entry = format!(r".\{loader_name},BLoaderConsoleBridge");
     let title = format!(
         "BLoader {} | Minecraft {} | Runtime Console",
         build_info::VERSION,
         file_io_policy::host_version().unwrap_or("unknown")
     );
 
+    logging::write_bootstrap_marker(&format!(
+        "console.windows_terminal.spawn.begin dir={} bridge={} pipe={}",
+        loader_dir.display(), bridge_entry, pipe_leaf
+    ));
+
     let mut wt = Command::new("wt.exe");
-    wt.args([
-        "-w",
-        "new",
-        "--size",
-        WINDOWS_TERMINAL_DEFAULT_SIZE,
-        "new-tab",
-        "--startingDirectory",
-    ]);
+    wt.args(["-w", "new", "new-tab", "--startingDirectory"]);
     wt.arg(loader_dir.as_os_str());
     wt.args([
         "--title",
@@ -242,19 +267,24 @@ fn launch_windows_terminal_async() -> bool {
         pipe_path.as_str(),
     ]);
 
-    if wt
+    if let Err(error) = wt
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .is_err()
     {
         unsafe { close_handle_raw(raw_pipe); }
+        logging::write_bootstrap_marker(&format!(
+            "console.windows_terminal.spawn.failed error={} fallback=classic",
+            error
+        ));
         return false;
     }
 
+    let backend = Arc::new(AtomicU8::new(BACKEND_PENDING));
+    let connector_backend = Arc::clone(&backend);
     let raw_value = raw_pipe as usize;
-    if thread::Builder::new()
+    let connector = thread::Builder::new()
         .name("bloader-windows-terminal".to_string())
         .spawn(move || {
             let raw_pipe = raw_value as *mut c_void;
@@ -264,15 +294,37 @@ fn launch_windows_terminal_async() -> bool {
             };
             if !connected {
                 unsafe { close_handle_raw(raw_pipe); }
-                logging::scoped_warn_message(
-                    "console",
-                    "Windows Terminal bridge did not connect; runtime logs remain available in the normal debug sinks.",
-                );
+                if connector_backend
+                    .compare_exchange(
+                        BACKEND_PENDING,
+                        BACKEND_CLASSIC,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    logging::scoped_warn_message(
+                        "console",
+                        "Windows Terminal bridge connection failed; switching to a visible classic console.",
+                    );
+                    unsafe { init_classic_console(false); }
+                }
                 return;
             }
 
-            // Branding is rendered inside the bridge using the real ConPTY width.
-            // From this point the pipe carries only runtime log lines.
+            if connector_backend
+                .compare_exchange(
+                    BACKEND_PENDING,
+                    BACKEND_WINDOWS_TERMINAL,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                unsafe { close_handle_raw(raw_pipe); }
+                return;
+            }
+
             let handle = HANDLE(raw_pipe);
             logging::set_console_stream_handle(handle, true);
             emit_runtime_identity();
@@ -283,10 +335,51 @@ fn launch_windows_terminal_async() -> bool {
                 "console",
                 "runtime console ready | backend=windows-terminal | transport=named-pipe | reader=bloader-rundll32-native | banner=bridge-real-width | shell=false | powershell=false | startup_blocking=false",
             );
+        });
+
+    if connector.is_err() {
+        unsafe { close_handle_raw(raw_pipe); }
+        logging::write_bootstrap_marker(
+            "console.windows_terminal.connector.spawn.failed fallback=classic",
+        );
+        return false;
+    }
+
+    let watchdog_backend = Arc::clone(&backend);
+    if thread::Builder::new()
+        .name("bloader-console-watchdog".to_string())
+        .spawn(move || {
+            thread::sleep(Duration::from_millis(WINDOWS_TERMINAL_HANDSHAKE_TIMEOUT_MS));
+            if watchdog_backend
+                .compare_exchange(
+                    BACKEND_PENDING,
+                    BACKEND_CLASSIC,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                logging::scoped_warn_message(
+                    "console",
+                    "Windows Terminal bridge handshake timed out; switching to a visible classic console.",
+                );
+                unsafe { init_classic_console(false); }
+            }
         })
         .is_err()
+        && backend
+            .compare_exchange(
+                BACKEND_PENDING,
+                BACKEND_CLASSIC,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     {
-        unsafe { close_handle_raw(raw_pipe); }
+        logging::write_bootstrap_marker(
+            "console.windows_terminal.watchdog.spawn.failed fallback=classic",
+        );
+        unsafe { init_classic_console(false); }
     }
 
     true
@@ -325,7 +418,6 @@ pub unsafe fn run_rundll32_console_bridge(cmdline: *const u8) {
         }
     }
 
-    // Only the bridge can query the real Windows Terminal character geometry.
     render_branding(stdout, visible_columns(stdout), true, true);
 
     let wide: Vec<u16> = pipe_path.encode_utf16().chain(Some(0)).collect();
@@ -608,11 +700,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bridge_entry_does_not_embed_absolute_path() {
+    fn bridge_entry_uses_explicit_relative_dll_path() {
         let loader_name = "BLoader.dll";
-        let bridge_entry = format!("{loader_name},BLoaderConsoleBridge");
-        assert_eq!(bridge_entry, "BLoader.dll,BLoaderConsoleBridge");
-        assert!(!bridge_entry.contains('\\'));
-        assert!(!bridge_entry.contains('/'));
+        let bridge_entry = format!(r".\{loader_name},BLoaderConsoleBridge");
+        assert_eq!(bridge_entry, r".\BLoader.dll,BLoaderConsoleBridge");
+        assert!(!bridge_entry.contains(":"));
     }
 }
