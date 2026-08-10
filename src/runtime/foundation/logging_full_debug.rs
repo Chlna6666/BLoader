@@ -10,6 +10,10 @@ pub use inner::{
 };
 
 pub fn init(configured_level: &str) {
+    // Persistent diagnostics always keep at least DEBUG detail. The interactive
+    // console independently follows the user's configured level so normal INFO
+    // sessions stay as compact as a Java server console.
+    inner::set_console_level(configured_level);
     let effective_level = if configured_level.trim().eq_ignore_ascii_case("trace") {
         "trace"
     } else {
@@ -18,9 +22,10 @@ pub fn init(configured_level: &str) {
 
     inner::init(effective_level);
     inner::write_bootstrap_marker(&format!(
-        "logging.validation.full-debug configured_level={} effective_level={} sinks=policy-selected",
+        "logging.validation.full-debug configured_level={} effective_level={} console_level={}",
         configured_level,
         effective_level,
+        configured_level,
     ));
     crate::runtime::foundation::startup_diagnostics::emit(configured_level, effective_level);
 }
