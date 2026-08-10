@@ -30,6 +30,7 @@ const BLOADER_ART: [&str; 5] = [
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BannerLayout {
+    Minimal,
     Compact,
     Normal,
     Wide,
@@ -40,8 +41,10 @@ pub fn choose_layout(columns: usize) -> BannerLayout {
         BannerLayout::Wide
     } else if columns >= 68 {
         BannerLayout::Normal
-    } else {
+    } else if columns >= 48 {
         BannerLayout::Compact
+    } else {
+        BannerLayout::Minimal
     }
 }
 
@@ -50,9 +53,13 @@ pub fn render_banner(columns: usize, ansi: bool, host_version: &str, mode: &str,
     let mut lines = Vec::new();
 
     match layout {
+        BannerLayout::Minimal => {
+            lines.push(color_text("BLoader", 117, 214, 255, ansi));
+        }
         BannerLayout::Compact => {
-            for art in BLOADER_ART {
-                lines.push(color_text(art, 117, 214, 255, ansi));
+            for (index, art) in BLOADER_ART.iter().enumerate() {
+                let (r, g, b) = wordmark_color(index);
+                lines.push(color_text(art, r, g, b, ansi));
             }
         }
         BannerLayout::Normal | BannerLayout::Wide => {
@@ -62,7 +69,8 @@ pub fn render_banner(columns: usize, ansi: bool, host_version: &str, mode: &str,
             for row in 0..height {
                 let left = logo.get(row).cloned().unwrap_or_else(|| " ".repeat(logo_rows * 2));
                 let right = BLOADER_ART.get(row).copied().unwrap_or("");
-                let right = color_text(right, 117, 214, 255, ansi);
+                let (r, g, b) = wordmark_color(row.min(BLOADER_ART.len() - 1));
+                let right = color_text(right, r, g, b, ansi);
                 lines.push(format!("{left}  {right}"));
             }
         }
@@ -72,9 +80,19 @@ pub fn render_banner(columns: usize, ansi: bool, host_version: &str, mode: &str,
     let debug_label = i18n::tr("console.banner.full_debug");
     let mode_label = i18n::tr("console.banner.file_io");
     lines.push(String::new());
-    lines.push(format!("BLoader v{}  |  Minecraft {}  |  {}", build_info::VERSION, host_version, build_info::LICENSE));
-    lines.push(subtitle);
-    lines.push(format!("{mode_label}: {mode}  |  {debug_label}: {debug_destination}"));
+
+    if layout == BannerLayout::Minimal {
+        lines.push(fit_plain(&format!("v{} | Minecraft {}", build_info::VERSION, host_version), columns));
+        lines.push(fit_plain(&subtitle, columns));
+    } else {
+        lines.push(fit_plain(
+            &format!("BLoader v{}  |  Minecraft {}  |  {}", build_info::VERSION, host_version, build_info::LICENSE),
+            columns,
+        ));
+        lines.push(fit_plain(&subtitle, columns));
+        lines.push(fit_plain(&format!("{mode_label}: {mode}"), columns));
+        lines.push(fit_plain(&format!("{debug_label}: {debug_destination}"), columns));
+    }
     lines.push(String::new());
     lines
 }
@@ -116,6 +134,17 @@ fn render_logo(target_rows: usize, ansi: bool) -> Vec<String> {
     rows
 }
 
+fn wordmark_color(row: usize) -> (u8, u8, u8) {
+    const COLORS: [(u8, u8, u8); 5] = [
+        (117, 214, 255),
+        (104, 196, 255),
+        (129, 166, 255),
+        (168, 145, 255),
+        (201, 132, 255),
+    ];
+    COLORS[row.min(COLORS.len() - 1)]
+}
+
 fn color_text(text: &str, r: u8, g: u8, b: u8, ansi: bool) -> String {
     if ansi {
         format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[0m")
@@ -124,13 +153,34 @@ fn color_text(text: &str, r: u8, g: u8, b: u8, ansi: bool) -> String {
     }
 }
 
+fn fit_plain(text: &str, columns: usize) -> String {
+    if columns == 0 {
+        return String::new();
+    }
+    let mut width = 0usize;
+    let mut output = String::new();
+    for ch in text.chars() {
+        let char_width = if ch.is_ascii() { 1 } else { 2 };
+        if width + char_width > columns.saturating_sub(1) {
+            if columns >= 4 {
+                output.push_str("...");
+            }
+            break;
+        }
+        output.push(ch);
+        width += char_width;
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn layout_never_forces_logo_into_narrow_console() {
-        assert_eq!(choose_layout(60), BannerLayout::Compact);
+    fn layout_never_forces_art_into_narrow_console() {
+        assert_eq!(choose_layout(40), BannerLayout::Minimal);
+        assert_eq!(choose_layout(50), BannerLayout::Compact);
         assert_eq!(choose_layout(70), BannerLayout::Normal);
         assert_eq!(choose_layout(100), BannerLayout::Wide);
     }
@@ -138,5 +188,10 @@ mod tests {
     #[test]
     fn ascii_wordmark_is_portable() {
         assert!(BLOADER_ART.iter().all(|line| line.is_ascii()));
+    }
+
+    #[test]
+    fn narrow_metadata_is_clamped() {
+        assert!(fit_plain("abcdefghijklmnopqrstuvwxyz", 10).len() <= 12);
     }
 }
