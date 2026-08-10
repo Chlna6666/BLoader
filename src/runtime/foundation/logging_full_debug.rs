@@ -9,9 +9,18 @@ pub use inner::{
     write_bootstrap_marker,
 };
 
-pub fn init(_configured_level: &str) {
-    inner::init("debug");
-    inner::write_bootstrap_marker(
-        "logging.validation.full-debug configured_level=ignored effective_level=debug sinks=policy-selected",
-    );
+pub fn init(configured_level: &str) {
+    let effective_level = if configured_level.trim().eq_ignore_ascii_case("trace") {
+        "trace"
+    } else {
+        "debug"
+    };
+
+    inner::init(effective_level);
+    inner::write_bootstrap_marker(&format!(
+        "logging.validation.full-debug configured_level={} effective_level={} sinks=policy-selected",
+        configured_level,
+        effective_level,
+    ));
+    crate::runtime::foundation::startup_diagnostics::emit(configured_level, effective_level);
 }
