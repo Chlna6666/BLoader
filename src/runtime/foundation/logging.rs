@@ -153,6 +153,30 @@ pub fn is_ready() -> bool {
     LOGGING_READY.get().is_some()
 }
 
+pub fn console_is_ready() -> bool {
+    CONSOLE_HANDLE
+        .get()
+        .map(|value| !value.0.is_invalid())
+        .unwrap_or(false)
+}
+
+/// Writes a previously-published diagnostic to the interactive console only.
+/// This intentionally bypasses tracing/file/OutputDebugString sinks so replaying
+/// pre-console XUser/Mod diagnostics does not duplicate persistent log records.
+pub fn replay_console_message(level: &str, scope: &str, message: &str) {
+    if !console_is_ready() {
+        return;
+    }
+    let level = match level.to_ascii_lowercase().as_str() {
+        "error" => Level::ERROR,
+        "warn" | "warning" => Level::WARN,
+        "debug" => Level::DEBUG,
+        "trace" => Level::TRACE,
+        _ => Level::INFO,
+    };
+    write_bytes_to_console(format_console_line(level, scope, message).as_bytes());
+}
+
 pub fn captured_mod_output(mod_name: &str, mod_id: &str, stream: &str, message: &str) {
     let scope = format!("mod:{mod_name}");
     log_message(Level::INFO, &scope, &format!("{stream}> {message}"));
@@ -474,6 +498,7 @@ fn console_route(scope: &str) -> (String, String) {
             | "logging"
             | "capabilities"
             | "compat"
+            | "console"
             | "file-redirection"
     ) {
         return ("SYS".to_string(), scope.to_string());
