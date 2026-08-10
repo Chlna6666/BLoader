@@ -511,7 +511,7 @@ fn format_console_line(level: Level, scope: &str, message: &str) -> String {
 
 fn console_source(scope: &str) -> String {
     if let Some(name) = scope.strip_prefix("mod:") {
-        return format!("Mod/{name}");
+        return name.to_string();
     }
     if scope == "xuser-bridge" || scope.starts_with("xuser-") {
         return "XUser".to_string();
@@ -546,7 +546,7 @@ fn console_source(scope: &str) -> String {
         return "BLoader".to_string();
     }
     if crate::runtime::foundation::mod_diagnostics::find_by_name(scope).is_some() {
-        return format!("Mod/{scope}");
+        return scope.to_string();
     }
     format!("BLoader/{scope}")
 }
