@@ -22,6 +22,7 @@ const O_TEXT: i32 = 0x4000;
 const STDOUT_FILENO: i32 = 1;
 const STDERR_FILENO: i32 = 2;
 const PIPE_READ_BUFFER: usize = 8192;
+const MAX_PENDING_LINE_BYTES: usize = 64 * 1024;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -32,6 +33,7 @@ unsafe extern "system" {
         pipe_attributes: *const c_void,
         size: u32,
     ) -> i32;
+
     #[link_name = "ReadFile"]
     fn read_file_raw(
         file: *mut c_void,
@@ -122,7 +124,7 @@ fn pending_lines() -> &'static Mutex<Vec<CapturedLine>> {
     PENDING_LINES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn kept_files() -> &'static Mutex<Vec<KeptCaptureFiles>>> {
+fn kept_files() -> &'static Mutex<Vec<KeptCaptureFiles>> {
     KEPT_FILES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
@@ -130,11 +132,22 @@ fn active_captures() -> &'static Mutex<Vec<ActiveCaptureSnapshot>> {
     ACTIVE_CAPTURES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-pub unsafe fn capture_library_load<T>(identity: &ModIdentity, phase: &str, f: impl FnOnce() -> T) -> T {
+pub unsafe fn capture_library_load<T>(
+    identity: &ModIdentity,
+    phase: &str,
+    f: impl FnOnce() -> T,
+) -> T {
     if file_io_policy::legacy_uwp_no_write() {
         return unsafe { capture_library_load_pipe(identity, phase, f) };
     }
+    unsafe { capture_library_load_file(identity, phase, f) }
+}
 
+unsafe fn capture_library_load_file<T>(
+    identity: &ModIdentity,
+    phase: &str,
+    f: impl FnOnce() -> T,
+) -> T {
     let capture_dir = PathBuf::from("logs").join("mod-output");
     let _ = fs::create_dir_all(&capture_dir);
     let base = format!("{}-{}", sanitize(&identity.id), sanitize(phase));
@@ -178,6 +191,7 @@ pub unsafe fn capture_library_load<T>(identity: &ModIdentity, phase: &str, f: im
         stdout_path.clone(),
         stderr_path.clone(),
     );
+
     let result = f();
     redirect.flush();
     redirect.restore();
@@ -237,11 +251,10 @@ unsafe fn capture_library_load_pipe<T>(
         PathBuf::from("<memory-pipe:stderr>"),
     );
 
-    // Drain concurrently while DllMain / Mod initialization is executing.
-    // Without active readers a verbose Mod can fill the anonymous-pipe buffer
-    // and deadlock the Minecraft startup thread before LoadLibrary returns.
-    spawn_pipe_reader(stdout_read, Some(identity.clone()), "stdout", false);
-    spawn_pipe_reader(stderr_read, Some(identity.clone()), "stderr", false);
+    // Readers must be live before the Mod runs. Otherwise a verbose DllMain can
+    // fill an anonymous pipe and block Minecraft's startup thread indefinitely.
+    spawn_pipe_reader(stdout_read, Some(identity.clone()), "stdout");
+    spawn_pipe_reader(stderr_read, Some(identity.clone()), "stderr");
 
     let result = f();
     redirect.flush();
@@ -249,9 +262,8 @@ unsafe fn capture_library_load_pipe<T>(
     let _ = SetStdHandle(STD_OUTPUT_HANDLE, original_stdout);
     let _ = SetStdHandle(STD_ERROR_HANDLE, original_stderr);
 
-    // Restoring CRT descriptors closes BLoader's duplicates. Closing these final
-    // write handles then releases the one-shot pipe readers after queued bytes
-    // have been drained. Pre-main output remains queued until logging is ready.
+    // The CRT duplicates were closed by restore(); close the final writer handles
+    // so the one-shot readers reach EOF after draining all remaining bytes.
     drop(stdout_write);
     drop(stderr_write);
     mod_diagnostics::record_lifecycle(identity, "stdio_capture_ready", "mode=memory-pipe");
@@ -279,6 +291,10 @@ pub unsafe fn install_process_capture() {
         return;
     }
 
+    install_process_file_capture();
+}
+
+unsafe fn install_process_file_capture() {
     let capture_dir = PathBuf::from("logs").join("captured-stdio");
     let _ = fs::create_dir_all(&capture_dir);
     let stdout_path = capture_dir.join("process-stdout.raw.log");
@@ -331,14 +347,14 @@ unsafe fn install_process_pipe_capture() -> bool {
     {
         return false;
     }
+
     let redirect = CrtRedirect::install(stdout_write.raw(), stderr_write.raw());
     std::mem::forget(redirect);
+    spawn_pipe_reader(stdout_read, None, "stdout");
+    spawn_pipe_reader(stderr_read, None, "stderr");
 
-    spawn_pipe_reader(stdout_read, None, "stdout", true);
-    spawn_pipe_reader(stderr_read, None, "stderr", true);
-
-    // SetStdHandle does not take ownership. Keep the write handles alive for the
-    // process lifetime; CRT descriptors hold duplicates as well.
+    // SetStdHandle does not own the handles. Keep the writers alive for the
+    // lifetime of Minecraft; the redirected CRT descriptors hold duplicates too.
     std::mem::forget(stdout_write);
     std::mem::forget(stderr_write);
     true
@@ -347,9 +363,8 @@ unsafe fn install_process_pipe_capture() -> bool {
 fn create_pipe_pair() -> Option<(PipeHandle, PipeHandle)> {
     let mut read = std::ptr::null_mut();
     let mut write = std::ptr::null_mut();
-    // Let Windows choose the anonymous-pipe buffer size. Continuous readers are
-    // always installed before any producer runs, so correctness is independent
-    // of a large implementation-specific buffer.
+    // Size 0 lets Windows choose the buffer. Readers are continuously draining,
+    // so correctness does not depend on a large implementation-specific buffer.
     let ok = unsafe { create_pipe_raw(&mut read, &mut write, std::ptr::null(), 0) };
     if ok == 0 || read.is_null() || write.is_null() {
         if !read.is_null() {
@@ -371,7 +386,6 @@ fn spawn_pipe_reader(
     read: PipeHandle,
     identity: Option<ModIdentity>,
     stream: &'static str,
-    follow: bool,
 ) {
     let thread_name = format!(
         "bloader-pipe-{}-{}",
@@ -382,11 +396,11 @@ fn spawn_pipe_reader(
             .unwrap_or_else(|| "process".to_string())
     );
     let _ = thread::Builder::new().name(thread_name).spawn(move || {
-        read_pipe(read, identity, stream, follow);
+        read_pipe(read, identity, stream);
     });
 }
 
-fn read_pipe(read: PipeHandle, identity: Option<ModIdentity>, stream: &str, follow: bool) {
+fn read_pipe(read: PipeHandle, identity: Option<ModIdentity>, stream: &str) {
     let mut pending = Vec::<u8>::new();
     let mut buffer = [0u8; PIPE_READ_BUFFER];
     loop {
@@ -405,28 +419,11 @@ fn read_pipe(read: PipeHandle, identity: Option<ModIdentity>, stream: &str, foll
         }
         pending.extend_from_slice(&buffer[..bytes_read as usize]);
         drain_lines(&mut pending, identity.clone(), stream);
-        if pending.len() > 64 * 1024 {
-            let line = String::from_utf8_lossy(&pending)
-                .trim_matches(char::from(0))
-                .trim()
-                .to_string();
-            if !line.is_empty() {
-                queue_or_emit(identity.clone(), stream, &line);
-            }
-            pending.clear();
-        }
-        if !follow && bytes_read < buffer.len() as u32 {
-            thread::yield_now();
+        if pending.len() > MAX_PENDING_LINE_BYTES {
+            flush_partial_line(&mut pending, identity.clone(), stream);
         }
     }
-    if !pending.is_empty() {
-        let line = String::from_utf8_lossy(&pending)
-            .trim_end_matches(|value| matches!(value, '\r' | '\n' | '\0'))
-            .to_string();
-        if !line.trim().is_empty() {
-            queue_or_emit(identity, stream, &line);
-        }
-    }
+    flush_partial_line(&mut pending, identity, stream);
 }
 
 pub fn flush_pending() {
@@ -488,7 +485,7 @@ fn read_available(path: &Path, mut offset: u64, identity: Option<ModIdentity>, s
     };
     let _ = file.seek(SeekFrom::Start(offset));
     let mut pending = Vec::<u8>::new();
-    let mut buffer = [0u8; 8192];
+    let mut buffer = [0u8; PIPE_READ_BUFFER];
     loop {
         match file.read(&mut buffer) {
             Ok(0) => break,
@@ -500,45 +497,31 @@ fn read_available(path: &Path, mut offset: u64, identity: Option<ModIdentity>, s
             Err(_) => break,
         }
     }
-    if !pending.is_empty() {
-        let line = String::from_utf8_lossy(&pending)
-            .trim_end_matches(|value| matches!(value, '\r' | '\n' | '\0'))
-            .to_string();
-        if !line.trim().is_empty() {
-            queue_or_emit(identity, stream, &line);
-        }
-    }
+    flush_partial_line(&mut pending, identity, stream);
     let _ = offset;
 }
 
 fn tail_file(path: &Path, mut offset: u64, identity: Option<ModIdentity>, stream: &str) {
     let mut pending = Vec::<u8>::new();
     loop {
-        match File::open(path) {
-            Ok(mut file) => {
-                let _ = file.seek(SeekFrom::Start(offset));
-                let mut buffer = [0u8; 8192];
-                loop {
-                    match file.read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(read) => {
-                            offset += read as u64;
-                            pending.extend_from_slice(&buffer[..read]);
-                            drain_lines(&mut pending, identity.clone(), stream);
-                        }
-                        Err(_) => break,
+        if let Ok(mut file) = File::open(path) {
+            let _ = file.seek(SeekFrom::Start(offset));
+            let mut buffer = [0u8; PIPE_READ_BUFFER];
+            loop {
+                match file.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        offset += read as u64;
+                        pending.extend_from_slice(&buffer[..read]);
+                        drain_lines(&mut pending, identity.clone(), stream);
                     }
+                    Err(_) => break,
                 }
             }
-            Err(_) => {}
         }
 
-        if pending.len() > 64 * 1024 {
-            let line = String::from_utf8_lossy(&pending).trim().to_string();
-            if !line.is_empty() {
-                queue_or_emit(identity.clone(), stream, &line);
-            }
-            pending.clear();
+        if pending.len() > MAX_PENDING_LINE_BYTES {
+            flush_partial_line(&mut pending, identity.clone(), stream);
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -561,6 +544,19 @@ fn drain_lines(pending: &mut Vec<u8>, identity: Option<ModIdentity>, stream: &st
     }
     if consumed > 0 {
         pending.drain(..consumed);
+    }
+}
+
+fn flush_partial_line(pending: &mut Vec<u8>, identity: Option<ModIdentity>, stream: &str) {
+    if pending.is_empty() {
+        return;
+    }
+    let line = String::from_utf8_lossy(pending)
+        .trim_end_matches(|value| matches!(value, '\r' | '\n' | '\0'))
+        .to_string();
+    pending.clear();
+    if !line.trim().is_empty() {
+        queue_or_emit(identity, stream, &line);
     }
 }
 
@@ -591,7 +587,6 @@ fn open_capture_file(path: &Path) -> Option<File> {
     if !file_io_policy::writes_allowed() {
         return None;
     }
-
     OpenOptions::new()
         .create(true)
         .append(true)
@@ -604,7 +599,6 @@ fn open_capture_file_truncated(path: &Path) -> Option<File> {
     if !file_io_policy::writes_allowed() {
         return None;
     }
-
     OpenOptions::new()
         .create(true)
         .write(true)
@@ -727,7 +721,7 @@ impl CrtRedirect {
         }
         if bindings.is_empty() {
             logging::write_bootstrap_marker(
-                "stdio-capture.crt.none supports=Win32-stdout only; static CRT puts may remain unavailable",
+                "stdio-capture.crt.none supports=Win32-stdout-only static-crt-output=best-effort",
             );
         } else {
             logging::write_bootstrap_marker(&format!(
