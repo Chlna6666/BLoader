@@ -19,7 +19,7 @@ use windows::Win32::System::Console::{
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 
-use crate::runtime::foundation::file_io_policy;
+use crate::runtime::foundation::{build_info, file_io_policy};
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -42,16 +42,24 @@ static ARCHIVE_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
 pub fn init(level: &str) {
     if LOGGING_READY.get().is_some() {
+        write_bootstrap_marker("logging.init.skip reason=already-initialized");
         return;
     }
 
     write_bootstrap_marker(&format!(
-        "logging.init.start mode={} host_version={}",
+        "logging.init.start level={} mode={} host_version={}",
+        level,
         file_io_policy::mode_label(),
         file_io_policy::host_version().unwrap_or("unknown")
     ));
 
-    let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_new(level).unwrap_or_else(|error| {
+        write_bootstrap_marker(&format!(
+            "logging.filter.invalid requested={} fallback=debug error={error}",
+            level
+        ));
+        EnvFilter::new("debug")
+    });
 
     if file_io_policy::legacy_uwp_no_write() {
         match tracing_subscriber::registry().with(filter).try_init() {
@@ -62,7 +70,8 @@ pub fn init(level: &str) {
         }
         let _ = LOGGING_READY.set(());
         write_bootstrap_marker(&format!(
-            "logging.init.ready level={level} mode={} sinks=console+OutputDebugString",
+            "logging.init.ready level={} mode={} sinks=console+OutputDebugString file_writes=false",
+            level,
             file_io_policy::mode_label()
         ));
         return;
@@ -97,14 +106,22 @@ pub fn init(level: &str) {
     let _ = ARCHIVE_GUARD.set(archive_guard);
 
     let latest_file_layer = fmt::layer()
-        .with_target(false)
+        .with_target(true)
         .with_ansi(false)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_file(true)
+        .with_line_number(true)
         .with_writer(latest_writer)
         .with_span_events(FmtSpan::NONE)
         .with_filter(filter.clone());
     let archive_file_layer = fmt::layer()
-        .with_target(false)
+        .with_target(true)
         .with_ansi(false)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_file(true)
+        .with_line_number(true)
         .with_writer(archive_writer)
         .with_span_events(FmtSpan::NONE)
         .with_filter(filter);
@@ -114,7 +131,7 @@ pub fn init(level: &str) {
         .with(archive_file_layer)
         .try_init()
     {
-        Ok(()) => write_bootstrap_marker("logging.tracing.init.ok sink=files"),
+        Ok(()) => write_bootstrap_marker("logging.tracing.init.ok sink=files metadata=target+thread+file+line"),
         Err(error) => write_bootstrap_marker(&format!(
             "logging.tracing.init.failed sink=files error={error}"
         )),
@@ -122,8 +139,11 @@ pub fn init(level: &str) {
 
     let _ = LOGGING_READY.set(());
     write_bootstrap_marker(&format!(
-        "logging.init.ready level={level} mode={} sinks=latest+archive+console+OutputDebugString",
-        file_io_policy::mode_label()
+        "logging.init.ready level={} mode={} sinks=latest+archive+console+OutputDebugString latest={} archive={} file_writes=true",
+        level,
+        file_io_policy::mode_label(),
+        latest_log_path.display(),
+        archive_log_path.display(),
     ));
 }
 
@@ -162,9 +182,10 @@ fn append_mod_log(mod_name: &str, mod_id: &str, stream: &str, message: &str) {
     );
     let path = dir.join(file_name);
     let line = format!(
-        "[{}] [thread={}] [stream={}] {}\r\n",
+        "[{}] [tid={}] [thread={}] [stream={}] {}\r\n",
         Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-        unsafe { GetCurrentThreadId() },
+        current_thread_id(),
+        current_thread_name(),
         stream,
         message,
     );
@@ -194,7 +215,11 @@ fn sanitize_file_component(value: &str) -> String {
 pub fn set_console_handle(handle: HANDLE) {
     let _ = CONSOLE_HANDLE.set(SendHandle(handle));
     enable_console_ansi(handle);
-    write_bootstrap_marker(&format!("logging.console.ready handle=0x{:X}", handle.0 as usize));
+    write_bootstrap_marker(&format!(
+        "logging.console.ready handle=0x{:X} ansi={}",
+        handle.0 as usize,
+        console_supports_ansi(),
+    ));
 }
 
 pub fn startup_banner(
@@ -208,12 +233,14 @@ pub fn startup_banner(
         Level::INFO,
         "bootstrap",
         &format!(
-            "{} v{} | host={} v{} | locale={} | crash=VEH+SEH | stdio=global | file_io={}",
+            "{} v{} | host={} v{} | locale={} | license={} | repository={} | crash=VEH+SEH | file_io={}",
             loader_name,
             loader_version,
             application_name,
             application_version,
             locale,
+            build_info::LICENSE,
+            build_info::REPOSITORY,
             file_io_policy::mode_label(),
         ),
     );
@@ -273,8 +300,10 @@ pub fn scoped_trace_message(scope: &str, message: &str) {
 
 pub fn write_bootstrap_marker(message: &str) {
     let file_line = format!(
-        "[{}] [BOOT] {}\r\n",
+        "[{}] [BOOT] [tid={}] [thread={}] {}\r\n",
         Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+        current_thread_id(),
+        current_thread_name(),
         message
     );
     write_bytes_to_bootstrap_file(file_line.as_bytes());
@@ -282,10 +311,11 @@ pub fn write_bootstrap_marker(message: &str) {
 
     if CONSOLE_HANDLE.get().is_some() {
         let console_line = format!(
-            "{} {:<5} {:<18} {}\r\n",
+            "{} {:<5} {:<18} [tid={}] {}\r\n",
             Local::now().format("%H:%M:%S%.3f"),
             "BOOT",
             "bootstrap",
+            current_thread_id(),
             message
         );
         write_bytes_to_console(console_line.as_bytes());
@@ -299,10 +329,12 @@ fn log_message(level: Level, scope: &str, message: &str) {
 
 fn emergency_log_message(level: Level, scope: &str, message: &str) {
     let line = format!(
-        "[{}] [{}] [{}] {}\r\n",
+        "[{}] [{}] [{}] [tid={}] [thread={}] {}\r\n",
         Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
         level_label(level),
         scope,
+        current_thread_id(),
+        current_thread_name(),
         message
     );
     write_bytes_to_console(format_console_line(level, scope, message).as_bytes());
@@ -326,10 +358,12 @@ fn mirror_message(level: Level, scope: &str, message: &str) {
     write_bytes_to_console(console_line.as_bytes());
 
     let debug_line = format!(
-        "[{}] [{}] [{}] {}\r\n",
+        "[{}] [{}] [{}] [tid={}] [thread={}] {}\r\n",
         Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
         level_label(level),
         scope,
+        current_thread_id(),
+        current_thread_name(),
         message
     );
     write_debug_string(&debug_line);
@@ -339,11 +373,13 @@ fn format_console_line(level: Level, scope: &str, message: &str) -> String {
     let timestamp = Local::now().format("%H:%M:%S%.3f");
     let level_text = level_label(level);
     let scope_text = truncate(scope, 18);
+    let thread_id = current_thread_id();
     let plain = format!(
-        "{} {:<5} {:<18} {}\r\n",
+        "{} {:<5} {:<18} [tid={}] {}\r\n",
         timestamp,
         level_text,
         scope_text,
+        thread_id,
         message.replace('\r', "").replace('\n', " | ")
     );
 
@@ -359,13 +395,25 @@ fn format_console_line(level: Level, scope: &str, message: &str) -> String {
         Level::TRACE => "\x1b[90m",
     };
     format!(
-        "\x1b[90m{}\x1b[0m {}{:<5}\x1b[0m \x1b[38;5;75m{:<18}\x1b[0m {}\r\n",
+        "\x1b[90m{}\x1b[0m {}{:<5}\x1b[0m \x1b[38;5;75m{:<18}\x1b[0m \x1b[90m[tid={}]\x1b[0m {}\r\n",
         timestamp,
         color,
         level_text,
         scope_text,
+        thread_id,
         message.replace('\r', "").replace('\n', " | ")
     )
+}
+
+fn current_thread_id() -> u32 {
+    unsafe { GetCurrentThreadId() }
+}
+
+fn current_thread_name() -> String {
+    std::thread::current()
+        .name()
+        .unwrap_or("unnamed")
+        .to_string()
 }
 
 fn level_label(level: Level) -> &'static str {
