@@ -15,7 +15,9 @@ use windows::core::{PCSTR, PCWSTR};
 
 use crate::bl;
 use crate::core::runtime_ready::{self, ReadyLevel};
-use crate::runtime::foundation::{crash_report, logging, mod_diagnostics, native_stdio};
+use crate::runtime::foundation::{
+    crash_report, file_io_policy, logging, mod_diagnostics, native_stdio,
+};
 
 #[derive(Serialize, Deserialize)]
 struct ModManifest {
@@ -36,31 +38,22 @@ struct ModManifest {
     api_version: Option<u32>,
     #[serde(default)]
     inject_delay_ms: Option<u64>,
-    /// Deprecated compatibility field. BLoader 0.2.19+ no longer counts
-    /// graphics frames or installs a Present hook for delayed Mod loading.
     #[serde(default)]
     inject_min_frames: Option<usize>,
-    /// Runtime readiness required before a hot Mod may load.
-    /// Supported values: process, window, stable-window.
     #[serde(default)]
     inject_ready: Option<String>,
     #[serde(default)]
     requires_symbol_pack: bool,
     #[serde(default)]
     required_symbols: Vec<String>,
-    /// 该原生模块加载失败时是否必须向开发者弹出错误提示。
     #[serde(default)]
     required: bool,
-    /// LoadLibrary 成功后必须存在的导出。
     #[serde(default)]
     verify_exports: Vec<String>,
-    /// LoadLibrary 成功后必须已经存在于进程中的依赖模块。
     #[serde(default)]
     verify_modules: Vec<String>,
-    /// 验证成功后是否显示显式成功提示。
     #[serde(default)]
     notify_success: bool,
-    /// 用于自动识别 puts/printf/std::cout 输出来源的额外前缀。
     #[serde(default)]
     log_aliases: Vec<String>,
 }
@@ -169,14 +162,6 @@ struct NativeLoadReport {
     elapsed_ms: u128,
 }
 
-/// 在 BLoader 自身的 `DllMain(DLL_PROCESS_ATTACH)` 返回之前，同步加载原生预加载包。
-///
-/// 该路径刻意只处理打包目录中的 `native` / `preload-native`，不处理 BL Mod、
-/// hot-native、hot-inject 或散落 DLL，避免在 Loader Lock 内执行自动打包、延迟线程
-/// 和宿主 API 初始化。系统 Runtime DLL 由宿主和 Windows 自己管理，BLoader 不加载。
-///
-/// 注意：Windows 官方不建议在 DllMain 中调用 LoadLibrary。这里是为兼容
-/// PreLoadCpp 的既有预加载语义而提供的受限路径。
 pub unsafe fn load_native_preloads_in_dllmain(game_dir: &Path) -> NativePreloadSummary {
     let mods_dir = game_dir.join("mods");
     let mut summary = NativePreloadSummary::default();
@@ -485,8 +470,6 @@ unsafe fn load_and_verify_native(
                 })
             }
         };
-        // A third-party DLL can replace the top-level exception filter from its
-        // DllMain. Restore BLoader attribution before any later Mod executes.
         crash_report::rearm_unhandled_filter(&format!("after-native-load:{}", preload.id));
         match load_result {
             Ok((module, loader_api)) => (module, loader_api, false),
@@ -814,7 +797,11 @@ pub fn publish_native_preload_reports() -> NativePreloadSummary {
             summary.verified,
             summary.failed,
             summary.required_failed,
-            status_path.display(),
+            if file_io_policy::writes_allowed() {
+                status_path.display().to_string()
+            } else {
+                "<disabled:legacy-uwp-no-file-write>".to_string()
+            },
         ),
     );
     summary
@@ -822,6 +809,10 @@ pub fn publish_native_preload_reports() -> NativePreloadSummary {
 
 fn write_native_status_file(summary: NativePreloadSummary, reports: &[NativeLoadReport]) -> PathBuf {
     let status_path = PathBuf::from("logs").join("native-load-status.json");
+    if !file_io_policy::writes_allowed() {
+        return status_path;
+    }
+
     let _ = fs::create_dir_all("logs");
     let status_document = serde_json::json!({
         "summary": summary,
@@ -884,8 +875,10 @@ pub fn required_native_failure_message() -> Option<String> {
             report.name, report.detail, report.stage
         ));
     }
-    lines.push(String::new());
-    lines.push("See logs\\latest.log and logs\\native-load-status.json for details.".to_string());
+    if file_io_policy::writes_allowed() {
+        lines.push(String::new());
+        lines.push("See logs\\latest.log and logs\\native-load-status.json for details.".to_string());
+    }
     Some(lines.join("\n"))
 }
 
@@ -917,13 +910,13 @@ pub fn native_success_notification_message() -> Option<String> {
             report.module_handle.as_deref().unwrap_or("handle unavailable")
         ));
     }
-    lines.push(String::new());
-    lines.push("Detailed status: logs\\native-load-status.json".to_string());
+    if file_io_policy::writes_allowed() {
+        lines.push(String::new());
+        lines.push("Detailed status: logs\\native-load-status.json".to_string());
+    }
     Some(lines.join("\n"))
 }
 
-/// 主加载入口：扫描并加载所有 Mods
-/// 返回值: bool (true 表示 PreLoader 已加载并接管，false 表示普通加载)
 pub unsafe fn load_mods(game_dir: &Path) -> bool {
     let mods_dir = ensure_mods_dir(game_dir);
     let mut discovered = discover_mods(&mods_dir);
@@ -943,8 +936,14 @@ pub unsafe fn load_mods(game_dir: &Path) -> bool {
 fn ensure_mods_dir(game_dir: &Path) -> PathBuf {
     let mods_dir = game_dir.join("mods");
     if !mods_dir.exists() {
-        let _ = fs::create_dir_all(&mods_dir);
-        logging::warn_message("Mods directory created, no mods loaded.");
+        if file_io_policy::writes_allowed() {
+            let _ = fs::create_dir_all(&mods_dir);
+            logging::warn_message("Mods directory created, no mods loaded.");
+        } else {
+            logging::info_message(
+                "Legacy UWP read-only mode: mods directory is absent and will not be created.",
+            );
+        }
     }
     mods_dir
 }
@@ -1127,6 +1126,17 @@ fn discover_loose_dll(mods_dir: &Path, entry_path: &Path, discovered: &mut Disco
 }
 
 fn package_loose_dll(mods_dir: &Path, entry_path: &Path) -> Option<PreloadMod> {
+    if !file_io_policy::writes_allowed() {
+        logging::scoped_warn_message(
+            "native-loader",
+            &format!(
+                "SKIP_AUTO_PACKAGE | legacy UWP read-only mode leaves loose DLL untouched | path={}",
+                entry_path.display()
+            ),
+        );
+        return None;
+    }
+
     let file_stem = entry_path.file_stem()?.to_string_lossy().to_string();
     let file_name = entry_path.file_name()?.to_string_lossy().to_string();
     let target_dir = mods_dir.join(&file_stem);
@@ -1425,22 +1435,32 @@ unsafe fn load_library(preload: &PreloadMod, phase: &str, silent_success: bool) 
     if !success && report.required {
         visible_title = Some("BLoader Required Native Module Failed");
         visible_message = Some(format!(
-            "Required native module '{}' failed during {}.\n\nStage: {}\nReason: {}\nExpected: {}\nResolved: {}\n\nSee logs\\latest.log and logs\\native-load-status.json.",
+            "Required native module '{}' failed during {}.\n\nStage: {}\nReason: {}\nExpected: {}\nResolved: {}{}",
             report.name,
             report.phase,
             report.stage,
             report.detail,
             report.expected_path,
             report.resolved_path.as_deref().unwrap_or("not loaded"),
+            if file_io_policy::writes_allowed() {
+                "\n\nSee logs\\latest.log and logs\\native-load-status.json."
+            } else {
+                ""
+            },
         ));
     } else if success && report.notify_success {
         visible_title = Some("BLoader Native Module Loaded");
         visible_message = Some(format!(
-            "Native module '{}' was loaded and verified successfully.\n\nPhase: {}\nPath: {}\nHandle: {}\n\nDetailed status: logs\\native-load-status.json",
+            "Native module '{}' was loaded and verified successfully.\n\nPhase: {}\nPath: {}\nHandle: {}{}",
             report.name,
             report.phase,
             report.resolved_path.as_deref().unwrap_or(&report.expected_path),
             report.module_handle.as_deref().unwrap_or("unavailable"),
+            if file_io_policy::writes_allowed() {
+                "\n\nDetailed status: logs\\native-load-status.json"
+            } else {
+                ""
+            },
         ));
     } else {
         visible_title = None;
