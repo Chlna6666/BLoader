@@ -7,7 +7,7 @@ use std::panic::{self, PanicHookInfo};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::HINSTANCE;
+use windows::Win32::Foundation::{HINSTANCE, HWND};
 use windows::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
 
 use crate::runtime::foundation::logging;
@@ -56,6 +56,29 @@ pub extern "system" fn bl_render3d_line(
     _a: f32,
 ) -> bool { false }
 
+/// rundll32-compatible native Windows Terminal bridge.
+///
+/// The host process is detected in DllMain and bypasses all Minecraft bootstrap
+/// work. This export then performs only the pipe-to-stdout byte pump implemented
+/// in core::console.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn BLoaderConsoleBridge(
+    _hwnd: HWND,
+    _hinstance: HINSTANCE,
+    cmdline: *mut u8,
+    _show: i32,
+) {
+    core::console::run_rundll32_console_bridge(cmdline.cast_const());
+}
+
+fn is_console_bridge_host() -> bool {
+    utils::get_exe_path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.eq_ignore_ascii_case("rundll32.exe"))
+        .unwrap_or(false)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DllMain(
     hinstance: HINSTANCE,
@@ -64,8 +87,16 @@ pub unsafe extern "system" fn DllMain(
 ) -> i32 {
     match call_reason {
         DLL_PROCESS_ATTACH => {
-            utils::set_exe_cwd();
             utils::set_loader_module_handle(hinstance.0 as usize);
+
+            // Windows Terminal's bridge host loads this same DLL through
+            // rundll32.exe. It must never arm the Minecraft OEP gate, install
+            // crash hooks, create files, or start the normal BLoader bootstrap.
+            if is_console_bridge_host() {
+                return 1;
+            }
+
+            utils::set_exe_cwd();
             runtime::foundation::crash_report::install_early();
 
             let static_process_attach = !reserved.is_null();
@@ -114,6 +145,9 @@ pub unsafe extern "system" fn DllMain(
             }
         }
         DLL_PROCESS_DETACH => {
+            if is_console_bridge_host() {
+                return 1;
+            }
             logging::write_bootstrap_marker("bootstrap.process_detach");
         }
         _ => {}
