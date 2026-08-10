@@ -2,6 +2,15 @@
 # Embedded into the DLL by include_str!; never extracted at runtime.
 bootstrap.start=Lightweight runtime started.
 bootstrap.complete=BLoader initialization complete
+console.banner.subtitle=Minecraft Bedrock Mod Loader
+console.banner.full_debug=Full debug
+console.banner.file_io=File I/O
+console.mods.summary=Mods: discovered {discovered}, loaded {loaded}, failed {failed}
+console.mods.disabled=Mod loading is disabled by config
+console.mod.loaded=Loaded {version} ({kind})
+console.mod.load_failed=Load failed: {detail}
+console.mod.crashed=Crashed: {detail}
+console.mod.output_capture_failed=Output capture unavailable: {detail}
 ui.pipeline.external=Graphics readiness signaling is active; panel rendering is disabled.
 overlay.window_title=BLoader Panel
 overlay.feature.disabled=Disabled
