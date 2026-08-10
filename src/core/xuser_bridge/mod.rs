@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 //
 // Only Microsoft xgameruntime.dll!QueryApiImpl is intercepted. Every other
 // XGameRuntime export and every non-XUser runtime class stays in the official
@@ -42,6 +42,7 @@ static PENDING_LOGS: OnceLock<Mutex<Vec<PendingLog>>> = OnceLock::new();
 
 #[derive(Clone, Copy)]
 enum BridgeLogLevel {
+    Debug,
     Info,
     Warn,
     Error,
@@ -80,6 +81,7 @@ pub fn initialize_before_mods() {
         return;
     }
 
+    bridge_debug("开始探测进程专属 BMCBL XUser named pipe；不存在时保持微软官方 XUser 原样");
     let candidate = match ipc::receive_session() {
         Ok(Some(session)) => session,
         Ok(None) => {
@@ -94,12 +96,33 @@ pub fn initialize_before_mods() {
         }
     };
 
-    // Gamertag is public profile data and is useful for confirming that BMCBL
-    // delivered the intended account. Remove control characters and bound the
-    // length before it reaches any text log to prevent log injection.
+    // Gamertag and XUID are public Xbox identity metadata. Secret bearer tokens,
+    // UHS values and the signing private key are never written to diagnostics.
     let gamertag = sanitize_gamertag(&candidate.gamertag);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let token_routes = candidate
+        .tokens
+        .iter()
+        .map(|token| {
+            format!(
+                "{}:{}s",
+                token.relying_party,
+                token.expires_at.saturating_sub(now)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     bridge_info(&format!(
-        "已从 BMCBL 安全一次性管道接收并验证 Xbox 会话 | xbox_gamertag={gamertag} | next=load-official-runtime-and-hook"
+        "已从 BMCBL 安全一次性管道接收并验证 Xbox 会话 | xbox_gamertag={gamertag} | xbox_xuid={} | token_routes={} | privilege_count={} | secrets_logged=false | next=load-official-runtime-and-hook",
+        candidate.xuid,
+        candidate.tokens.len(),
+        candidate.privileges.len(),
+    ));
+    bridge_debug(&format!(
+        "XUser token 路由已装载 | routes=[{token_routes}] | token_body=redacted | uhs=redacted | signing_key=redacted"
     ));
 
     match install_hook(candidate) {
@@ -144,6 +167,7 @@ pub fn publish_pending_logs() {
     );
     for entry in pending {
         match entry.level {
+            BridgeLogLevel::Debug => logging::scoped_debug_message("xuser-bridge", &entry.message),
             BridgeLogLevel::Info => logging::scoped_info_message("xuser-bridge", &entry.message),
             BridgeLogLevel::Warn => logging::scoped_warn_message("xuser-bridge", &entry.message),
             BridgeLogLevel::Error => logging::scoped_error_message("xuser-bridge", &entry.message),
@@ -155,10 +179,6 @@ fn install_hook(session: Session) -> Result<HookInstallReport, String> {
     let module_name = wide("xgameruntime.dll");
     let mut module = unsafe { GetModuleHandleW(module_name.as_ptr()) };
     let runtime_source = if module.is_null() {
-        // This path is reached only after a process-scoped BMCBL session has
-        // been authenticated. Loading exclusively from System32 ensures the
-        // official runtime is present before the executable can resolve or call
-        // QueryApiImpl. No-session launches never execute this load.
         bridge_info(
             "已认证 BMCBL 会话，但系统原生 xgameruntime.dll 尚未映射；正在从 System32 同步加载官方 Runtime",
         );
@@ -224,6 +244,7 @@ pub(crate) unsafe fn call_original_query(
     out: *mut *mut c_void,
 ) -> HResult {
     let Some(address) = ORIGINAL_QUERY_API.get().copied() else {
+        bridge_error("QueryApiImpl trampoline 不可用；无法回退到微软官方 Runtime");
         return abi::E_FAIL;
     };
     let function: QueryApiImplFn = unsafe { mem::transmute(address) };
@@ -240,6 +261,7 @@ unsafe extern "system" fn query_api_hook(
     }
 
     if runtime_class_id.is_null() || interface_id.is_null() || out.is_null() {
+        bridge_warn("QueryApiImpl 收到空指针参数；返回 E_POINTER");
         return E_POINTER;
     }
     unsafe {
@@ -254,10 +276,13 @@ unsafe extern "system" fn query_api_hook(
             bridge_info(&format!(
                 "QueryApiImpl 已请求 CLSID_XUserImpl；返回 BLoader 内置 Rust XUser | xbox_gamertag={gamertag}"
             ));
+        } else {
+            bridge_debug("QueryApiImpl route=embedded-XUser");
         }
         return unsafe { xuser::query_interface(interface_id, out) };
     }
 
+    bridge_debug("QueryApiImpl route=official-runtime | class=non-XUser");
     unsafe { call_original_query(runtime_class_id, interface_id, out) }
 }
 
@@ -337,7 +362,16 @@ fn queue_pending(level: BridgeLogLevel, message: &str) {
     });
 }
 
-fn bridge_info(message: &str) {
+pub(crate) fn bridge_debug(message: &str) {
+    logging::write_bootstrap_marker(&format!("xuser-bridge.debug {message}"));
+    if logging::is_ready() {
+        logging::scoped_debug_message("xuser-bridge", message);
+    } else {
+        queue_pending(BridgeLogLevel::Debug, message);
+    }
+}
+
+pub(crate) fn bridge_info(message: &str) {
     logging::write_bootstrap_marker(&format!("xuser-bridge.info {message}"));
     if logging::is_ready() {
         logging::scoped_info_message("xuser-bridge", message);
@@ -346,7 +380,7 @@ fn bridge_info(message: &str) {
     }
 }
 
-fn bridge_warn(message: &str) {
+pub(crate) fn bridge_warn(message: &str) {
     logging::write_bootstrap_marker(&format!("xuser-bridge.warn {message}"));
     if logging::is_ready() {
         logging::scoped_warn_message("xuser-bridge", message);
@@ -355,7 +389,7 @@ fn bridge_warn(message: &str) {
     }
 }
 
-fn bridge_error(message: &str) {
+pub(crate) fn bridge_error(message: &str) {
     logging::write_bootstrap_marker(&format!("xuser-bridge.error {message}"));
     if logging::is_ready() {
         logging::scoped_error_message("xuser-bridge", message);
