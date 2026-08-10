@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::RwLock;
 
-use crate::runtime::foundation::logging;
+use crate::runtime::foundation::{file_io_policy, logging};
 use crate::utils::get_exe_directory;
 
 #[cfg(feature = "panel-ui")]
@@ -47,7 +47,6 @@ pub struct FileRedirectionConfig {
     pub kind: Option<String>,
 }
 
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
     #[serde(default = "default_false")]
@@ -73,7 +72,6 @@ pub struct Config {
 
     #[serde(default)]
     pub file_redirections: Vec<FileRedirectionConfig>,
-
 
     #[serde(default)]
     pub mods: Vec<String>,
@@ -315,8 +313,6 @@ fn is_config_file_outdated(content: &str, loaded_cfg: &Config) -> bool {
         return true;
     };
 
-    // Remove the retired xgameruntime LdrLoadDll redirection configuration.
-    // Native runtime proxies are now loaded only through the synchronous DllMain preload chain.
     if disk_obj.contains_key("xgameruntime_redirection") {
         return true;
     }
@@ -337,7 +333,13 @@ impl Config {
 
         if !config_path.exists() {
             let default_config = Config::default();
-            let _ = default_config.save();
+            if file_io_policy::writes_allowed() {
+                let _ = default_config.save();
+            } else {
+                logging::info_message(
+                    "[config] Legacy UWP read-only mode: config.json is absent; using in-memory defaults without creating a file.",
+                );
+            }
             return default_config;
         }
 
@@ -348,17 +350,29 @@ impl Config {
                     cfg.overlay.blur_strength = clamp_overlay_blur_strength(cfg.overlay.blur_strength);
                 }
                 if is_config_file_outdated(&content, &cfg) {
-                    logging::info_message(&format!("[config] Discovered outdated config.json schema; automatically syncing current schema to disk at {}", config_path.display()));
-                    let _ = cfg.save();
+                    if file_io_policy::writes_allowed() {
+                        logging::info_message(&format!("[config] Discovered outdated config.json schema; automatically syncing current schema to disk at {}", config_path.display()));
+                        let _ = cfg.save();
+                    } else {
+                        logging::info_message(
+                            "[config] Legacy UWP read-only mode: outdated config.json is accepted without rewriting it.",
+                        );
+                    }
                 }
                 return cfg;
             } else {
-                logging::warn_message(&format!("[config] Failed to parse existing config.json format at {}; rewriting clean default config...", config_path.display()));
+                logging::warn_message(&format!("[config] Failed to parse existing config.json format at {}", config_path.display()));
             }
         }
 
         let default_config = Config::default();
-        let _ = default_config.save();
+        if file_io_policy::writes_allowed() {
+            let _ = default_config.save();
+        } else {
+            logging::warn_message(
+                "[config] Legacy UWP read-only mode: invalid config.json was not replaced; using in-memory defaults.",
+            );
+        }
         default_config
     }
 
@@ -375,6 +389,14 @@ impl Config {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
+        if !file_io_policy::writes_allowed() {
+            Self::apply_update(self);
+            logging::warn_message(
+                "[config] Legacy UWP read-only mode: config save skipped; changes apply only to the current process.",
+            );
+            return Ok(());
+        }
+
         let json = serde_json::to_string_pretty(self)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         let res = fs::write(config_path(), json);
@@ -397,7 +419,7 @@ fn config_path() -> std::path::PathBuf {
         return loader_cfg;
     }
 
-    let exe_dir = crate::utils::get_exe_directory();
+    let exe_dir = get_exe_directory();
     let exe_cfg = exe_dir.join("config.json");
     if exe_cfg.exists() {
         return exe_cfg;
