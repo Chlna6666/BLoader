@@ -39,9 +39,9 @@ pub enum BannerLayout {
 }
 
 pub fn choose_layout(columns: usize) -> BannerLayout {
-    if columns >= 100 {
+    if columns >= 104 {
         BannerLayout::Wide
-    } else if columns >= 82 {
+    } else if columns >= 84 {
         BannerLayout::Normal
     } else if columns >= 48 {
         BannerLayout::Compact
@@ -63,20 +63,17 @@ pub fn render_banner(columns: usize, ansi: bool) -> Vec<String> {
             })
             .chain(std::iter::once(String::new()))
             .collect(),
-        BannerLayout::Normal | BannerLayout::Wide => {
-            let logo_rows = if layout == BannerLayout::Wide { 20 } else { 16 };
-            compose_centered(render_logo(logo_rows, ansi), ansi)
-        }
+        BannerLayout::Normal => compose_centered(render_logo(16, 18, ansi), 36, ansi),
+        BannerLayout::Wide => compose_centered(render_logo(20, 22, ansi), 44, ansi),
     }
 }
 
-fn compose_centered(logo: Vec<String>, ansi: bool) -> Vec<String> {
+fn compose_centered(logo: Vec<String>, logo_width: usize, ansi: bool) -> Vec<String> {
     let logo_height = logo.len();
     let art_height = BLOADER_ART.len();
     let height = logo_height.max(art_height);
     let logo_top = (height - logo_height) / 2;
     let art_top = (height - art_height) / 2;
-    let logo_width = logo_height * 2;
     let mut lines = Vec::with_capacity(height + 1);
 
     for row in 0..height {
@@ -98,18 +95,19 @@ fn compose_centered(logo: Vec<String>, ansi: bool) -> Vec<String> {
     lines
 }
 
-fn render_logo(target_rows: usize, ansi: bool) -> Vec<String> {
-    if !ansi || target_rows == 0 {
+fn render_logo(target_rows: usize, target_cols: usize, ansi: bool) -> Vec<String> {
+    if !ansi || target_rows == 0 || target_cols == 0 {
         return Vec::new();
     }
     let target_rows = target_rows.clamp(8, LOGO_SIZE);
+    let target_cols = target_cols.clamp(8, 28);
     let mut rows = Vec::with_capacity(target_rows);
     for out_y in 0..target_rows {
         let src_y = out_y * LOGO_SIZE / target_rows;
         let mut line = String::new();
         let mut active_color: Option<u32> = None;
-        for out_x in 0..target_rows {
-            let src_x = out_x * LOGO_SIZE / target_rows;
+        for out_x in 0..target_cols {
+            let src_x = out_x * LOGO_SIZE / target_cols;
             let color = LOGO[src_y][src_x];
             if color == 0 {
                 if active_color.take().is_some() {
@@ -173,7 +171,7 @@ mod tests {
 
     #[test]
     fn centered_art_starts_below_tall_logo_top() {
-        let lines = compose_centered(vec!["x".into(); 16], false);
+        let lines = compose_centered(vec!["x".into(); 16], 36, false);
         let first_art = lines.iter().position(|line| line.contains("____")).unwrap();
         assert!(first_art >= 5);
     }
