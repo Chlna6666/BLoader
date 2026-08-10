@@ -33,6 +33,7 @@ use crate::runtime::foundation::logging;
 
 const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
 const XUSER_BRIDGE_PROTOCOL: u32 = 1;
+const MAX_CONSOLE_REPLAY_LOGS: usize = 512;
 
 static SESSION: OnceLock<Session> = OnceLock::new();
 static ORIGINAL_QUERY_API: OnceLock<usize> = OnceLock::new();
@@ -387,6 +388,9 @@ fn queue_pending(level: BridgeLogLevel, message: &str, published: bool) {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
+    if guard.len() >= MAX_CONSOLE_REPLAY_LOGS {
+        guard.remove(0);
+    }
     guard.push(PendingLog {
         level,
         message: message.to_string(),
