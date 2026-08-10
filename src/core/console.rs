@@ -6,17 +6,17 @@ use std::ptr::null_mut;
 use std::thread;
 use std::time::Duration;
 
-use crate::runtime::foundation::{build_info, file_io_policy, logging};
-use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+use crate::runtime::foundation::{build_info, console_branding, file_io_policy, logging};
+use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, WriteFile,
 };
 use windows::Win32::System::Console::{
-    AllocConsole, CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT,
-    ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
+    AllocConsole, CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS,
+    ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
     ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WRAP_AT_EOL_OUTPUT, GetConsoleMode,
-    GetConsoleWindow, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
-    SetConsoleTitleW, SetStdHandle,
+    GetConsoleScreenBufferInfo, GetConsoleWindow, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE, SetConsoleMode, SetConsoleTitleW, SetStdHandle,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DeleteMenu, GetSystemMenu, MF_BYCOMMAND, SC_CLOSE, SW_SHOW, ShowWindow,
@@ -83,10 +83,10 @@ pub unsafe fn init_console() {
             let _ = SetConsoleMode(h_conout, new_mode);
         }
 
-        // set_console_handle emits the structured BLoader/Minecraft banner after
-        // ANSI capability is known. Then replay all pre-main XUser diagnostics
-        // to the console only; persistent sinks already received those records.
+        // Register the handle first so all subsequent runtime logs use the same
+        // console sink. Then replace the legacy banner with the adaptive brand.
         logging::set_console_handle(h_conout);
+        render_adaptive_branding(h_conout);
         crate::core::xuser_bridge::publish_pending_logs();
     }
 
@@ -95,7 +95,6 @@ pub unsafe fn init_console() {
         let mut mode = CONSOLE_MODE(0);
         if GetConsoleMode(h_conin, &mut mode).is_ok() {
             // QuickEdit pauses a console process while the user is selecting text.
-            // That behavior is unacceptable for a real-time game/mod runtime.
             let new_mode = CONSOLE_MODE(
                 (mode.0
                     | ENABLE_EXTENDED_FLAGS.0
@@ -113,14 +112,78 @@ pub unsafe fn init_console() {
         crate::runtime::foundation::native_stdio::flush_pending();
     }
 
-    logging::scoped_info_message(
+    logging::scoped_debug_message(
         "console",
         &format!(
-            "runtime console ready | source={} | quick_edit=false | ansi=true-if-supported | layout=structured-v2 | file_io={}",
+            "runtime console ready | source={} | quick_edit=false | layout=adaptive-java-server | columns={} | file_io={}",
             if is_existing { "existing" } else { "allocated" },
+            visible_columns(h_conout),
             file_io_policy::mode_label(),
         ),
     );
+}
+
+fn render_adaptive_branding(handle: HANDLE) {
+    let ansi = console_has_vt(handle);
+    let columns = visible_columns(handle);
+    let host_version = file_io_policy::host_version().unwrap_or("unknown");
+    let debug_destination = if file_io_policy::writes_allowed() {
+        "logs/latest.log"
+    } else {
+        "OutputDebugString"
+    };
+
+    // Clear the old fixed banner emitted while the console handle is attached.
+    // VT is enabled before this point on supported Windows consoles. If a host
+    // does not support VT, we simply print the portable ASCII fallback below.
+    if ansi {
+        write_console(handle, "\x1b[0m\x1b[2J\x1b[H");
+    }
+
+    for line in console_branding::render_banner(
+        columns,
+        ansi,
+        host_version,
+        file_io_policy::mode_label(),
+        debug_destination,
+    ) {
+        write_console(handle, &line);
+        write_console(handle, "\r\n");
+    }
+}
+
+fn visible_columns(handle: HANDLE) -> usize {
+    if handle.is_invalid() {
+        return 80;
+    }
+    unsafe {
+        let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+        if GetConsoleScreenBufferInfo(handle, &mut info).is_ok() {
+            let width = i32::from(info.srWindow.Right) - i32::from(info.srWindow.Left) + 1;
+            if width > 0 {
+                return width as usize;
+            }
+        }
+    }
+    80
+}
+
+fn console_has_vt(handle: HANDLE) -> bool {
+    unsafe {
+        let mut mode = CONSOLE_MODE(0);
+        GetConsoleMode(handle, &mut mode).is_ok()
+            && (mode.0 & ENABLE_VIRTUAL_TERMINAL_PROCESSING.0) != 0
+    }
+}
+
+fn write_console(handle: HANDLE, text: &str) {
+    if handle.is_invalid() || text.is_empty() {
+        return;
+    }
+    unsafe {
+        let mut written = 0;
+        let _ = WriteFile(handle, Some(text.as_bytes()), Some(&mut written), None);
+    }
 }
 
 fn set_runtime_console_title() {
@@ -140,8 +203,7 @@ pub fn start_input_listener() {
     let _ = thread::Builder::new()
         .name("bloader-console-input".to_string())
         .spawn(|| {
-            // Reserved for interactive diagnostics. Keeping the thread named makes
-            // crash/log attribution explicit without adding a blocking stdin loop.
+            // Reserved for interactive diagnostics.
             thread::sleep(Duration::from_millis(100));
         });
 }
