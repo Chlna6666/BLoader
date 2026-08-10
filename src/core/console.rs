@@ -2,7 +2,10 @@
 #![allow(dead_code)]
 #![allow(non_snake_case)]
 
+use std::ffi::c_void;
+use std::process::{Command, Stdio};
 use std::ptr::null_mut;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -18,15 +21,66 @@ use windows::Win32::System::Console::{
     GetConsoleScreenBufferInfo, GetConsoleWindow, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
     STD_OUTPUT_HANDLE, SetConsoleMode, SetConsoleTitleW, SetStdHandle,
 };
+use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
     DeleteMenu, GetSystemMenu, MF_BYCOMMAND, SC_CLOSE, SW_SHOW, ShowWindow,
 };
 use windows::core::PCWSTR;
 
-pub unsafe fn init_console() {
-    let mut window = GetConsoleWindow();
-    let is_existing = window.0 != null_mut();
+const WINDOWS_TERMINAL_COLUMNS: usize = 120;
+const CLASSIC_SCROLLBACK_LINES: i16 = 12_000;
+const ERROR_PIPE_CONNECTED: u32 = 535;
+const PIPE_ACCESS_OUTBOUND: u32 = 0x0000_0002;
+const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawCoord {
+    x: i16,
+    y: i16,
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateNamedPipeW(
+        name: *const u16,
+        open_mode: u32,
+        pipe_mode: u32,
+        max_instances: u32,
+        out_buffer_size: u32,
+        in_buffer_size: u32,
+        default_timeout: u32,
+        security_attributes: *const c_void,
+    ) -> *mut c_void;
+    fn ConnectNamedPipe(pipe: *mut c_void, overlapped: *mut c_void) -> i32;
+    #[link_name = "CloseHandle"]
+    fn close_handle_raw(handle: *mut c_void) -> i32;
+    #[link_name = "GetLastError"]
+    fn get_last_error_raw() -> u32;
+    #[link_name = "SetConsoleScreenBufferSize"]
+    fn set_console_screen_buffer_size_raw(handle: *mut c_void, size: RawCoord) -> i32;
+}
+
+pub unsafe fn init_console() {
+    let existing_window = GetConsoleWindow();
+    let has_existing_console = existing_window.0 != null_mut();
+
+    // If Minecraft already has a terminal, keep it. Otherwise prefer a real
+    // Windows Terminal window. This avoids binding Minecraft to a legacy
+    // conhost just to display BLoader diagnostics.
+    if !has_existing_console && try_init_windows_terminal() {
+        logging::scoped_debug_message(
+            "console",
+            "runtime console ready | backend=windows-terminal | transport=named-pipe | close_isolated=true",
+        );
+        return;
+    }
+
+    init_classic_console(has_existing_console);
+}
+
+unsafe fn init_classic_console(is_existing: bool) {
+    let mut window = GetConsoleWindow();
     if is_existing {
         let _ = ShowWindow(window, SW_SHOW);
     } else {
@@ -37,6 +91,8 @@ pub unsafe fn init_console() {
     set_runtime_console_title();
 
     if window.0 != null_mut() {
+        // Closing an attached classic console can terminate Minecraft itself.
+        // Keep the close command disabled for this fallback backend only.
         let menu = GetSystemMenu(window, false);
         if !menu.is_invalid() {
             let _ = DeleteMenu(menu, SC_CLOSE, MF_BYCOMMAND);
@@ -81,8 +137,9 @@ pub unsafe fn init_console() {
             let _ = SetConsoleMode(h_conout, new_mode);
         }
 
+        configure_classic_scrollback(h_conout);
         logging::set_console_handle(h_conout);
-        render_adaptive_branding(h_conout);
+        render_branding(h_conout, visible_columns(h_conout), console_has_vt(h_conout), true);
         emit_runtime_identity();
         replay_pre_main_load_state();
         crate::core::xuser_bridge::publish_pending_logs();
@@ -93,13 +150,15 @@ pub unsafe fn init_console() {
         let _ = SetStdHandle(STD_INPUT_HANDLE, h_conin);
         let mut mode = CONSOLE_MODE(0);
         if GetConsoleMode(h_conin, &mut mode).is_ok() {
+            // Selection/copy is intentionally enabled in the fallback console.
+            // Windows Terminal does not need QuickEdit and is preferred above.
             let new_mode = CONSOLE_MODE(
-                (mode.0
+                mode.0
                     | ENABLE_EXTENDED_FLAGS.0
                     | ENABLE_LINE_INPUT.0
                     | ENABLE_ECHO_INPUT.0
-                    | ENABLE_PROCESSED_INPUT.0)
-                    & !ENABLE_QUICK_EDIT_MODE.0,
+                    | ENABLE_PROCESSED_INPUT.0
+                    | ENABLE_QUICK_EDIT_MODE.0,
             );
             let _ = SetConsoleMode(h_conin, new_mode);
         }
@@ -113,22 +172,136 @@ pub unsafe fn init_console() {
     logging::scoped_debug_message(
         "console",
         &format!(
-            "runtime console ready | source={} | quick_edit=false | layout=adaptive-java-server | columns={} | file_io={}",
+            "runtime console ready | backend=console-host-fallback | source={} | quick_edit=true | scrollback={} | columns={} | file_io={}",
             if is_existing { "existing" } else { "allocated" },
+            CLASSIC_SCROLLBACK_LINES,
             visible_columns(h_conout),
             file_io_policy::mode_label(),
         ),
     );
 }
 
-fn render_adaptive_branding(handle: HANDLE) {
-    let ansi = console_has_vt(handle);
-    let columns = visible_columns(handle);
+fn try_init_windows_terminal() -> bool {
+    let pid = unsafe { GetCurrentProcessId() };
+    let pipe_leaf = format!("BLoader.Console.{pid}");
+    let pipe_path = format!(r"\\.\pipe\{pipe_leaf}");
+    let pipe_wide: Vec<u16> = pipe_path.encode_utf16().chain(Some(0)).collect();
 
-    if ansi {
-        write_console(handle, "\x1b[0m\x1b[2J\x1b[H");
+    let raw_pipe = unsafe {
+        CreateNamedPipeW(
+            pipe_wide.as_ptr(),
+            PIPE_ACCESS_OUTBOUND,
+            PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            64 * 1024,
+            4 * 1024,
+            0,
+            std::ptr::null(),
+        )
+    };
+    if raw_pipe.is_null() || raw_pipe as isize == -1 {
+        return false;
     }
 
+    let title = format!(
+        "BLoader {} | Minecraft {} | Runtime Console",
+        build_info::VERSION,
+        file_io_policy::host_version().unwrap_or("unknown")
+    );
+    let script = format!(
+        "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); \
+         $p=[IO.Pipes.NamedPipeClientStream]::new('.', '{pipe_leaf}', [IO.Pipes.PipeDirection]::In); \
+         try {{ $p.Connect(5000); $r=[IO.StreamReader]::new($p,[Text.UTF8Encoding]::new($false)); \
+         while (($l=$r.ReadLine()) -ne $null) {{ [Console]::Out.WriteLine($l) }} }} \
+         finally {{ if ($r) {{ $r.Dispose() }}; $p.Dispose() }}"
+    );
+
+    let spawned = Command::new("wt.exe")
+        .args([
+            "-w",
+            "new",
+            "--size",
+            "120,40",
+            "new-tab",
+            "--title",
+            &title,
+            "--suppressApplicationTitle",
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok();
+
+    if !spawned {
+        unsafe {
+            close_handle_raw(raw_pipe);
+        }
+        return false;
+    }
+
+    let raw_value = raw_pipe as usize;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let _ = thread::Builder::new()
+        .name("bloader-wt-pipe-connect".to_string())
+        .spawn(move || {
+            let raw_pipe = raw_value as *mut c_void;
+            let connected = unsafe {
+                ConnectNamedPipe(raw_pipe, null_mut()) != 0
+                    || get_last_error_raw() == ERROR_PIPE_CONNECTED
+            };
+            let _ = sender.send(connected);
+        });
+
+    match receiver.recv_timeout(Duration::from_secs(4)) {
+        Ok(true) => {
+            let handle = HANDLE(raw_pipe);
+            logging::set_console_stream_handle(handle, true);
+            render_branding(handle, WINDOWS_TERMINAL_COLUMNS, true, false);
+            emit_runtime_identity();
+            replay_pre_main_load_state();
+            crate::core::xuser_bridge::publish_pending_logs();
+            schedule_mod_inventory_replay();
+            unsafe {
+                crate::runtime::foundation::native_stdio::install_process_capture();
+            }
+            crate::runtime::foundation::native_stdio::flush_pending();
+            true
+        }
+        _ => {
+            unsafe {
+                close_handle_raw(raw_pipe);
+            }
+            false
+        }
+    }
+}
+
+fn configure_classic_scrollback(handle: HANDLE) {
+    if handle.is_invalid() {
+        return;
+    }
+    unsafe {
+        let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+        if GetConsoleScreenBufferInfo(handle, &mut info).is_ok() {
+            let window_width = info.srWindow.Right.saturating_sub(info.srWindow.Left) + 1;
+            let width = info.dwSize.X.max(window_width).max(1);
+            let height = info.dwSize.Y.max(CLASSIC_SCROLLBACK_LINES);
+            let _ = set_console_screen_buffer_size_raw(handle.0, RawCoord { x: width, y: height });
+        }
+    }
+}
+
+fn render_branding(handle: HANDLE, columns: usize, ansi: bool, clear: bool) {
+    if clear && ansi {
+        write_console(handle, "\x1b[0m\x1b[2J\x1b[H");
+    }
     for line in console_branding::render_banner(columns, ansi) {
         write_console(handle, &line);
         write_console(handle, "\r\n");
