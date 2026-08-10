@@ -1,6 +1,7 @@
 pub mod build_info;
 pub mod crash_report;
 pub mod error_dialog;
+pub mod file_io_policy;
 pub mod i18n;
 #[path = "logging_full_debug.rs"]
 pub mod logging;
