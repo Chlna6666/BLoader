@@ -152,10 +152,6 @@ unsafe fn init_classic_console(is_existing_visible: bool) {
         }
 
         configure_classic_scrollback(h_conout);
-
-        // The banner owns the first screen. Do not install the logging sink until
-        // it is completely drawn; otherwise backlog/relay threads can write into
-        // the ASCII art while the console is being initialized.
         render_branding(
             h_conout,
             visible_columns(h_conout),
@@ -163,14 +159,11 @@ unsafe fn init_classic_console(is_existing_visible: bool) {
             true,
         );
 
-        // These messages intentionally enter the normal pre-console backlog.
-        // set_console_handle() then flushes the backlog as one ordered startup
-        // block and only after that starts the external LeviLamina log relay.
+        // Queue the synthetic identity block before installing the sink. The
+        // sink installation flushes all earlier startup logs only after the
+        // banner is complete, then starts the external structured-log relay.
         emit_runtime_identity();
-        replay_pre_main_load_state();
-        crate::core::xuser_bridge::publish_pending_logs();
         logging::set_console_handle(h_conout);
-        schedule_mod_inventory_replay();
     }
 
     if !h_conin.is_invalid() {
@@ -326,16 +319,8 @@ fn launch_windows_terminal_async() -> bool {
             }
 
             let handle = HANDLE(raw_pipe);
-
-            // WT bridge draws the banner before opening the named pipe. Queue all
-            // synthetic startup identity/state first, then attach the stream sink;
-            // this makes the backlog flush precede the external log relay and
-            // prevents LeviLamina history from interleaving with BLoader metadata.
             emit_runtime_identity();
-            replay_pre_main_load_state();
-            crate::core::xuser_bridge::publish_pending_logs();
             logging::set_console_stream_handle(handle, true);
-            schedule_mod_inventory_replay();
             logging::scoped_debug_message(
                 "console",
                 "runtime console ready | backend=windows-terminal | transport=named-pipe | reader=bloader-rundll32-native | banner=bridge-real-width | shell=false | powershell=false | startup_blocking=false",
@@ -585,58 +570,52 @@ fn replay_pre_main_load_state() {
     logging::scoped_info_message("mod:Proxy", &i18n::tr("console.proxy.route"));
 }
 
-fn schedule_mod_inventory_replay() {
-    let _ = thread::Builder::new()
-        .name("bloader-console-mod-inventory".to_string())
-        .spawn(|| {
-            thread::sleep(Duration::from_millis(2_000));
-            let mut mods = crate::runtime::foundation::mod_diagnostics::all_mods();
-            mods.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+fn replay_mod_inventory() {
+    let mut mods = crate::runtime::foundation::mod_diagnostics::all_mods();
+    mods.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
 
-            for identity in &mods {
-                let scope = format!("mod:{}", identity.name);
-                let version = identity.version.as_deref().unwrap_or("unknown");
-                logging::scoped_info_message(
-                    &scope,
-                    &format!(
-                        "{} {version} ({})",
-                        i18n::tr("console.mod.discovered"),
-                        identity.kind
-                    ),
-                );
-                match identity.state.as_str() {
-                    "loaded" => logging::scoped_info_message(
-                        &scope,
-                        &format!("Loaded {version} ({})", identity.kind),
-                    ),
-                    "failed" => logging::scoped_error_message(
-                        &scope,
-                        &i18n::tr("console.mod.failed"),
-                    ),
-                    "crashed" => logging::scoped_error_message(
-                        &scope,
-                        &i18n::tr("console.mod.crashed"),
-                    ),
-                    "loading" => logging::scoped_info_message(
-                        &scope,
-                        &i18n::tr("console.mod.loading"),
-                    ),
-                    _ => {}
-                }
-            }
+    for identity in &mods {
+        let scope = format!("mod:{}", identity.name);
+        let version = identity.version.as_deref().unwrap_or("unknown");
+        logging::scoped_info_message(
+            &scope,
+            &format!(
+                "{} {version} ({})",
+                i18n::tr("console.mod.discovered"),
+                identity.kind
+            ),
+        );
+        match identity.state.as_str() {
+            "loaded" => logging::scoped_info_message(
+                &scope,
+                &format!("Loaded {version} ({})", identity.kind),
+            ),
+            "failed" => logging::scoped_error_message(&scope, &i18n::tr("console.mod.failed")),
+            "crashed" => logging::scoped_error_message(&scope, &i18n::tr("console.mod.crashed")),
+            "loading" => logging::scoped_info_message(&scope, &i18n::tr("console.mod.loading")),
+            _ => {}
+        }
+    }
 
-            let discovered = mods.len();
-            let loaded = mods.iter().filter(|m| m.state == "loaded").count();
-            let failed = mods
-                .iter()
-                .filter(|m| matches!(m.state.as_str(), "failed" | "crashed"))
-                .count();
-            let text = i18n::tr("console.mods.summary")
-                .replace("{discovered}", &discovered.to_string())
-                .replace("{loaded}", &loaded.to_string())
-                .replace("{failed}", &failed.to_string());
-            logging::info_message(&text);
-        });
+    let discovered = mods.len();
+    let loaded = mods.iter().filter(|m| m.state == "loaded").count();
+    let failed = mods
+        .iter()
+        .filter(|m| matches!(m.state.as_str(), "failed" | "crashed"))
+        .count();
+    let text = i18n::tr("console.mods.summary")
+        .replace("{discovered}", &discovered.to_string())
+        .replace("{loaded}", &loaded.to_string())
+        .replace("{failed}", &failed.to_string());
+    logging::info_message(&text);
+}
+
+/// Publishes state that is only authoritative after the synchronous preload and
+/// normal Mod loading phases have completed. This deliberately has no fixed
+/// sleep: slow PreLoader chains must not produce an early/incorrect inventory.
+pub fn publish_runtime_state() {
+    replay_pre_main_load_state();
+    replay_mod_inventory();
 }
 
 fn visible_columns(handle: HANDLE) -> usize {
