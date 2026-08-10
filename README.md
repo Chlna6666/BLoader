@@ -8,7 +8,7 @@ BLoader 是面向 Minecraft Bedrock 的开源 Rust Mod 加载器，以 `BLoader.
 - 编译目标：`x86_64-pc-windows-msvc`
 - crate 类型：`cdylib`
 - 当前版本：以 `Cargo.toml` 的 `[package].version` 为唯一来源
-- 许可证：GPL-3.0-or-later
+- 许可证：GPL-3.0
 
 ## XUser 登录架构
 
@@ -71,7 +71,22 @@ Authorization: XBL3.0 x=<uhs>;<token>
 Signature: Base64(version + FILETIME timestamp + ECDSA-P256 signature)
 ```
 
-签名摘要覆盖 HTTP Method、Path/Query、Authorization 和请求 Body，使用 SHA-256 与 ECDSA P-256 生成 Xbox Proof-of-Possession Signature。该链路用于 Presence、好友活动状态以及其他要求请求签名的 Xbox Live 服务。
+签名摘要覆盖 HTTP Method、Path/Query、Authorization、签名策略要求的 Header 和请求 Body，使用 SHA-256 与 ECDSA P-256 生成 Xbox Proof-of-Possession Signature。
+
+## XUser 通信日志
+
+BLoader 会把 XUser/BMCBL 通信状态输出到结构化控制台和正常日志链路，包括：
+
+- BMCBL 当前 Minecraft PID 的 named-pipe 探测和连接状态；
+- Minecraft PID、父进程 PID、pipe server PID 校验；
+- transport protocol、时效窗口、payload 长度、SHA-256 校验结果；
+- 会话解析状态、公开 Gamertag、XUID、Token 路由数量、Privilege 数量；
+- System32 `xgameruntime.dll` 路径和 `QueryApiImpl` Hook 状态；
+- `QueryApiImpl` 路由到内置 XUser 或微软官方 Runtime；
+- 每次 Token/Signature 请求的 encoding、HTTP method、host、无 query 的 path、relying party、Header 名称、Body 大小、Token 剩余寿命；
+- PoP Signature 生成阶段、XAsync Begin/DoWork/GetResult/Cleanup、HRESULT 和结果 buffer 大小。
+
+日志不会记录 Token 内容、UHS、Authorization 正文、Signature 正文、ECC 私钥、完整请求 Body 或原始 pipe payload。URL query 也不会写入通信日志。
 
 ## 安全模型
 
@@ -103,6 +118,7 @@ Signature: Base64(version + FILETIME timestamp + ECDSA-P256 signature)
 - 原生 `native` / `preload-native` / `hot-native` / `hot-inject` Mod 装载；
 - BL Mod ABI、事件总线、资源和 UI 注册；
 - 进程 stdio 捕获，支持 `puts`、`printf`、`fprintf`、`std::cout`、Rust stdout/stderr 与 Win32 stdout；
+- 每个 Mod 的加载生命周期、stdout/stderr、BL Host `log()` 和崩溃归属统一输出到控制台；
 - VEH/SEH/顶层异常过滤器和原生预加载崩溃归属；
 - 内置中英文 i18n；
 - 文件重定向；
@@ -117,6 +133,42 @@ default = []
 ```
 
 `panel-ui`、`mc-symbols` 和 `blgen` 不会进入默认发布 DLL。
+
+## 结构化运行控制台
+
+BLoader 控制台使用固定列输出：
+
+```text
+TIME         LEVEL  GROUP    SOURCE             THREAD     MESSAGE
+12:44:10.125 INFO   SYS      identity           t18452     BLoader v0.2.32 ...
+12:44:10.180 INFO   XUSER    bridge             t18452     BMCBL XUser pipe 已连接 ...
+12:44:11.004 INFO   MOD      ExampleMod          t18452     stdout> initialized
+12:44:11.040 DEBUG  MOD      ExampleMod          t18452     lifecycle#8 ...
+12:44:12.300 INFO   STDIO    game-stdio          t19200     stdout> ...
+```
+
+分组包括：
+
+- `SYS`：构建、宿主、日志、路径和兼容层；
+- `XUSER`：BMCBL/XUser/Token/Signature 通信；
+- `MOD`：Mod 加载、生命周期、BL Host 日志和已归属 stdout/stderr；
+- `STDIO`：未能归属到特定 Mod 的 Minecraft/进程输出；
+- `NET`：网络 Hook；
+- `BLOADER`：其他 BLoader 内部模块。
+
+控制台支持 ANSI 时会按等级和分组着色，不支持 ANSI 时保持相同列布局的纯文本输出。QuickEdit 被关闭，避免选择文本时暂停 Minecraft 进程。
+
+### UWP 1.17–1.19
+
+Minecraft 1.17.x、1.18.x、1.19.x 下 BLoader 进入 `legacy-uwp-no-file-write`：
+
+- 不创建或修改 BLoader 日志、配置、崩溃文件和缓存；
+- 不安装会预创建目标目录的文件重定向；
+- Mod/进程 stdout 与 stderr 改用匿名内存管道实时捕获；
+- 预加载阶段的 Mod 输出在日志系统就绪前暂存于内存，随后回放到控制台；
+- 不依赖磁盘即可看到 `puts/printf/std::cout/Rust print/Win32 stdout`。
+
+其他版本继续保留磁盘 raw stdio capture，并同步实时回放到结构化控制台。
 
 ## 构建
 
@@ -148,24 +200,7 @@ Copy-Item target\x86_64-pc-windows-msvc\release\BLoader.dll target\release\BLoad
 
 ## GitHub Actions 与发布产物
 
-`.github/workflows/windows-release.yml` 在 `windows-2025` Runner 上执行：
-
-1. 安装 Rust/MSVC 目标；
-2. 恢复 Cargo registry、Git 依赖和可复用 `target` 缓存；
-3. 格式化校验；
-4. 运行 Rust 单元测试；
-5. 构建 Release DLL；
-6. 使用当前 Visual Studio 实例中的 `dumpbin.exe` 验证导出；
-7. 生成发布 ZIP、Manifest 和 SHA-256；
-8. 上传 Actions Artifacts；
-9. `v*` 标签自动创建 GitHub Release。
-
-Actions 产物：
-
-| Artifact | 内容 |
-| --- | --- |
-| `BLoader-windows-x64` | `BLoader.dll`、`exports.txt` 和 DLL 校验文件 |
-| `BLoader-release-package` | `BLoader-<version>-windows-x64.zip` 与 ZIP SHA-256 文件 |
+`.github/workflows/windows-release.yml` 在 Windows Runner 上执行格式检查、单元测试、Release DLL 构建、导出验证、打包、SHA-256 和 Artifact/Release 发布。
 
 发布 ZIP 内包含：
 
@@ -182,44 +217,40 @@ manifest.json
 
 ## 运行时日志
 
-主要日志：
+允许文件写入的版本主要使用：
 
 ```text
 logs/latest.log
-logs/<timestamp>.log
+logs/archive/bloader-<timestamp>.log
 logs/native-load-status.json
 logs/mods/<name>-<id>.log
-logs/bootstrap.marker.log
+logs/mod-registry.json
 ```
 
-XUser Bridge 日志只记录：
+`latest.log` 和 archive tracing sink 包含 target、线程 ID、线程名、源文件和行号。完整 DEBUG 为默认有效等级；只有显式 `log_level=trace` 才启用 TRACE。
 
-- 是否检测到 BMCBL 会话；
-- 会话校验结果；
-- 已解析的公开 Gamertag（由启动器/桥接成功日志使用）；
-- 是否安装 `QueryApiImpl` Hook；
-- relying-party 路由和 Signature 生成状态；
-- 失败阶段及 HRESULT/NTSTATUS。
-
-禁止记录 XUID、Token、私钥、Authorization、Signature、完整请求 Body 或原始管道载荷。
+1.17–1.19 的 legacy UWP 模式不创建上述文件，诊断改走控制台、`OutputDebugStringW` 和匿名内存管道。
 
 ### XUser Bridge 判定顺序
 
-BLoader 0.2.6 起会在最早启动阶段输出完整判定链。有效 BMCBL 会话下，正常日志应依次包含：
+有效 BMCBL 会话下，日志应依次出现类似：
 
 ```text
 XUser Bridge 入口已执行
+BMCBL XUser pipe 已连接
+BMCBL XUser transport verified
 已从 BMCBL 安全一次性管道接收并验证 Xbox 会话
-系统原生 xgameruntime.dll 已就绪 | source=... | path=C:\Windows\System32\xgameruntime.dll
-已定位系统原生 QueryApiImpl | address=...
+系统原生 xgameruntime.dll 已就绪
+已定位系统原生 QueryApiImpl
 XUser Bridge 已启用；仅接管官方 QueryApiImpl
 QueryApiImpl Hook 已首次命中
 QueryApiImpl 已请求 CLSID_XUserImpl；返回 BLoader 内置 Rust XUser
+XUser token/signature request | ...
+XUser request signature prepared | ...
+XUser token async provider | op=GetResult | result=S_OK | ...
 ```
 
-若没有安全会话，日志会明确说明“不主动加载系统 Runtime、不安装 Hook，系统原生 `xgameruntime.dll` 由游戏按微软正常流程启动”。
-
-如果日志中完全没有 `XUser Bridge 入口已执行`，说明实际加载的不是支持该桥接入口的 BLoader 产物，应优先检查 BMCBL 内嵌的 `assets/bin/BLoader.dll`，而不是继续判断 Hook 是否命中。
+若没有安全会话，日志会明确说明不主动加载系统 Runtime、不安装 Hook，并继续使用微软官方 XUser。
 
 ## 配置
 
@@ -231,7 +262,7 @@ BLoader 在 DLL 所在目录读取 `config.json`。常用配置：
 | `disable_mod_loading` | `false` | 禁止第三方 Mod 装载 |
 | `enable_redirection` | `false` | 启用文件重定向 |
 | `default_locale` | `zh_CN` | 日志/界面语言 |
-| `log_level` | `info` | 日志级别 |
+| `log_level` | `debug` | 日志级别；`trace` 可启用最高详细度 |
 | `enable_network_hooks` | `false` | 网络 Hook 总开关 |
 | `network_verbose` | `false` | 逐包详细日志 |
 | `enable_p2p_redirection` | `false` | P2P 重定向开关 |
@@ -260,4 +291,4 @@ BLoader 只 Hook 系统官方 `xgameruntime.dll!QueryApiImpl`；其他导出与 
 
 ## 许可证
 
-BLoader 以 GPL-3.0-or-later 发布，完整条款见 `LICENSE`。仓库中的第三方代码保留各自许可证。本软件按“AS IS”提供，不附带任何明示或默示担保。
+BLoader 以 GPL-3.0 发布；Cargo 使用与其等价的精确 SPDX 标识 `GPL-3.0-only`。完整条款见 `LICENSE`。仓库中的第三方代码保留各自许可证。本软件按“AS IS”提供，不附带任何明示或默示担保。
