@@ -2,23 +2,23 @@
 #![allow(dead_code)]
 #![allow(non_snake_case)]
 
-use std::ffi::c_void;
+use std::ffi::{CStr, c_void};
 use std::process::{Command, Stdio};
 use std::ptr::null_mut;
-use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use crate::runtime::foundation::{build_info, console_branding, file_io_policy, i18n, logging};
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, WriteFile,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
+    WriteFile,
 };
 use windows::Win32::System::Console::{
     AllocConsole, CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS,
     ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
     ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WRAP_AT_EOL_OUTPUT, GetConsoleMode,
-    GetConsoleScreenBufferInfo, GetConsoleWindow, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+    GetConsoleScreenBufferInfo, GetConsoleWindow, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
     STD_OUTPUT_HANDLE, SetConsoleMode, SetConsoleTitleW, SetStdHandle,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
@@ -32,6 +32,8 @@ const CLASSIC_SCROLLBACK_LINES: i16 = 12_000;
 const ERROR_PIPE_CONNECTED: u32 = 535;
 const PIPE_ACCESS_OUTBOUND: u32 = 0x0000_0002;
 const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
+const BRIDGE_OPEN_RETRIES: usize = 500;
+const BRIDGE_OPEN_RETRY_MS: u64 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -187,16 +189,62 @@ fn launch_windows_terminal_async() -> bool {
         return false;
     }
 
-    // Arm ConnectNamedPipe before wt.exe starts. The previous order launched
-    // `type \\.\pipe\...` first, so the client could observe the only pipe
-    // instance before it entered the listening state and fail with ERROR_PIPE_BUSY.
+    let loader_path = crate::utils::get_module_path(crate::utils::loader_module_handle());
+    if loader_path.as_os_str().is_empty() {
+        unsafe {
+            close_handle_raw(raw_pipe);
+        }
+        return false;
+    }
+
+    let title = format!(
+        "BLoader {} | Minecraft {} | Runtime Console",
+        build_info::VERSION,
+        file_io_policy::host_version().unwrap_or("unknown")
+    );
+    let bridge_entry = format!(
+        "{},BLoaderConsoleBridge",
+        loader_path.to_string_lossy()
+    );
+
+    // Windows Terminal launches the system rundll32 host, which calls the tiny
+    // exported BLoaderConsoleBridge function in this same DLL. No PowerShell,
+    // cmd.exe, .NET, script parser, helper extraction or extra product binary is
+    // involved. The bridge copies the pipe byte stream to terminal stdout.
+    let spawned = Command::new("wt.exe")
+        .args([
+            "-w",
+            "new",
+            "--size",
+            "120,40",
+            "new-tab",
+            "--title",
+            title.as_str(),
+            "--suppressApplicationTitle",
+            "rundll32.exe",
+            bridge_entry.as_str(),
+            pipe_path.as_str(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    if spawned.is_err() {
+        unsafe {
+            close_handle_raw(raw_pipe);
+        }
+        return false;
+    }
+
+    // The native bridge retries opening the pipe briefly, so this server thread
+    // does not need a startup barrier or artificial sleep. This keeps the
+    // Minecraft runtime-I/O path non-blocking while eliminating shell races.
     let raw_value = raw_pipe as usize;
-    let (armed_tx, armed_rx) = mpsc::sync_channel(0);
     let connector = thread::Builder::new()
         .name("bloader-windows-terminal".to_string())
         .spawn(move || {
             let raw_pipe = raw_value as *mut c_void;
-            let _ = armed_tx.send(());
             let connected = unsafe {
                 ConnectNamedPipe(raw_pipe, null_mut()) != 0
                     || get_last_error_raw() == ERROR_PIPE_CONNECTED
@@ -221,72 +269,101 @@ fn launch_windows_terminal_async() -> bool {
             schedule_mod_inventory_replay();
             logging::scoped_debug_message(
                 "console",
-                "runtime console ready | backend=windows-terminal | transport=named-pipe | server_armed_before_client=true | reader=cmd-type | powershell=false | startup_blocking=false | close_isolated=true",
+                "runtime console ready | backend=windows-terminal | transport=named-pipe | reader=bloader-rundll32-native | shell=false | powershell=false | startup_blocking=false | close_isolated=true",
             );
         });
 
     if connector.is_err() {
+        // WT has already started; do not create a second classic console window.
         unsafe {
             close_handle_raw(raw_pipe);
         }
-        return false;
-    }
-
-    // Wait only for the connector thread to reach the point immediately before
-    // ConnectNamedPipe, then yield a tiny scheduling window. This is not a game
-    // startup delay; it only orders the two console-side actors.
-    let _ = armed_rx.recv_timeout(Duration::from_millis(50));
-    thread::sleep(Duration::from_millis(2));
-
-    let title = format!(
-        "BLoader {} | Minecraft {} | Runtime Console",
-        build_info::VERSION,
-        file_io_policy::host_version().unwrap_or("unknown")
-    );
-    let reader_args = windows_terminal_reader_args(&pipe_path);
-    let mut command = Command::new("wt.exe");
-    command.args([
-        "-w",
-        "new",
-        "--size",
-        "120,40",
-        "new-tab",
-        "--title",
-        title.as_str(),
-        "--suppressApplicationTitle",
-    ]);
-    command.args(&reader_args);
-
-    // The reader also has a silent, bounded retry loop. It normally succeeds on
-    // the first attempt because the server is armed above; the loop only covers
-    // an extreme scheduler race and never prints ERROR_PIPE_BUSY to the terminal.
-    if command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .is_err()
-    {
-        // wt.exe itself is unavailable. The blocked connector owns raw_pipe and
-        // will be released when the process exits; return false so the caller can
-        // provide the classic Console Host fallback for this session.
-        return false;
     }
 
     true
 }
 
-fn windows_terminal_reader_args(pipe_path: &str) -> Vec<String> {
-    let command = format!(
-        "for /l %i in (1,1,512) do @(type \"{pipe_path}\" 2>nul && exit /b 0) & exit /b 1"
-    );
-    vec![
-        "cmd.exe".to_string(),
-        "/d".to_string(),
-        "/q".to_string(),
-        "/c".to_string(),
-        command,
-    ]
+/// Runtime entry used only by the rundll32 Windows Terminal bridge process.
+/// The DLL's DllMain detects rundll32.exe and skips all Minecraft bootstrap work,
+/// leaving this function as a small native pipe -> stdout byte pump.
+pub unsafe fn run_rundll32_console_bridge(cmdline: *const u8) {
+    if cmdline.is_null() {
+        return;
+    }
+
+    let raw = unsafe { CStr::from_ptr(cmdline.cast()) }.to_string_lossy();
+    let pipe_path = raw.trim().trim_matches('"');
+    if pipe_path.is_empty() || !pipe_path.starts_with(r"\\.\pipe\BLoader.Console.") {
+        return;
+    }
+
+    let wide: Vec<u16> = pipe_path.encode_utf16().chain(Some(0)).collect();
+    let mut pipe = HANDLE::default();
+    for _ in 0..BRIDGE_OPEN_RETRIES {
+        match unsafe {
+            CreateFileW(
+                PCWSTR(wide.as_ptr()),
+                GENERIC_READ.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        } {
+            Ok(handle) if !handle.is_invalid() => {
+                pipe = handle;
+                break;
+            }
+            _ => thread::sleep(Duration::from_millis(BRIDGE_OPEN_RETRY_MS)),
+        }
+    }
+    if pipe.is_invalid() {
+        return;
+    }
+
+    let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }.unwrap_or_default();
+    if stdout.is_invalid() {
+        unsafe {
+            close_handle_raw(pipe.0);
+        }
+        return;
+    }
+
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let mut read = 0u32;
+        if unsafe { ReadFile(pipe, Some(&mut buffer), Some(&mut read), None) }.is_err() || read == 0 {
+            break;
+        }
+
+        let mut offset = 0usize;
+        let end = read as usize;
+        while offset < end {
+            let mut written = 0u32;
+            if unsafe {
+                WriteFile(
+                    stdout,
+                    Some(&buffer[offset..end]),
+                    Some(&mut written),
+                    None,
+                )
+            }
+            .is_err()
+                || written == 0
+            {
+                unsafe {
+                    close_handle_raw(pipe.0);
+                }
+                return;
+            }
+            offset += written as usize;
+        }
+    }
+
+    unsafe {
+        close_handle_raw(pipe.0);
+    }
 }
 
 fn configure_classic_scrollback(handle: HANDLE) {
@@ -493,13 +570,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn windows_terminal_reader_is_shell_minimal_and_hides_pipe_busy_race() {
-        let args = windows_terminal_reader_args(r"\\.\pipe\BLoader.Console.1234");
-        assert_eq!(args[0], "cmd.exe");
-        assert_eq!(&args[1..4], &["/d", "/q", "/c"]);
-        assert!(args[4].contains("for /l"));
-        assert!(args[4].contains("2>nul"));
-        assert!(args[4].contains(r"\\.\pipe\BLoader.Console.1234"));
-        assert!(args.iter().all(|arg| !arg.to_ascii_lowercase().contains("powershell")));
+    fn rundll32_bridge_command_has_no_shell_layer() {
+        let loader = r"C:\Games\Minecraft\BLoader.dll";
+        let bridge_entry = format!("{loader},BLoaderConsoleBridge");
+        assert_eq!(bridge_entry, r"C:\Games\Minecraft\BLoader.dll,BLoaderConsoleBridge");
+        assert!(!bridge_entry.to_ascii_lowercase().contains("powershell"));
+        assert!(!bridge_entry.to_ascii_lowercase().contains("cmd.exe"));
     }
 }
