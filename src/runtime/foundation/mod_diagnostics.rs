@@ -435,7 +435,7 @@ pub fn record_lifecycle(identity: &ModIdentity, phase: &str, detail: &str) {
     drop(queue);
 
     let scope = format!("mod:{}", identity.name);
-    let message = format!(
+    let diagnostic = format!(
         "lifecycle#{sequence} | id={} | version={} | kind={} | phase={} | state={} | {}",
         identity.id,
         identity.version.as_deref().unwrap_or("unknown"),
@@ -444,13 +444,29 @@ pub fn record_lifecycle(identity: &ModIdentity, phase: &str, detail: &str) {
         identity.state,
         detail,
     );
+
+    // Keep the machine-useful lifecycle record in DEBUG/TRACE sinks, then emit
+    // only a short Java-server-style status line for events users need live.
     match phase {
-        "load_success" => logging::scoped_info_message(&scope, &message),
-        "load_failed" | "crash" | "stdio_capture_failed" => {
-            logging::scoped_error_message(&scope, &message)
+        "scope_enter" | "scope_exit" => logging::scoped_trace_message(&scope, &diagnostic),
+        _ => logging::scoped_debug_message(&scope, &diagnostic),
+    }
+
+    match phase {
+        "load_success" => logging::scoped_info_message(
+            &scope,
+            &format!(
+                "Loaded {} ({})",
+                identity.version.as_deref().unwrap_or("unknown version"),
+                identity.kind,
+            ),
+        ),
+        "load_failed" => logging::scoped_error_message(&scope, &format!("Load failed: {detail}")),
+        "crash" => logging::scoped_error_message(&scope, &format!("Crashed: {detail}")),
+        "stdio_capture_failed" => {
+            logging::scoped_warn_message(&scope, &format!("Output capture unavailable: {detail}"))
         }
-        "scope_enter" | "scope_exit" => logging::scoped_trace_message(&scope, &message),
-        _ => logging::scoped_debug_message(&scope, &message),
+        _ => {}
     }
 }
 
