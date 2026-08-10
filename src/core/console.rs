@@ -83,9 +83,6 @@ pub unsafe fn init_console() {
         return;
     }
 
-    // A pseudoconsole/ConPTY can return a non-null GetConsoleWindow HWND that is
-    // only a message-queue endpoint and is not locally visible. Do not treat that
-    // HWND as a usable runtime console; prefer an explicit Windows Terminal.
     if launch_windows_terminal_async() {
         return;
     }
@@ -98,9 +95,6 @@ unsafe fn init_classic_console(is_existing_visible: bool) {
     if is_existing_visible {
         let _ = ShowWindow(window, SW_SHOW);
     } else {
-        // If Minecraft inherited a hidden console or pseudoconsole, AllocConsole
-        // would fail while that association exists. Detach first, then create a
-        // real locally visible fallback console.
         if window.0 != null_mut() {
             let _ = FreeConsole();
         }
@@ -158,16 +152,24 @@ unsafe fn init_classic_console(is_existing_visible: bool) {
         }
 
         configure_classic_scrollback(h_conout);
-        logging::set_console_handle(h_conout);
+
+        // The banner owns the first screen. Do not install the logging sink until
+        // it is completely drawn; otherwise backlog/relay threads can write into
+        // the ASCII art while the console is being initialized.
         render_branding(
             h_conout,
             visible_columns(h_conout),
             console_has_vt(h_conout),
             true,
         );
+
+        // These messages intentionally enter the normal pre-console backlog.
+        // set_console_handle() then flushes the backlog as one ordered startup
+        // block and only after that starts the external LeviLamina log relay.
         emit_runtime_identity();
         replay_pre_main_load_state();
         crate::core::xuser_bridge::publish_pending_logs();
+        logging::set_console_handle(h_conout);
         schedule_mod_inventory_replay();
     }
 
@@ -241,8 +243,6 @@ fn launch_windows_terminal_async() -> bool {
         return false;
     }
 
-    // Make the DLL path explicit relative to WT's starting directory. This avoids
-    // both absolute-path quoting ambiguity and DLL-search-policy differences.
     let bridge_entry = format!(r".\{loader_name},BLoaderConsoleBridge");
     let title = format!(
         "BLoader {} | Minecraft {} | Runtime Console",
@@ -326,10 +326,15 @@ fn launch_windows_terminal_async() -> bool {
             }
 
             let handle = HANDLE(raw_pipe);
-            logging::set_console_stream_handle(handle, true);
+
+            // WT bridge draws the banner before opening the named pipe. Queue all
+            // synthetic startup identity/state first, then attach the stream sink;
+            // this makes the backlog flush precede the external log relay and
+            // prevents LeviLamina history from interleaving with BLoader metadata.
             emit_runtime_identity();
             replay_pre_main_load_state();
             crate::core::xuser_bridge::publish_pending_logs();
+            logging::set_console_stream_handle(handle, true);
             schedule_mod_inventory_replay();
             logging::scoped_debug_message(
                 "console",
