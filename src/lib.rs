@@ -89,9 +89,6 @@ pub unsafe extern "system" fn DllMain(
         DLL_PROCESS_ATTACH => {
             utils::set_loader_module_handle(hinstance.0 as usize);
 
-            // Windows Terminal's bridge host loads this same DLL through
-            // rundll32.exe. It must never arm the Minecraft OEP gate, install
-            // crash hooks, create files, or start the normal BLoader bootstrap.
             if is_console_bridge_host() {
                 return 1;
             }
@@ -171,6 +168,27 @@ fn run_bootstrap_late_attach() {
 }
 
 fn run_bootstrap_sequence(execution_mode: &'static str) -> bool {
+    runtime::foundation::crash_report::install();
+
+    // Resolve the user's console preference before any potentially slow native
+    // preload chain. PreLoader/LeviLamina can take many seconds; the runtime
+    // console must already be launching while that work is in progress.
+    let config = config::Config::load();
+    runtime::foundation::logging::init(&config.log_level);
+    config::ensure_config_watcher();
+    config::Config::apply_update(&config);
+    runtime::foundation::logging::write_bootstrap_marker("bootstrap.config.loaded.early");
+    runtime::foundation::crash_report::spawn_external_logger(utils::loader_module_handle());
+    runtime::foundation::i18n::init(&config);
+    runtime::foundation::logging::write_bootstrap_marker("bootstrap.i18n.ready.early");
+
+    if config.enable_debug_console {
+        unsafe { core::console::init_console(); }
+        runtime::foundation::logging::write_bootstrap_marker(
+            "bootstrap.console.launch.early before=premain-preloader",
+        );
+    }
+
     runtime::foundation::logging::write_bootstrap_marker(&format!(
         "bootstrap.xuser_bridge.premain.begin execution={execution_mode} loader_lock=released"
     ));
@@ -178,8 +196,6 @@ fn run_bootstrap_sequence(execution_mode: &'static str) -> bool {
     runtime::foundation::logging::write_bootstrap_marker(&format!(
         "bootstrap.xuser_bridge.premain.done execution={execution_mode} loader_lock=released"
     ));
-
-    runtime::foundation::crash_report::install();
 
     let premain_result = panic::catch_unwind(|| unsafe { prepare_premain_preloads(execution_mode) });
     let (preloader_summary, loaded_summary) = match premain_result {
@@ -195,7 +211,7 @@ fn run_bootstrap_sequence(execution_mode: &'static str) -> bool {
     };
 
     if let Err(panic_payload) = panic::catch_unwind(|| unsafe {
-        bootstrap(preloader_summary, loaded_summary, execution_mode)
+        bootstrap(preloader_summary, loaded_summary, execution_mode, config)
     }) {
         let details = panic_payload_to_string(panic_payload.as_ref());
         report_bootstrap_panic(&details, execution_mode);
@@ -257,33 +273,22 @@ unsafe fn bootstrap(
     preloader_summary: core::preloader_proxy::PreloaderProxySummary,
     loaded_summary: core::loader::NativePreloadSummary,
     execution_mode: &'static str,
+    config: config::Config,
 ) {
     let start_time = Instant::now();
     runtime::foundation::logging::write_bootstrap_marker(&format!(
         "bootstrap.begin execution={execution_mode}"
     ));
 
-    let config = config::Config::load();
-    config::ensure_config_watcher();
-    config::Config::apply_update(&config);
-    runtime::foundation::logging::write_bootstrap_marker("bootstrap.config.loaded");
-    runtime::foundation::logging::init(&config.log_level);
-    runtime::foundation::logging::write_bootstrap_marker("bootstrap.logging.ready");
-    runtime::foundation::crash_report::spawn_external_logger(utils::loader_module_handle());
-    runtime::foundation::i18n::init(&config);
-    runtime::foundation::logging::write_bootstrap_marker("bootstrap.i18n.ready");
-
     logging::info_message(
         "Minecraft symbol subsystem: disabled (not compiled in lightweight build).",
     );
 
+    // Console launch is independent from the compatibility delay. Only process
+    // CRT/stdout capture remains deferred after OEP.
     if execution_mode == "oep-gated-startup-thread" {
-        schedule_post_oep_runtime_io(config.enable_debug_console);
+        schedule_post_oep_runtime_io();
     } else {
-        if config.enable_debug_console {
-            unsafe { core::console::init_console(); }
-            runtime::foundation::logging::write_bootstrap_marker("bootstrap.console.ready");
-        }
         runtime::foundation::native_stdio::install_process_capture();
     }
 
@@ -434,10 +439,10 @@ unsafe fn bootstrap(
 
 const POST_OEP_RUNTIME_IO_DELAY_MS: u64 = 1_500;
 
-fn schedule_post_oep_runtime_io(enable_debug_console: bool) {
+fn schedule_post_oep_runtime_io() {
     runtime::foundation::logging::write_bootstrap_marker(&format!(
-        "bootstrap.runtime_io.deferred until=oep+{}ms console={} stdio=process-crt",
-        POST_OEP_RUNTIME_IO_DELAY_MS, enable_debug_console,
+        "bootstrap.runtime_io.deferred until=oep+{}ms stdio=process-crt console=independent",
+        POST_OEP_RUNTIME_IO_DELAY_MS,
     ));
 
     match thread::Builder::new()
@@ -455,16 +460,11 @@ fn schedule_post_oep_runtime_io(enable_debug_console: bool) {
 
             core::runtime_ready::wait_until_oep_delay(POST_OEP_RUNTIME_IO_DELAY_MS);
 
-            if enable_debug_console {
-                unsafe { core::console::init_console(); }
-                runtime::foundation::logging::write_bootstrap_marker("post-oep.console.ready");
-            }
-
             unsafe { runtime::foundation::native_stdio::install_process_capture(); }
             runtime::foundation::native_stdio::flush_pending();
             runtime::foundation::logging::write_bootstrap_marker(&format!(
-                "post-oep.runtime_io.ready delay_ms={} console={} stdio=process-crt",
-                POST_OEP_RUNTIME_IO_DELAY_MS, enable_debug_console,
+                "post-oep.runtime_io.ready delay_ms={} stdio=process-crt console=independent",
+                POST_OEP_RUNTIME_IO_DELAY_MS,
             ));
         }) {
         Ok(_) => runtime::foundation::logging::write_bootstrap_marker(
