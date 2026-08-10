@@ -19,7 +19,7 @@ use crate::bl::abi::{
     BL_REGISTRY_TEXT_PANEL, BL_REGISTRY_UI_PANEL, BlEventCallback, BlHostApiV1,
     BlResourceCallback, BlStringView,
 };
-use crate::runtime::foundation::{crash_report, logging, mod_diagnostics};
+use crate::runtime::foundation::{crash_report, file_io_policy, logging, mod_diagnostics};
 #[cfg(feature = "panel-ui")]
 use crate::bl::abi::{BlFeatureToggleCallback, BlTextCallback, BlUiCallback};
 use crate::utils::get_exe_directory;
@@ -269,7 +269,7 @@ unsafe extern "system" fn host_get_path(kind: u32, out_path: *mut u8, out_len: u
         BL_PATH_UI_RESOURCE_PACK_DIR => PathBuf::new(),
         _ => PathBuf::new(),
     };
-    if kind == BL_PATH_CACHE_DIR {
+    if kind == BL_PATH_CACHE_DIR && file_io_policy::writes_allowed() {
         let _ = std::fs::create_dir_all(&path);
     }
     copy_path(path, out_path, out_len)
@@ -318,16 +318,10 @@ unsafe extern "system" fn host_get_runtime_info(
         | "mapping.module_name"
         | "mapping.pack_id"
         | "mapping.public_symbols" => String::new(),
-        "client.instance"
-        | "client.local_player"
-        | "client.level" => "0".to_string(),
-        "client.ready"
-        | "client.local_player_ready"
-        | "client_instance.ready" => "false".to_string(),
+        "client.instance" | "client.local_player" | "client.level" => "0".to_string(),
+        "client.ready" | "client.local_player_ready" | "client_instance.ready" => "false".to_string(),
         "client.status" => "disabled".to_string(),
-        "ui.native_hud.status" | "ui.native_hud.mode" | "ui.native_hud.reason" => {
-            "disabled".to_string()
-        }
+        "ui.native_hud.status" | "ui.native_hud.mode" | "ui.native_hud.reason" => "disabled".to_string(),
         "ui.native_hud.candidate_count" => "0".to_string(),
         "input.mouse_wheel_total_steps" | "input.mouse_wheel_last_steps" => "0".to_string(),
         "input.global.left_down"
@@ -342,13 +336,14 @@ unsafe extern "system" fn host_get_runtime_info(
 }
 
 unsafe extern "system" fn host_path_exists(path: BlStringView) -> bool {
-    let path = PathBuf::from(view_to_string(path));
-    path.exists()
+    PathBuf::from(view_to_string(path)).exists()
 }
 
 unsafe extern "system" fn host_create_dir(path: BlStringView) -> bool {
-    let path = PathBuf::from(view_to_string(path));
-    std::fs::create_dir_all(path).is_ok()
+    if !file_io_policy::writes_allowed() {
+        return false;
+    }
+    std::fs::create_dir_all(PathBuf::from(view_to_string(path))).is_ok()
 }
 
 unsafe extern "system" fn host_read_text_file(
@@ -357,9 +352,7 @@ unsafe extern "system" fn host_read_text_file(
     out_len: usize,
 ) -> usize {
     let path = PathBuf::from(view_to_string(path));
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return 0;
-    };
+    let Ok(content) = std::fs::read_to_string(path) else { return 0; };
     let bytes = content.as_bytes();
     if !out_buf.is_null() && out_len > 0 {
         let copy_len = bytes.len().min(out_len.saturating_sub(1));
@@ -370,6 +363,9 @@ unsafe extern "system" fn host_read_text_file(
 }
 
 unsafe extern "system" fn host_write_text_file(path: BlStringView, content: BlStringView) -> i32 {
+    if !file_io_policy::writes_allowed() {
+        return -3;
+    }
     let path = PathBuf::from(view_to_string(path));
     if let Some(parent) = path.parent() {
         if std::fs::create_dir_all(parent).is_err() {
@@ -398,9 +394,7 @@ fn copy_text(text: &str, out_path: *mut u8, out_len: usize) -> usize {
     bytes.len()
 }
 
-pub fn host_api() -> *const BlHostApiV1 {
-    &HOST_API
-}
+pub fn host_api() -> *const BlHostApiV1 { &HOST_API }
 
 #[unsafe(export_name = "bl_register_mod_lang")]
 pub unsafe extern "system" fn bl_register_mod_lang(
@@ -444,20 +438,11 @@ pub fn register_loaded_mod(
     on_unload: Option<unsafe extern "system" fn()>,
 ) {
     logging::debug_message(&format!(
-        "[BL] Registered loaded mod {} ({}) @0x{:X}",
-        name, id, module
+        "[BL] Registered loaded mod {} ({}) @0x{:X}", name, id, module
     ));
     let mut state = lock_state();
     state.loaded_mods.push(LoadedBlMod {
-        id,
-        name,
-        dll_path,
-        api_version,
-        version,
-        author,
-        description,
-        module,
-        on_unload,
+        id, name, dll_path, api_version, version, author, description, module, on_unload,
     });
 }
 
@@ -466,26 +451,17 @@ pub fn dispatch_bootstrap_complete() {
     dispatch_resource_reload(BL_EVENT_RESOURCE_RELOAD);
 }
 
-pub fn dispatch_render_frame() {
-    dispatch_event(BL_EVENT_RENDER_FRAME, ptr::null());
-}
+pub fn dispatch_render_frame() { dispatch_event(BL_EVENT_RENDER_FRAME, ptr::null()); }
 
 #[cfg(feature = "panel-ui")]
-pub fn dispatch_ui_frame() {
-    dispatch_event(crate::bl::abi::BL_EVENT_UI_FRAME, ptr::null());
-}
+pub fn dispatch_ui_frame() { dispatch_event(crate::bl::abi::BL_EVENT_UI_FRAME, ptr::null()); }
 
 pub fn dispatch_shutdown() {
     let unloads = {
         let state = lock_state();
-        state
-            .loaded_mods
-            .iter()
-            .filter_map(|m| {
-                m.on_unload
-                    .map(|f| (m.id.clone(), m.name.clone(), m.module, f))
-            })
-            .collect::<Vec<_>>()
+        state.loaded_mods.iter().filter_map(|m| {
+            m.on_unload.map(|f| (m.id.clone(), m.name.clone(), m.module, f))
+        }).collect::<Vec<_>>()
     };
 
     dispatch_event(BL_EVENT_SHUTDOWN, ptr::null());
@@ -493,18 +469,13 @@ pub fn dispatch_shutdown() {
     for (id, name, module, f) in unloads {
         run_mod_callback_safely(&name, "on_unload", || unsafe { f() });
         logging::info_message(&format!(
-            "[BL] Unloaded mod: {} ({}) @0x{:X}",
-            name, id, module
+            "[BL] Unloaded mod: {} ({}) @0x{:X}", name, id, module
         ));
     }
 }
 
 pub fn dispatch_event(event_id: u32, payload: *const c_void) {
-    let callbacks = {
-        let state = lock_state();
-        state.event_handlers.clone()
-    };
-
+    let callbacks = { lock_state().event_handlers.clone() };
     for handler in callbacks {
         let callback: BlEventCallback = unsafe { std::mem::transmute(handler.callback) };
         run_mod_callback_safely(&handler.owner_name, "event", || unsafe {
@@ -515,11 +486,7 @@ pub fn dispatch_event(event_id: u32, payload: *const c_void) {
 
 #[cfg(feature = "panel-ui")]
 pub fn dispatch_ui_panels() {
-    let panels = {
-        let state = lock_state();
-        state.ui_panels.clone()
-    };
-
+    let panels = { lock_state().ui_panels.clone() };
     for panel in panels {
         let callback: BlUiCallback = unsafe { std::mem::transmute(panel.callback) };
         run_mod_callback_safely(&panel.owner_name, "ui_panel", || unsafe {
@@ -530,10 +497,7 @@ pub fn dispatch_ui_panels() {
 
 #[cfg(feature = "panel-ui")]
 pub fn dispatch_text_panels() {
-    let handlers: Vec<RegisteredHandler> = {
-        let state = lock_state();
-        state.text_panels.clone()
-    };
+    let handlers: Vec<RegisteredHandler> = { lock_state().text_panels.clone() };
     for handler in handlers {
         let callback: BlTextCallback = unsafe { std::mem::transmute(handler.callback) };
         run_mod_callback_safely(&handler.owner_name, "text_panel", || unsafe {
@@ -543,19 +507,11 @@ pub fn dispatch_text_panels() {
 }
 
 #[cfg(feature = "panel-ui")]
-pub fn has_text_panels() -> bool {
-    let state = lock_state();
-    !state.text_panels.is_empty()
-}
+pub fn has_text_panels() -> bool { !lock_state().text_panels.is_empty() }
 
 pub fn dispatch_resource_reload(reason: u32) {
     dispatch_event(BL_EVENT_RESOURCE_RELOAD, ptr::null());
-
-    let resources = {
-        let state = lock_state();
-        state.resources.clone()
-    };
-
+    let resources = { lock_state().resources.clone() };
     for resource in resources {
         let callback: BlResourceCallback = unsafe { std::mem::transmute(resource.callback) };
         run_mod_callback_safely(&resource.owner_name, "resource_reload", || unsafe {
@@ -591,12 +547,8 @@ pub fn active_mod_name_for_registration() -> String {
 }
 
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(msg) = payload.downcast_ref::<&str>() {
-        return (*msg).to_string();
-    }
-    if let Some(msg) = payload.downcast_ref::<String>() {
-        return msg.clone();
-    }
+    if let Some(msg) = payload.downcast_ref::<&str>() { return (*msg).to_string(); }
+    if let Some(msg) = payload.downcast_ref::<String>() { return msg.clone(); }
     "Unknown panic".to_string()
 }
 
@@ -609,8 +561,6 @@ fn run_mod_callback_safely(owner_name: &str, callback_kind: &str, f: impl FnOnce
     } else {
         with_active_mod_name(owner_name, || panic::catch_unwind(AssertUnwindSafe(f)))
     };
-    // A Mod callback can replace SetUnhandledExceptionFilter. Re-arm after every
-    // callback so the next native crash remains attributable.
     crash_report::rearm_unhandled_filter(&format!("after-mod-callback:{owner_name}:{callback_kind}"));
     if let Err(payload) = result {
         let details = panic_payload_to_string(payload.as_ref());
@@ -618,8 +568,7 @@ fn run_mod_callback_safely(owner_name: &str, callback_kind: &str, f: impl FnOnce
             mod_diagnostics::mark_crashed(identity, callback_kind, &format!("Rust panic: {details}"));
         }
         crash_report::capture_rust_panic(
-            &format!("mod={owner_name} callback={callback_kind} detail={details}"),
-            false,
+            &format!("mod={owner_name} callback={callback_kind} detail={details}"), false,
         );
         logging::scoped_error_message(
             &format!("mod:{owner_name}"),
@@ -629,70 +578,33 @@ fn run_mod_callback_safely(owner_name: &str, callback_kind: &str, f: impl FnOnce
 }
 
 pub fn loaded_mod_summaries() -> Vec<String> {
-    let state = lock_state();
-    state
-        .loaded_mods
-        .iter()
-        .map(|m| format!("{} ({})", m.name, m.id))
-        .collect()
+    lock_state().loaded_mods.iter().map(|m| format!("{} ({})", m.name, m.id)).collect()
 }
 
-pub fn loaded_mods() -> Vec<LoadedBlMod> {
-    let state = lock_state();
-    state.loaded_mods.clone()
-}
+pub fn loaded_mods() -> Vec<LoadedBlMod> { lock_state().loaded_mods.clone() }
 
 #[cfg(feature = "panel-ui")]
 pub fn loaded_mod_views() -> Vec<LoadedBlModView> {
     let state = lock_state();
-    let mut mods = state
-        .loaded_mods
-        .iter()
-        .map(|loaded| LoadedBlModView {
-            id: loaded.id.clone(),
-            name: loaded.name.clone(),
-            dll_path: loaded.dll_path.clone(),
-            api_version: loaded.api_version,
-            version: loaded.version.clone(),
-            author: loaded.author.clone(),
-            description: loaded.description.clone(),
-            module: loaded.module,
-            event_count: state
-                .event_handlers
-                .iter()
-                .filter(|handler| handler.owner_name == loaded.name)
-                .count(),
-            ui_panel_count: state
-                .ui_panels
-                .iter()
-                .filter(|handler| handler.owner_name == loaded.name)
-                .count(),
-            resource_count: state
-                .resources
-                .iter()
-                .filter(|handler| handler.owner_name == loaded.name)
-                .count(),
-            text_panel_count: state
-                .text_panels
-                .iter()
-                .filter(|handler| handler.owner_name == loaded.name)
-                .count(),
-            feature_toggle_count: state
-                .feature_toggles
-                .iter()
-                .filter(|toggle| toggle.owner_name == loaded.name)
-                .count(),
-            feature_panel_count: state
-                .feature_panels
-                .iter()
-                .filter(|panel| panel.owner_name == loaded.name)
-                .count(),
-        })
-        .collect::<Vec<_>>();
+    let mut mods = state.loaded_mods.iter().map(|loaded| LoadedBlModView {
+        id: loaded.id.clone(),
+        name: loaded.name.clone(),
+        dll_path: loaded.dll_path.clone(),
+        api_version: loaded.api_version,
+        version: loaded.version.clone(),
+        author: loaded.author.clone(),
+        description: loaded.description.clone(),
+        module: loaded.module,
+        event_count: state.event_handlers.iter().filter(|handler| handler.owner_name == loaded.name).count(),
+        ui_panel_count: state.ui_panels.iter().filter(|handler| handler.owner_name == loaded.name).count(),
+        resource_count: state.resources.iter().filter(|handler| handler.owner_name == loaded.name).count(),
+        text_panel_count: state.text_panels.iter().filter(|handler| handler.owner_name == loaded.name).count(),
+        feature_toggle_count: state.feature_toggles.iter().filter(|toggle| toggle.owner_name == loaded.name).count(),
+        feature_panel_count: state.feature_panels.iter().filter(|panel| panel.owner_name == loaded.name).count(),
+    }).collect::<Vec<_>>();
 
     mods.sort_by(|left, right| {
-        left.name
-            .cmp(&right.name)
+        left.name.cmp(&right.name)
             .then_with(|| left.id.cmp(&right.id))
             .then_with(|| left.dll_path.cmp(&right.dll_path))
     });
@@ -703,32 +615,22 @@ pub fn loaded_mod_views() -> Vec<LoadedBlModView> {
 pub fn feature_toggles() -> Vec<FeatureToggleView> {
     let mut toggles = {
         let state = lock_state();
-        state
-            .feature_toggles
-            .iter()
-            .map(|toggle| FeatureToggleView {
-                id: toggle.id.clone(),
-                title: toggle.title.clone(),
-                description: toggle.description.clone(),
-                owner_name: toggle.owner_name.clone(),
-                enabled: toggle.enabled,
-            })
-            .collect::<Vec<_>>()
+        state.feature_toggles.iter().map(|toggle| FeatureToggleView {
+            id: toggle.id.clone(),
+            title: toggle.title.clone(),
+            description: toggle.description.clone(),
+            owner_name: toggle.owner_name.clone(),
+            enabled: toggle.enabled,
+        }).collect::<Vec<_>>()
     };
-    toggles.sort_by(|left, right| {
-        left.owner_name
-            .cmp(&right.owner_name)
-            .then_with(|| left.title.cmp(&right.title))
-    });
+    toggles.sort_by(|left, right| left.owner_name.cmp(&right.owner_name).then_with(|| left.title.cmp(&right.title)));
     toggles
 }
 
 #[cfg(feature = "panel-ui")]
 pub fn feature_panel_for_owner(owner_name: &str) -> Option<FeaturePanelView> {
     let state = lock_state();
-    state
-        .feature_panels
-        .iter()
+    state.feature_panels.iter()
         .find(|panel| panel.owner_name == owner_name)
         .map(|panel| FeaturePanelView {
             id: panel.id.clone(),
@@ -742,18 +644,10 @@ pub fn feature_panel_for_owner(owner_name: &str) -> Option<FeaturePanelView> {
 pub fn set_feature_toggle(owner_name: &str, id: &str, enabled: bool) -> bool {
     let callback = {
         let mut state = lock_state();
-        let Some(toggle) = state
-            .feature_toggles
-            .iter_mut()
+        let Some(toggle) = state.feature_toggles.iter_mut()
             .find(|toggle| toggle.owner_name == owner_name && toggle.id == id)
-        else {
-            return false;
-        };
-
-        if toggle.enabled == enabled {
-            return true;
-        }
-
+        else { return false; };
+        if toggle.enabled == enabled { return true; }
         toggle.enabled = enabled;
         (toggle.owner_name.clone(), toggle.callback, toggle.user_data)
     };
@@ -775,13 +669,9 @@ pub fn render_feature_panel_inline(
 ) -> bool {
     let callback = {
         let state = lock_state();
-        let Some(panel) = state
-            .feature_panels
-            .iter()
+        let Some(panel) = state.feature_panels.iter()
             .find(|panel| panel.owner_name == owner_name && panel.id == id)
-        else {
-            return false;
-        };
+        else { return false; };
         (panel.owner_name.clone(), panel.callback, panel.user_data)
     };
 
@@ -793,10 +683,7 @@ pub fn render_feature_panel_inline(
     true
 }
 
-fn loaded_mod_count() -> usize {
-    let state = lock_state();
-    state.loaded_mods.len()
-}
+fn loaded_mod_count() -> usize { lock_state().loaded_mods.len() }
 
 #[cfg(feature = "panel-ui")]
 fn parse_feature_toggle_registration(raw: &str) -> Option<(String, String, String, bool)> {
@@ -808,11 +695,7 @@ fn parse_feature_toggle_registration(raw: &str) -> Option<(String, String, Strin
         lines.next().unwrap_or_default().trim(),
         "1" | "true" | "TRUE" | "True"
     );
-
-    if id.is_empty() || title.is_empty() {
-        return None;
-    }
-
+    if id.is_empty() || title.is_empty() { return None; }
     Some((id, title, description, default_enabled))
 }
 
@@ -822,17 +705,11 @@ fn parse_feature_panel_registration(raw: &str) -> Option<(String, String, String
     let id = lines.next()?.trim().to_string();
     let title = lines.next()?.trim().to_string();
     let description = lines.next().unwrap_or_default().trim().to_string();
-
-    if id.is_empty() || title.is_empty() {
-        return None;
-    }
-
+    if id.is_empty() || title.is_empty() { return None; }
     Some((id, title, description))
 }
 
-fn process_working_set_mb() -> u64 {
-    0
-}
+fn process_working_set_mb() -> u64 { 0 }
 
 #[cfg(test)]
 mod tests {
@@ -842,12 +719,8 @@ mod tests {
     #[test]
     fn exposes_the_symbol_mapping_runtime_info_keys() {
         for key in [
-            "mapping.summary",
-            "mapping.highlights",
-            "mapping.cache_path",
-            "mapping.cache_status",
-            "mapping.module_name",
-            "mapping.symbol_count",
+            "mapping.summary", "mapping.highlights", "mapping.cache_path",
+            "mapping.cache_status", "mapping.module_name", "mapping.symbol_count",
         ] {
             assert!(is_public_runtime_info_key(key), "{key} must be public");
         }
@@ -859,15 +732,10 @@ mod tests {
         let mut output = [0u8; 64];
         let length = unsafe {
             host_get_runtime_info(
-                BlStringView {
-                    ptr: key.as_ptr() as *const i8,
-                    len: key.len(),
-                },
-                output.as_mut_ptr(),
-                output.len(),
+                BlStringView { ptr: key.as_ptr() as *const i8, len: key.len() },
+                output.as_mut_ptr(), output.len(),
             )
         };
-
         assert_eq!(
             std::str::from_utf8(&output[..length]).expect("host output is UTF-8"),
             "disabled: symbol subsystem not compiled"
@@ -880,15 +748,10 @@ mod tests {
         let mut output = [0u8; 16];
         let length = unsafe {
             host_get_runtime_info(
-                BlStringView {
-                    ptr: key.as_ptr() as *const i8,
-                    len: key.len(),
-                },
-                output.as_mut_ptr(),
-                output.len(),
+                BlStringView { ptr: key.as_ptr() as *const i8, len: key.len() },
+                output.as_mut_ptr(), output.len(),
             )
         };
-
         assert_eq!(
             std::str::from_utf8(&output[..length]).expect("host output is UTF-8"),
             "false"
@@ -898,11 +761,8 @@ mod tests {
     #[test]
     fn exposes_client_runtime_info_keys_without_claiming_client_support() {
         for key in [
-            "client.instance",
-            "client.local_player",
-            "client.level",
-            "client.ready",
-            "client.status",
+            "client.instance", "client.local_player", "client.level",
+            "client.ready", "client.status",
         ] {
             assert!(is_public_runtime_info_key(key), "{key} must be public");
         }
@@ -911,84 +771,42 @@ mod tests {
     #[test]
     fn exposes_native_hud_runtime_info_without_candidate_addresses() {
         for key in [
-            "ui.native_hud.status",
-            "ui.native_hud.mode",
-            "ui.native_hud.candidate_count",
-            "ui.native_hud.reason",
+            "ui.native_hud.status", "ui.native_hud.mode",
+            "ui.native_hud.candidate_count", "ui.native_hud.reason",
         ] {
             assert!(is_public_runtime_info_key(key), "{key} must be public");
         }
-        assert!(!is_public_runtime_info_key(
-            "ui.native_hud.candidate_address"
-        ));
+        assert!(!is_public_runtime_info_key("ui.native_hud.candidate_address"));
     }
 }
 
 pub fn resource_summaries() -> Vec<String> {
-    let state = lock_state();
-    state.resources.iter().map(|r| r.name.clone()).collect()
+    lock_state().resources.iter().map(|r| r.name.clone()).collect()
 }
 
 pub fn render_callback_summaries() -> Vec<String> {
     let mut lines = Vec::new();
-
     for d3d12 in crate::core::d3d12_queue::d3d12_callback_summaries() {
         lines.push(format!("D3D12: {d3d12}"));
     }
-
     for d3d11 in crate::core::d3d12_queue::d3d11_callback_summaries() {
         lines.push(format!("D3D11: {d3d11}"));
     }
-
     lines
 }
 
 #[cfg(feature = "panel-ui")]
-pub fn should_attach_overlay() -> bool {
-    true
-}
+pub fn should_attach_overlay() -> bool { true }
 
-pub fn has_event_handlers() -> bool {
-    let state = lock_state();
-    !state.event_handlers.is_empty()
-}
+pub fn has_event_handlers() -> bool { !lock_state().event_handlers.is_empty() }
 
-pub const fn event_id_tick() -> u32 {
-    BL_EVENT_TICK
-}
-
-pub const fn event_id_key() -> u32 {
-    BL_EVENT_KEY
-}
-
-pub const fn event_id_world_enter() -> u32 {
-    BL_EVENT_WORLD_ENTER
-}
-
-pub const fn event_id_chat() -> u32 {
-    BL_EVENT_CHAT
-}
-
-pub const fn event_id_created_level() -> u32 {
-    BL_EVENT_CREATED_LEVEL
-}
-
-pub const fn event_id_start_game_packet() -> u32 {
-    BL_EVENT_START_GAME_PACKET
-}
-
-pub const fn event_id_set_local_player_as_init() -> u32 {
-    BL_EVENT_SET_LOCAL_PLAYER_AS_INIT
-}
-
-pub const fn event_id_local_player_bound() -> u32 {
-    BL_EVENT_LOCAL_PLAYER_BOUND
-}
-
-pub const fn event_id_player_action() -> u32 {
-    BL_EVENT_PLAYER_ACTION
-}
-
-pub const fn event_id_block_action() -> u32 {
-    BL_EVENT_BLOCK_ACTION
-}
+pub const fn event_id_tick() -> u32 { BL_EVENT_TICK }
+pub const fn event_id_key() -> u32 { BL_EVENT_KEY }
+pub const fn event_id_world_enter() -> u32 { BL_EVENT_WORLD_ENTER }
+pub const fn event_id_chat() -> u32 { BL_EVENT_CHAT }
+pub const fn event_id_created_level() -> u32 { BL_EVENT_CREATED_LEVEL }
+pub const fn event_id_start_game_packet() -> u32 { BL_EVENT_START_GAME_PACKET }
+pub const fn event_id_set_local_player_as_init() -> u32 { BL_EVENT_SET_LOCAL_PLAYER_AS_INIT }
+pub const fn event_id_local_player_bound() -> u32 { BL_EVENT_LOCAL_PLAYER_BOUND }
+pub const fn event_id_player_action() -> u32 { BL_EVENT_PLAYER_ACTION }
+pub const fn event_id_block_action() -> u32 { BL_EVENT_BLOCK_ACTION }
