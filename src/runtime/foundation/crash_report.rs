@@ -28,7 +28,9 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::PCWSTR;
 
-use crate::runtime::foundation::{build_info, error_dialog, logging, mod_diagnostics, native_stdio};
+use crate::runtime::foundation::{
+    build_info, error_dialog, file_io_policy, logging, mod_diagnostics, native_stdio,
+};
 
 static CRASH_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 static CRASH_DIALOG_SHOWN: AtomicBool = AtomicBool::new(false);
@@ -152,6 +154,13 @@ pub fn rearm_unhandled_filter(reason: &str) {
 }
 
 pub fn spawn_external_logger(module_handle: usize) {
+    if file_io_policy::legacy_uwp_no_write() {
+        logging::write_bootstrap_marker(
+            "crash_report.external_logger.skipped reason=legacy-uwp-no-file-write",
+        );
+        return;
+    }
+
     if EXTERNAL_LOGGER_STARTED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -226,6 +235,30 @@ unsafe fn capture_exception(exception: *const EXCEPTION_POINTERS, phase: &str, s
     let Some(_capture_guard) = CaptureGuard::enter() else {
         return;
     };
+
+    if file_io_policy::legacy_uwp_no_write() {
+        let code = exception_code(exception);
+        let address = exception_address(exception);
+        let thread_id = GetCurrentThreadId();
+        let module = module_path_from_address(address);
+        logging::emergency_error_message(
+            "loader",
+            &format!(
+                "CRASH_CAPTURED_NO_FILE | phase={phase} | code=0x{code:08X} | address=0x{address:X} | module={module} | thread={thread_id} | file_io=disabled"
+            ),
+        );
+        if show_dialog
+            && CRASH_DIALOG_SHOWN
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            error_dialog::show_fatal_error(
+                "BLoader Mod Crash",
+                "A crash was captured, but file crash reports are disabled for Minecraft 1.17/1.18/1.19 legacy UWP hosts.",
+            );
+        }
+        return;
+    }
 
     let report_dir = prepare_crash_dir();
     let timestamp = Local::now().format("%Y%m%d-%H%M%S-%3f").to_string();
@@ -406,34 +439,29 @@ unsafe fn should_capture_veh_exception(exception: *const EXCEPTION_POINTERS) -> 
     let module = module_path_from_address(address).to_ascii_lowercase();
     let active_mod = mod_diagnostics::active_scope_for_thread(GetCurrentThreadId()).is_some();
 
-    // C++ exceptions and BLoader's translated Rust exception marker may be caught
-    // by user code. The final unhandled filter still records them if they escape.
     if matches!(code, 0xE0000001 | 0xE06D7363) {
         return false;
     }
 
     let fatal = matches!(
         code,
-        0x40000015 // STATUS_FATAL_APP_EXIT
-            | 0x80000003 // breakpoint left unhandled
-            | 0xC0000005 // access violation
-            | 0xC000001D // illegal instruction
-            | 0xC0000025 // noncontinuable exception
-            | 0xC0000094 // integer divide by zero
-            | 0xC0000096 // privileged instruction
-            | 0xC00000FD // stack overflow
-            | 0xC0000409 // stack buffer overrun / fail-fast
-            | 0xC000041D // user callback exception
-            | 0xC0000602 // fail-fast exception
+        0x40000015
+            | 0x80000003
+            | 0xC0000005
+            | 0xC000001D
+            | 0xC0000025
+            | 0xC0000094
+            | 0xC0000096
+            | 0xC00000FD
+            | 0xC0000409
+            | 0xC000041D
+            | 0xC0000602
     );
 
     if !fatal {
         return false;
     }
 
-    // During synchronous native preload, a dependency or CRT can be the actual
-    // exception module. The active Mod scope is therefore stronger evidence than
-    // checking only whether the faulting address belongs to a DLL under mods/.
     if active_mod {
         return true;
     }
@@ -560,6 +588,30 @@ fn capture_manual_failure(phase: &str, title: &str, details: &str, show_dialog: 
     let Some(_capture_guard) = CaptureGuard::enter() else {
         return;
     };
+
+    if file_io_policy::legacy_uwp_no_write() {
+        logging::emergency_error_message(
+            "loader",
+            &format!(
+                "MANUAL_CRASH_CAPTURED_NO_FILE | phase={phase} | title={title} | details={} | file_io=disabled",
+                if details.is_empty() { "<none>" } else { details }
+            ),
+        );
+        if show_dialog
+            && CRASH_DIALOG_SHOWN
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            error_dialog::show_fatal_error(
+                "BLoader Mod Crash",
+                &format!(
+                    "{title}\n\n{details}\n\nFile crash reports are disabled for Minecraft 1.17/1.18/1.19 legacy UWP hosts."
+                ),
+            );
+        }
+        return;
+    }
+
     let report_dir = prepare_crash_dir();
     let timestamp = Local::now().format("%Y%m%d-%H%M%S-%3f").to_string();
     let thread_id = unsafe { GetCurrentThreadId() };
@@ -635,6 +687,13 @@ unsafe fn write_minidump(
     path: &PathBuf,
     exception: *const EXCEPTION_POINTERS,
 ) -> windows::core::Result<()> {
+    if !file_io_policy::writes_allowed() {
+        return Err(windows::core::Error::new(
+            windows::core::HRESULT(0x80070005u32 as i32),
+            "file writes disabled by legacy UWP policy",
+        ));
+    }
+
     let file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -666,11 +725,17 @@ unsafe fn write_minidump(
 
 fn prepare_crash_dir() -> PathBuf {
     let dir = PathBuf::from("logs").join("crash-reports");
-    let _ = fs::create_dir_all(&dir);
+    if file_io_policy::writes_allowed() {
+        let _ = fs::create_dir_all(&dir);
+    }
     dir
 }
 
 fn write_report(path: &PathBuf, text: &str) {
+    if !file_io_policy::writes_allowed() {
+        return;
+    }
+
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .write(true)
