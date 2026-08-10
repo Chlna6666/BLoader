@@ -7,14 +7,12 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
 use windows::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThreadId,
-};
+use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId};
 use windows::core::{PCSTR, PCWSTR};
 
 use crate::runtime::foundation::{file_io_policy, logging, mod_diagnostics};
@@ -23,6 +21,26 @@ use mod_diagnostics::ModIdentity;
 const O_TEXT: i32 = 0x4000;
 const STDOUT_FILENO: i32 = 1;
 const STDERR_FILENO: i32 = 2;
+const PIPE_READ_BUFFER: usize = 8192;
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "CreatePipe"]
+    fn create_pipe_raw(
+        read_pipe: *mut *mut c_void,
+        write_pipe: *mut *mut c_void,
+        pipe_attributes: *const c_void,
+        size: u32,
+    ) -> i32;
+    #[link_name = "ReadFile"]
+    fn read_file_raw(
+        file: *mut c_void,
+        buffer: *mut c_void,
+        bytes_to_read: u32,
+        bytes_read: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+}
 
 #[derive(Clone)]
 struct CapturedLine {
@@ -34,6 +52,28 @@ struct CapturedLine {
 struct KeptCaptureFiles {
     _stdout: File,
     _stderr: File,
+}
+
+struct PipeHandle(HANDLE);
+
+unsafe impl Send for PipeHandle {}
+unsafe impl Sync for PipeHandle {}
+
+impl PipeHandle {
+    fn raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
+impl Drop for PipeHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+            self.0 = HANDLE::default();
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -92,12 +132,7 @@ fn active_captures() -> &'static Mutex<Vec<ActiveCaptureSnapshot>> {
 
 pub unsafe fn capture_library_load<T>(identity: &ModIdentity, phase: &str, f: impl FnOnce() -> T) -> T {
     if file_io_policy::legacy_uwp_no_write() {
-        mod_diagnostics::record_lifecycle(
-            identity,
-            "stdio_capture_skipped",
-            &format!("phase={phase} reason=legacy-uwp-no-file-write"),
-        );
-        return f();
+        return unsafe { capture_library_load_pipe(identity, phase, f) };
     }
 
     let capture_dir = PathBuf::from("logs").join("mod-output");
@@ -131,7 +166,11 @@ pub unsafe fn capture_library_load<T>(identity: &ModIdentity, phase: &str, f: im
     mod_diagnostics::record_lifecycle(
         identity,
         "stdio_capture_begin",
-        &format!("phase={phase} stdout={} stderr={}", stdout_path.display(), stderr_path.display()),
+        &format!(
+            "phase={phase} mode=file stdout={} stderr={}",
+            stdout_path.display(),
+            stderr_path.display()
+        ),
     );
     let _active_capture = ActiveCaptureGuard::push(
         identity,
@@ -154,19 +193,85 @@ pub unsafe fn capture_library_load<T>(identity: &ModIdentity, phase: &str, f: im
             _stdout: stdout_file,
             _stderr: stderr_file,
         });
-    mod_diagnostics::record_lifecycle(identity, "stdio_capture_ready", phase);
+    mod_diagnostics::record_lifecycle(identity, "stdio_capture_ready", "mode=file");
+    result
+}
+
+unsafe fn capture_library_load_pipe<T>(
+    identity: &ModIdentity,
+    phase: &str,
+    f: impl FnOnce() -> T,
+) -> T {
+    let Some((stdout_read, stdout_write)) = create_pipe_pair() else {
+        mod_diagnostics::record_lifecycle(
+            identity,
+            "stdio_capture_failed",
+            &format!("phase={phase} mode=memory-pipe stream=stdout"),
+        );
+        return f();
+    };
+    let Some((stderr_read, stderr_write)) = create_pipe_pair() else {
+        mod_diagnostics::record_lifecycle(
+            identity,
+            "stdio_capture_failed",
+            &format!("phase={phase} mode=memory-pipe stream=stderr"),
+        );
+        return f();
+    };
+
+    let original_stdout = GetStdHandle(STD_OUTPUT_HANDLE).unwrap_or_default();
+    let original_stderr = GetStdHandle(STD_ERROR_HANDLE).unwrap_or_default();
+    let _ = SetStdHandle(STD_OUTPUT_HANDLE, stdout_write.raw());
+    let _ = SetStdHandle(STD_ERROR_HANDLE, stderr_write.raw());
+    let redirect = CrtRedirect::install(stdout_write.raw(), stderr_write.raw());
+
+    mod_diagnostics::record_lifecycle(
+        identity,
+        "stdio_capture_begin",
+        &format!("phase={phase} mode=memory-pipe file_io=false"),
+    );
+    let _active_capture = ActiveCaptureGuard::push(
+        identity,
+        phase,
+        PathBuf::from("<memory-pipe:stdout>"),
+        PathBuf::from("<memory-pipe:stderr>"),
+    );
+
+    let result = f();
+    redirect.flush();
+    redirect.restore();
+    let _ = SetStdHandle(STD_OUTPUT_HANDLE, original_stdout);
+    let _ = SetStdHandle(STD_ERROR_HANDLE, original_stderr);
+
+    // Closing the write ends makes the one-shot readers finish after all CRT
+    // duplicates have been restored/closed. The read threads queue output when
+    // logging is not ready yet, so pre-main Mod text is replayed later.
+    drop(stdout_write);
+    drop(stderr_write);
+    spawn_pipe_reader(stdout_read, Some(identity.clone()), "stdout", false);
+    spawn_pipe_reader(stderr_read, Some(identity.clone()), "stderr", false);
+    mod_diagnostics::record_lifecycle(identity, "stdio_capture_ready", "mode=memory-pipe");
     result
 }
 
 pub unsafe fn install_process_capture() {
     if PROCESS_CAPTURE_INSTALLED.set(()).is_err() {
+        logging::scoped_debug_message("stdio-capture", "process capture already installed");
         return;
     }
 
     if file_io_policy::legacy_uwp_no_write() {
-        logging::write_bootstrap_marker(
-            "stdio-capture.process.skipped reason=legacy-uwp-no-file-write",
-        );
+        if unsafe { install_process_pipe_capture() } {
+            logging::scoped_info_message(
+                "stdio-capture",
+                "process stdio capture installed | mode=memory-pipe | file_io=false | supports=puts,printf,fputs,fprintf,std::cout,Rust-print,Win32-stdout | console_replay=structured",
+            );
+        } else {
+            logging::scoped_error_message(
+                "stdio-capture",
+                "failed to install legacy UWP memory-pipe stdio capture; direct console output remains available",
+            );
+        }
         return;
     }
 
@@ -202,11 +307,128 @@ pub unsafe fn install_process_capture() {
     logging::scoped_info_message(
         "stdio-capture",
         &format!(
-            "process stdio capture installed | stdout={} | stderr={} | supports=puts,printf,fputs,fprintf,std::cout,Rust-print,Win32-stdout",
+            "process stdio capture installed | mode=file-tail | stdout={} | stderr={} | supports=puts,printf,fputs,fprintf,std::cout,Rust-print,Win32-stdout | console_replay=structured",
             stdout_path.display(),
             stderr_path.display()
         ),
     );
+}
+
+unsafe fn install_process_pipe_capture() -> bool {
+    let Some((stdout_read, stdout_write)) = create_pipe_pair() else {
+        return false;
+    };
+    let Some((stderr_read, stderr_write)) = create_pipe_pair() else {
+        return false;
+    };
+
+    if SetStdHandle(STD_OUTPUT_HANDLE, stdout_write.raw()).is_err()
+        || SetStdHandle(STD_ERROR_HANDLE, stderr_write.raw()).is_err()
+    {
+        return false;
+    }
+    let redirect = CrtRedirect::install(stdout_write.raw(), stderr_write.raw());
+    std::mem::forget(redirect);
+
+    spawn_pipe_reader(stdout_read, None, "stdout", true);
+    spawn_pipe_reader(stderr_read, None, "stderr", true);
+
+    // SetStdHandle does not take ownership. Keep the write handles alive for the
+    // process lifetime; CRT descriptors hold duplicates as well.
+    std::mem::forget(stdout_write);
+    std::mem::forget(stderr_write);
+    true
+}
+
+fn create_pipe_pair() -> Option<(PipeHandle, PipeHandle)> {
+    let mut read = std::ptr::null_mut();
+    let mut write = std::ptr::null_mut();
+    let ok = unsafe {
+        create_pipe_raw(
+            &mut read,
+            &mut write,
+            std::ptr::null(),
+            64 * 1024,
+        )
+    };
+    if ok == 0 || read.is_null() || write.is_null() {
+        if !read.is_null() {
+            unsafe {
+                let _ = CloseHandle(HANDLE(read));
+            }
+        }
+        if !write.is_null() {
+            unsafe {
+                let _ = CloseHandle(HANDLE(write));
+            }
+        }
+        return None;
+    }
+    Some((PipeHandle(HANDLE(read)), PipeHandle(HANDLE(write))))
+}
+
+fn spawn_pipe_reader(
+    read: PipeHandle,
+    identity: Option<ModIdentity>,
+    stream: &'static str,
+    follow: bool,
+) {
+    let thread_name = format!(
+        "bloader-pipe-{}-{}",
+        stream,
+        identity
+            .as_ref()
+            .map(|value| sanitize(&value.id))
+            .unwrap_or_else(|| "process".to_string())
+    );
+    let _ = thread::Builder::new().name(thread_name).spawn(move || {
+        read_pipe(read, identity, stream, follow);
+    });
+}
+
+fn read_pipe(read: PipeHandle, identity: Option<ModIdentity>, stream: &str, follow: bool) {
+    let mut pending = Vec::<u8>::new();
+    let mut buffer = [0u8; PIPE_READ_BUFFER];
+    loop {
+        let mut bytes_read = 0u32;
+        let ok = unsafe {
+            read_file_raw(
+                read.raw().0,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                &mut bytes_read,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || bytes_read == 0 {
+            break;
+        }
+        pending.extend_from_slice(&buffer[..bytes_read as usize]);
+        drain_lines(&mut pending, identity.clone(), stream);
+        if pending.len() > 64 * 1024 {
+            let line = String::from_utf8_lossy(&pending)
+                .trim_matches(char::from(0))
+                .trim()
+                .to_string();
+            if !line.is_empty() {
+                queue_or_emit(identity.clone(), stream, &line);
+            }
+            pending.clear();
+        }
+        if !follow && bytes_read < buffer.len() as u32 {
+            // One-shot captures still continue until the write end closes; this
+            // branch only gives the scheduler a chance to run the Mod loader.
+            thread::yield_now();
+        }
+    }
+    if !pending.is_empty() {
+        let line = String::from_utf8_lossy(&pending)
+            .trim_end_matches(|value| matches!(value, '\r' | '\n' | '\0'))
+            .to_string();
+        if !line.trim().is_empty() {
+            queue_or_emit(identity, stream, &line);
+        }
+    }
 }
 
 pub fn flush_pending() {
@@ -449,6 +671,16 @@ pub fn active_capture_output(thread_id: u32, max_bytes: usize) -> String {
     let Some(capture) = active_capture_for_thread(thread_id) else {
         return "<none>".to_string();
     };
+    if capture
+        .stdout_path
+        .to_string_lossy()
+        .starts_with("<memory-pipe")
+    {
+        return format!(
+            "mod={} ({}) phase={} capture=memory-pipe output=streamed-to-console",
+            capture.identity.name, capture.identity.id, capture.phase
+        );
+    }
     format!(
         "mod={} ({}) phase={}\r\nstdout={}\r\n{}\r\nstderr={}\r\n{}",
         capture.identity.name,
@@ -585,15 +817,24 @@ unsafe fn resolve_crt_apis() -> Vec<(String, CrtApi)> {
         let Ok(module) = GetModuleHandleW(PCWSTR(wide.as_ptr())) else {
             continue;
         };
-        let Some(dup) = proc(module, b"_dup\0") else { continue; };
-        let Some(dup2) = proc(module, b"_dup2\0") else { continue; };
-        let Some(close) = proc(module, b"_close\0") else { continue; };
-        let Some(open_osfhandle) = proc(module, b"_open_osfhandle\0") else { continue; };
-        let Some(flushall) = proc(module, b"_flushall\0") else { continue; };
-        let iob_func = proc(module, b"__acrt_iob_func\0")
-            .map(|value| std::mem::transmute(value));
-        let setvbuf = proc(module, b"setvbuf\0")
-            .map(|value| std::mem::transmute(value));
+        let Some(dup) = proc(module, b"_dup\0") else {
+            continue;
+        };
+        let Some(dup2) = proc(module, b"_dup2\0") else {
+            continue;
+        };
+        let Some(close) = proc(module, b"_close\0") else {
+            continue;
+        };
+        let Some(open_osfhandle) = proc(module, b"_open_osfhandle\0") else {
+            continue;
+        };
+        let Some(flushall) = proc(module, b"_flushall\0") else {
+            continue;
+        };
+        let iob_func =
+            proc(module, b"__acrt_iob_func\0").map(|value| std::mem::transmute(value));
+        let setvbuf = proc(module, b"setvbuf\0").map(|value| std::mem::transmute(value));
         result.push((
             module_name.to_string(),
             CrtApi {
