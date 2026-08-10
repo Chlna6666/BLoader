@@ -84,8 +84,10 @@ pub unsafe fn init_console() {
         }
 
         // set_console_handle emits the structured BLoader/Minecraft banner after
-        // ANSI capability is known.
+        // ANSI capability is known. Then replay all pre-main XUser diagnostics
+        // to the console only; persistent sinks already received those records.
         logging::set_console_handle(h_conout);
+        crate::core::xuser_bridge::publish_pending_logs();
     }
 
     if !h_conin.is_invalid() {
