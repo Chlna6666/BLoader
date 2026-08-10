@@ -155,11 +155,7 @@ pub fn is_ready() -> bool {
 
 pub fn captured_mod_output(mod_name: &str, mod_id: &str, stream: &str, message: &str) {
     let scope = format!("mod:{mod_name}");
-    log_message(
-        Level::INFO,
-        &scope,
-        &format!("{stream}> {message}"),
-    );
+    log_message(Level::INFO, &scope, &format!("{stream}> {message}"));
     append_mod_log(mod_name, mod_id, stream, message);
 }
 
@@ -453,7 +449,10 @@ fn console_route(scope: &str) -> (String, String) {
         return ("MOD".to_string(), name.to_string());
     }
     if scope == "xuser-bridge" || scope.starts_with("xuser-") {
-        return ("XUSER".to_string(), scope.trim_start_matches("xuser-").to_string());
+        return (
+            "XUSER".to_string(),
+            scope.trim_start_matches("xuser-").to_string(),
+        );
     }
     if matches!(scope, "native-stdio" | "game-stdio" | "stdio-capture") {
         return ("STDIO".to_string(), scope.to_string());
@@ -479,6 +478,14 @@ fn console_route(scope: &str) -> (String, String) {
     ) {
         return ("SYS".to_string(), scope.to_string());
     }
+
+    // BL Host log() uses the active Mod name as its logging scope. Resolve it
+    // against the runtime Mod registry so SDK/native Mod logs render under MOD
+    // even when they did not come through the stdout/stderr capture pipeline.
+    if crate::runtime::foundation::mod_diagnostics::find_by_name(scope).is_some() {
+        return ("MOD".to_string(), scope.to_string());
+    }
+
     ("BLOADER".to_string(), scope.to_string())
 }
 
