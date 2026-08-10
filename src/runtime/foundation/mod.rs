@@ -1,4 +1,5 @@
 pub mod build_info;
+pub mod console_branding;
 pub mod crash_report;
 pub mod error_dialog;
 pub mod file_io_policy;
