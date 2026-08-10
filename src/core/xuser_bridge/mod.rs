@@ -48,9 +48,21 @@ enum BridgeLogLevel {
     Error,
 }
 
+impl BridgeLogLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+}
+
 struct PendingLog {
     level: BridgeLogLevel,
     message: String,
+    published_to_persistent_sinks: bool,
 }
 
 #[derive(Debug)]
@@ -116,7 +128,7 @@ pub fn initialize_before_mods() {
         .collect::<Vec<_>>()
         .join(",");
     bridge_info(&format!(
-        "已从 BMCBL 安全一次性管道接收并验证 Xbox 会话 | xbox_gamertag={gamertag} | xbox_xuid={} | token_routes={} | privilege_count={} | secrets_logged=false | next=load-official-runtime-and-hook",
+        "已从 BMCBL 安全一次性管道接收并验证 Xbox 会话 | xbox_gamertag={gamertag} | xbox_xuid={} | token_count={} | privilege_count={} | secrets_logged=false | next=load-official-runtime-and-hook",
         candidate.xuid,
         candidate.tokens.len(),
         candidate.privileges.len(),
@@ -139,38 +151,57 @@ pub fn initialize_before_mods() {
     }
 }
 
-/// Replays XUser bridge diagnostics generated before the normal tracing and
-/// console pipeline became available. The bridge now initializes in the OEP-gated
-/// pre-main phase after the Windows loader lock has been released.
+/// Publishes pre-main XUser diagnostics to persistent logging when tracing first
+/// becomes available, but keeps a console replay copy until the delayed runtime
+/// console exists. Calling this again after `set_console_handle` replays only to
+/// the console, so latest/archive logs are not duplicated.
 pub fn publish_pending_logs() {
     let Some(queue) = PENDING_LOGS.get() else {
         return;
     };
-    let pending = {
-        let mut guard = match queue.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        mem::take(&mut *guard)
-    };
-
-    if pending.is_empty() {
+    let console_ready = logging::console_is_ready();
+    let logging_ready = logging::is_ready();
+    if !logging_ready && !console_ready {
         return;
     }
 
-    logging::scoped_info_message(
-        "xuser-bridge",
-        &format!(
-            "正在回放 {} 条早期 XUser Bridge 诊断；以下状态生成于 BLoader pre-main 阶段（loader lock 已释放）",
-            pending.len()
-        ),
-    );
-    for entry in pending {
-        match entry.level {
-            BridgeLogLevel::Debug => logging::scoped_debug_message("xuser-bridge", &entry.message),
-            BridgeLogLevel::Info => logging::scoped_info_message("xuser-bridge", &entry.message),
-            BridgeLogLevel::Warn => logging::scoped_warn_message("xuser-bridge", &entry.message),
-            BridgeLogLevel::Error => logging::scoped_error_message("xuser-bridge", &entry.message),
+    let mut guard = match queue.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.is_empty() {
+        return;
+    }
+
+    if console_ready {
+        for entry in guard.iter_mut() {
+            if entry.published_to_persistent_sinks {
+                logging::replay_console_message(
+                    entry.level.as_str(),
+                    "xuser-bridge",
+                    &entry.message,
+                );
+            } else {
+                emit_persistent(entry.level, &entry.message);
+                entry.published_to_persistent_sinks = true;
+            }
+        }
+        let count = guard.len();
+        guard.clear();
+        logging::replay_console_message(
+            "info",
+            "xuser-bridge",
+            &format!(
+                "early XUser diagnostics replay complete | entries={count} | source=pre-main"
+            ),
+        );
+        return;
+    }
+
+    for entry in guard.iter_mut() {
+        if !entry.published_to_persistent_sinks {
+            emit_persistent(entry.level, &entry.message);
+            entry.published_to_persistent_sinks = true;
         }
     }
 }
@@ -350,7 +381,7 @@ fn sanitize_gamertag(value: &str) -> String {
     }
 }
 
-fn queue_pending(level: BridgeLogLevel, message: &str) {
+fn queue_pending(level: BridgeLogLevel, message: &str, published: bool) {
     let queue = PENDING_LOGS.get_or_init(|| Mutex::new(Vec::new()));
     let mut guard = match queue.lock() {
         Ok(guard) => guard,
@@ -359,43 +390,49 @@ fn queue_pending(level: BridgeLogLevel, message: &str) {
     guard.push(PendingLog {
         level,
         message: message.to_string(),
+        published_to_persistent_sinks: published,
     });
 }
 
-pub(crate) fn bridge_debug(message: &str) {
-    logging::write_bootstrap_marker(&format!("xuser-bridge.debug {message}"));
-    if logging::is_ready() {
-        logging::scoped_debug_message("xuser-bridge", message);
-    } else {
-        queue_pending(BridgeLogLevel::Debug, message);
+fn emit_persistent(level: BridgeLogLevel, message: &str) {
+    match level {
+        BridgeLogLevel::Debug => logging::scoped_debug_message("xuser-bridge", message),
+        BridgeLogLevel::Info => logging::scoped_info_message("xuser-bridge", message),
+        BridgeLogLevel::Warn => logging::scoped_warn_message("xuser-bridge", message),
+        BridgeLogLevel::Error => logging::scoped_error_message("xuser-bridge", message),
     }
+}
+
+fn bridge_log(level: BridgeLogLevel, message: &str) {
+    if logging::is_ready() {
+        emit_persistent(level, message);
+        if !logging::console_is_ready() {
+            queue_pending(level, message, true);
+        }
+        return;
+    }
+
+    logging::write_bootstrap_marker(&format!(
+        "xuser-bridge.{} {message}",
+        level.as_str()
+    ));
+    queue_pending(level, message, false);
+}
+
+pub(crate) fn bridge_debug(message: &str) {
+    bridge_log(BridgeLogLevel::Debug, message);
 }
 
 pub(crate) fn bridge_info(message: &str) {
-    logging::write_bootstrap_marker(&format!("xuser-bridge.info {message}"));
-    if logging::is_ready() {
-        logging::scoped_info_message("xuser-bridge", message);
-    } else {
-        queue_pending(BridgeLogLevel::Info, message);
-    }
+    bridge_log(BridgeLogLevel::Info, message);
 }
 
 pub(crate) fn bridge_warn(message: &str) {
-    logging::write_bootstrap_marker(&format!("xuser-bridge.warn {message}"));
-    if logging::is_ready() {
-        logging::scoped_warn_message("xuser-bridge", message);
-    } else {
-        queue_pending(BridgeLogLevel::Warn, message);
-    }
+    bridge_log(BridgeLogLevel::Warn, message);
 }
 
 pub(crate) fn bridge_error(message: &str) {
-    logging::write_bootstrap_marker(&format!("xuser-bridge.error {message}"));
-    if logging::is_ready() {
-        logging::scoped_error_message("xuser-bridge", message);
-    } else {
-        queue_pending(BridgeLogLevel::Error, message);
-    }
+    bridge_log(BridgeLogLevel::Error, message);
 }
 
 fn wide(value: &str) -> Vec<u16> {
