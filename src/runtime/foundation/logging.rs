@@ -2,6 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use chrono::Local;
 use tracing::{Level, debug, error, info, trace, warn};
@@ -39,6 +40,21 @@ static ARCHIVE_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 static LATEST_PREPARED: OnceLock<()> = OnceLock::new();
 static LATEST_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 static ARCHIVE_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
+
+// 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, 5=TRACE.
+// Persistent logs are intentionally independent from this console threshold.
+static CONSOLE_LEVEL: AtomicU8 = AtomicU8::new(3);
+
+pub fn set_console_level(level: &str) {
+    let value = match level.trim().to_ascii_lowercase().as_str() {
+        "error" => 1,
+        "warn" | "warning" => 2,
+        "debug" => 4,
+        "trace" => 5,
+        _ => 3,
+    };
+    CONSOLE_LEVEL.store(value, Ordering::Release);
+}
 
 pub fn init(level: &str) {
     if LOGGING_READY.get().is_some() {
@@ -160,9 +176,6 @@ pub fn console_is_ready() -> bool {
         .unwrap_or(false)
 }
 
-/// Writes a previously-published diagnostic to the interactive console only.
-/// This intentionally bypasses tracing/file/OutputDebugString sinks so replaying
-/// pre-console XUser/Mod diagnostics does not duplicate persistent log records.
 pub fn replay_console_message(level: &str, scope: &str, message: &str) {
     if !console_is_ready() {
         return;
@@ -174,21 +187,29 @@ pub fn replay_console_message(level: &str, scope: &str, message: &str) {
         "trace" => Level::TRACE,
         _ => Level::INFO,
     };
-    write_bytes_to_console(format_console_line(level, scope, message).as_bytes());
+    if console_should_show(level, scope, message) {
+        write_bytes_to_console(format_console_line(level, scope, message).as_bytes());
+    }
 }
 
 pub fn captured_mod_output(mod_name: &str, mod_id: &str, stream: &str, message: &str) {
     let scope = format!("mod:{mod_name}");
-    log_message(Level::INFO, &scope, &format!("{stream}> {message}"));
+    let console_message = if stream.eq_ignore_ascii_case("stderr") {
+        format!("[stderr] {message}")
+    } else {
+        message.to_string()
+    };
+    log_message(Level::INFO, &scope, &console_message);
     append_mod_log(mod_name, mod_id, stream, message);
 }
 
 pub fn captured_process_output(stream: &str, message: &str) {
-    log_message(
-        Level::INFO,
-        "game-stdio",
-        &format!("{stream}> {message}"),
-    );
+    let console_message = if stream.eq_ignore_ascii_case("stderr") {
+        format!("[stderr] {message}")
+    } else {
+        message.to_string()
+    };
+    log_message(Level::INFO, "game-stdio", &console_message);
 }
 
 fn append_mod_log(mod_name: &str, mod_id: &str, stream: &str, message: &str) {
@@ -242,7 +263,7 @@ pub fn set_console_handle(handle: HANDLE) {
         write_console_banner();
     }
     write_bootstrap_marker(&format!(
-        "logging.console.ready handle=0x{:X} ansi={} layout=structured-v2",
+        "logging.console.ready handle=0x{:X} ansi={} layout=java-server-v1",
         handle.0 as usize,
         console_supports_ansi(),
     ));
@@ -251,53 +272,59 @@ pub fn set_console_handle(handle: HANDLE) {
 fn write_console_banner() {
     let host_version = file_io_policy::host_version().unwrap_or("unknown");
     let mode = file_io_policy::mode_label();
-    let width = 78usize;
-    let rule = "=".repeat(width);
-    let lines = [
-        rule.clone(),
-        format!(
-            " BLoader {:<10} Minecraft {:<16} {}",
-            format!("v{}", build_info::VERSION),
-            format!("v{host_version}"),
-            build_info::LICENSE,
-        ),
-        format!(
-            " Runtime Console | DEBUG diagnostics | file_io={} | secrets=redacted",
-            mode
-        ),
-        format!(" Repository: {}", build_info::REPOSITORY),
-        rule,
-        " TIME         LEVEL  GROUP    SOURCE             THREAD     MESSAGE".to_string(),
-        " -----------------------------------------------------------------------------".to_string(),
+    let debug_destination = if file_io_policy::writes_allowed() {
+        "logs/latest.log"
+    } else {
+        "OutputDebugString (legacy UWP no-write)"
+    };
+    let art = [
+        r" ____  _                    _           ",
+        r"| __ )| |    ___   __ _  __| | ___ _ __",
+        r"|  _ \| |   / _ \ / _` |/ _` |/ _ \ '__|",
+        r"| |_) | |__| (_) | (_| | (_| |  __/ |   ",
+        r"|____/|_____\___/ \__,_|\__,_|\___|_|   ",
     ];
-    for line in lines {
+
+    write_bytes_to_console(b"\r\n");
+    for line in art {
         if console_supports_ansi() {
-            write_bytes_to_console(format!("\x1b[38;5;75m{line}\x1b[0m\r\n").as_bytes());
+            write_bytes_to_console(format!("\x1b[96m{line}\x1b[0m\r\n").as_bytes());
         } else {
             write_bytes_to_console(format!("{line}\r\n").as_bytes());
         }
     }
+
+    let metadata = [
+        format!(
+            "  BLoader v{}  |  Minecraft {}  |  {}",
+            build_info::VERSION,
+            host_version,
+            build_info::LICENSE,
+        ),
+        format!("  Minecraft Bedrock Mod Loader  |  file_io={mode}"),
+        format!("  Full debug: {debug_destination}"),
+        String::new(),
+    ];
+    for line in metadata {
+        write_bytes_to_console(format!("{line}\r\n").as_bytes());
+    }
 }
 
 pub fn startup_banner(
-    loader_name: &str,
-    loader_version: &str,
+    _loader_name: &str,
+    _loader_version: &str,
     application_name: &str,
     application_version: &str,
     locale: &str,
 ) {
     log_message(
         Level::INFO,
-        "bootstrap",
+        "loader",
         &format!(
-            "{} v{} | host={} v{} | locale={} | license={} | repository={} | crash=VEH+SEH | file_io={}",
-            loader_name,
-            loader_version,
+            "Starting for {} {} (locale={}, file_io={})",
             application_name,
             application_version,
             locale,
-            build_info::LICENSE,
-            build_info::REPOSITORY,
             file_io_policy::mode_label(),
         ),
     );
@@ -366,9 +393,8 @@ pub fn write_bootstrap_marker(message: &str) {
     write_bytes_to_bootstrap_file(file_line.as_bytes());
     write_debug_string(&file_line);
 
-    if CONSOLE_HANDLE.get().is_some() {
-        let console_line = format_console_line(Level::DEBUG, "bootstrap", message);
-        write_bytes_to_console(console_line.as_bytes());
+    if console_is_ready() && console_should_show(Level::DEBUG, "bootstrap", message) {
+        write_bytes_to_console(format_console_line(Level::DEBUG, "bootstrap", message).as_bytes());
     }
 }
 
@@ -404,8 +430,9 @@ fn emit_event(level: Level, scope: &str, message: &str) {
 }
 
 fn mirror_message(level: Level, scope: &str, message: &str) {
-    let console_line = format_console_line(level, scope, message);
-    write_bytes_to_console(console_line.as_bytes());
+    if console_should_show(level, scope, message) {
+        write_bytes_to_console(format_console_line(level, scope, message).as_bytes());
+    }
 
     let debug_line = format!(
         "[{}] [{}] [{}] [tid={}] [thread={}] {}\r\n",
@@ -419,77 +446,92 @@ fn mirror_message(level: Level, scope: &str, message: &str) {
     write_debug_string(&debug_line);
 }
 
+fn console_should_show(level: Level, scope: &str, message: &str) -> bool {
+    let required = level_rank(level);
+    if required > CONSOLE_LEVEL.load(Ordering::Acquire) {
+        return false;
+    }
+
+    // Per-request XUser signing telemetry is intentionally kept in the complete
+    // debug log at normal INFO console verbosity. The console only needs state
+    // transitions and failures, matching the signal density of Java servers.
+    if level == Level::INFO
+        && scope == "xuser-bridge"
+        && (message.starts_with("XUser token/signature request")
+            || message.starts_with("BMCBL XUser pipe payload"))
+    {
+        return CONSOLE_LEVEL.load(Ordering::Acquire) >= 4;
+    }
+    true
+}
+
+fn level_rank(level: Level) -> u8 {
+    match level {
+        Level::ERROR => 1,
+        Level::WARN => 2,
+        Level::INFO => 3,
+        Level::DEBUG => 4,
+        Level::TRACE => 5,
+    }
+}
+
 fn format_console_line(level: Level, scope: &str, message: &str) -> String {
-    let timestamp = Local::now().format("%H:%M:%S%.3f");
+    let timestamp = Local::now().format("%H:%M:%S");
     let level_text = level_label(level);
-    let (group, source) = console_route(scope);
-    let source_text = truncate(&source, 18);
-    let thread_id = current_thread_id();
+    let source = truncate(&console_source(scope), 28);
     let message = message.replace('\r', "").replace('\n', " | ");
-    let plain = format!(
-        "{}  {:<5}  {:<7}  {:<18} t{:<7} {}\r\n",
-        timestamp,
-        level_text,
-        group,
-        source_text,
-        thread_id,
-        message,
-    );
 
     if !console_supports_ansi() {
-        return plain;
+        return format!("[{timestamp} {level_text}] [{source}]: {message}\r\n");
     }
 
     let level_color = match level {
         Level::ERROR => "\x1b[91m",
         Level::WARN => "\x1b[93m",
-        Level::INFO => "\x1b[92m",
+        Level::INFO => "\x1b[97m",
         Level::DEBUG => "\x1b[96m",
         Level::TRACE => "\x1b[90m",
     };
-    let group_color = match group.as_str() {
-        "MOD" => "\x1b[95m",
-        "XUSER" => "\x1b[94m",
-        "STDIO" => "\x1b[38;5;208m",
-        "NET" => "\x1b[38;5;45m",
-        "SYS" => "\x1b[38;5;75m",
-        _ => "\x1b[97m",
+    let source_color = if scope.starts_with("mod:")
+        || crate::runtime::foundation::mod_diagnostics::find_by_name(scope).is_some()
+    {
+        "\x1b[95m"
+    } else if scope == "xuser-bridge" || scope.starts_with("xuser-") {
+        "\x1b[94m"
+    } else if scope.contains("network") || scope.starts_with("net-") {
+        "\x1b[96m"
+    } else {
+        "\x1b[92m"
     };
+
     format!(
-        "\x1b[90m{}\x1b[0m  {}{:<5}\x1b[0m  {}{:<7}\x1b[0m  \x1b[97m{:<18}\x1b[0m \x1b[90mt{:<7}\x1b[0m {}\r\n",
-        timestamp,
-        level_color,
-        level_text,
-        group_color,
-        group,
-        source_text,
-        thread_id,
-        message,
+        "\x1b[90m[{timestamp} \x1b[0m{level_color}{level_text}\x1b[90m]\x1b[0m {source_color}[{source}]\x1b[0m: {message}\r\n"
     )
 }
 
-fn console_route(scope: &str) -> (String, String) {
+fn console_source(scope: &str) -> String {
     if let Some(name) = scope.strip_prefix("mod:") {
-        return ("MOD".to_string(), name.to_string());
+        return format!("Mod/{name}");
     }
     if scope == "xuser-bridge" || scope.starts_with("xuser-") {
-        return (
-            "XUSER".to_string(),
-            scope.trim_start_matches("xuser-").to_string(),
-        );
+        return "XUser".to_string();
     }
-    if matches!(scope, "native-stdio" | "game-stdio" | "stdio-capture") {
-        return ("STDIO".to_string(), scope.to_string());
+    if scope == "game-stdio" {
+        return "Minecraft".to_string();
+    }
+    if matches!(scope, "native-stdio" | "stdio-capture") {
+        return "StdIO".to_string();
     }
     if scope.contains("network") || scope.starts_with("net-") {
-        return ("NET".to_string(), scope.to_string());
+        return "Network".to_string();
     }
     if matches!(scope, "native-loader" | "preloader" | "runtime-ready") {
-        return ("MOD".to_string(), scope.to_string());
+        return "Loader".to_string();
     }
     if matches!(
         scope,
-        "bootstrap"
+        "loader"
+            | "bootstrap"
             | "identity"
             | "build"
             | "host"
@@ -501,17 +543,12 @@ fn console_route(scope: &str) -> (String, String) {
             | "console"
             | "file-redirection"
     ) {
-        return ("SYS".to_string(), scope.to_string());
+        return "BLoader".to_string();
     }
-
-    // BL Host log() uses the active Mod name as its logging scope. Resolve it
-    // against the runtime Mod registry so SDK/native Mod logs render under MOD
-    // even when they did not come through the stdout/stderr capture pipeline.
     if crate::runtime::foundation::mod_diagnostics::find_by_name(scope).is_some() {
-        return ("MOD".to_string(), scope.to_string());
+        return format!("Mod/{scope}");
     }
-
-    ("BLOADER".to_string(), scope.to_string())
+    format!("BLoader/{scope}")
 }
 
 fn current_thread_id() -> u32 {
