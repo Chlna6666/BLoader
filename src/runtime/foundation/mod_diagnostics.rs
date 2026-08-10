@@ -9,6 +9,8 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 
+use crate::runtime::foundation::file_io_policy;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ModIdentity {
     pub id: String,
@@ -209,7 +211,6 @@ impl Drop for ModScopeGuard {
         }
     }
 }
-
 
 pub fn active_scope_for_thread(thread_id: u32) -> Option<ActiveScopeSnapshot> {
     let scopes = active_scopes().try_lock().ok()?;
@@ -428,6 +429,10 @@ pub fn record_lifecycle(identity: &ModIdentity, phase: &str, detail: &str) {
 }
 
 pub fn write_registry_snapshot() -> std::io::Result<()> {
+    if !file_io_policy::writes_allowed() {
+        return Ok(());
+    }
+
     #[derive(Serialize)]
     struct Snapshot {
         generated_at: String,
