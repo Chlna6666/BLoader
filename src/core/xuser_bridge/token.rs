@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 
 use core::ffi::{c_char, c_void};
 use std::{ffi::CStr, mem, ptr};
@@ -10,7 +10,7 @@ use super::{
         TokenData, TokenHeader, TokenUtf16Data, TokenUtf16Header, XAsyncBlock,
         XAsyncOp, XAsyncProviderData, XUserHandle,
     },
-    session,
+    bridge_debug, bridge_info, bridge_warn, session,
     xasync,
     xuser,
 };
@@ -106,20 +106,57 @@ impl TokenContext {
         utf16: bool,
     ) -> Result<Self, HResult> {
         if !xuser::valid_user(user) {
+            bridge_warn("XUser token/signature 请求被拒绝 | reason=invalid-user-handle");
             return Err(E_INVALIDARG);
         }
         let relying_party = relying_party_for_url(url);
         let runtime = session().ok_or(E_FAIL)?;
-        let token = runtime
-            .token_for_relying_party(relying_party)
-            .ok_or(E_FAIL)?;
+        let token = match runtime.token_for_relying_party(relying_party) {
+            Some(token) => token,
+            None => {
+                bridge_warn(&format!(
+                    "XUser token/signature 请求无法路由 | rp={relying_party} | reason=no-token-for-relying-party"
+                ));
+                return Err(E_FAIL);
+            }
+        };
+        let remaining = token.expires_at.saturating_sub(now_epoch());
         if token.expires_at <= now_epoch().saturating_add(30) {
+            bridge_warn(&format!(
+                "XUser token/signature 请求被拒绝 | rp={relying_party} | token_remaining={}s | reason=token-near-expiry",
+                remaining
+            ));
             return Err(E_FAIL);
         }
         let request_target = request_target_from_url(url).ok_or(E_INVALIDARG)?;
         let policy = signing_policy_for_url(url, &headers);
         let policy_header_values =
             select_policy_header_values(&headers, &policy.extra_header_names);
+
+        let host = url_host(url).unwrap_or_else(|| "<invalid-host>".to_string());
+        let header_names = headers
+            .iter()
+            .map(|header| header.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        bridge_info(&format!(
+            "XUser token/signature request | encoding={} | method={} | host={} | path={} | rp={} | options=validated | header_count={} | header_names=[{}] | body_bytes={} | token_remaining={}s | secrets_logged=false",
+            if utf16 { "utf16" } else { "ansi" },
+            method.to_ascii_uppercase(),
+            host,
+            safe_request_path(&request_target),
+            relying_party,
+            headers.len(),
+            header_names,
+            body.len(),
+            remaining,
+        ));
+        bridge_debug(&format!(
+            "XUser signing policy selected | host={} | max_signed_body_bytes={} | extra_policy_headers={} | authorization=redacted | signature=redacted",
+            host,
+            policy.max_body_bytes,
+            policy.extra_header_names.len(),
+        ));
 
         let authorization_text = Zeroizing::new(format!(
             "XBL3.0 x={};{}",
@@ -160,6 +197,8 @@ impl TokenContext {
             .map(String::as_str)
             .collect::<Vec<_>>();
         let body_to_sign = &self.body[..self.body.len().min(self.max_body_bytes)];
+        let signed_body_bytes = body_to_sign.len();
+        let policy_header_count = policy_header_values.len();
 
         let signature_text = Zeroizing::new(
             session()
@@ -173,6 +212,7 @@ impl TokenContext {
                     body_to_sign,
                 )?,
         );
+        let signature_text_bytes = signature_text.len();
         self.body.zeroize();
         self.body.clear();
         self.policy_header_values.zeroize();
@@ -183,6 +223,15 @@ impl TokenContext {
         self.signature_utf16 = signature_text.encode_utf16().collect();
         self.signature_utf16.push(0);
         self.prepared = true;
+        bridge_debug(&format!(
+            "XUser request signature prepared | encoding={} | method={} | path={} | signed_body_bytes={} | policy_header_count={} | signature_text_bytes={} | signature_body=redacted",
+            if self.utf16 { "utf16" } else { "ansi" },
+            self.method,
+            safe_request_path(&self.request_target),
+            signed_body_bytes,
+            policy_header_count,
+            signature_text_bytes,
+        ));
         Ok(())
     }
 
@@ -246,17 +295,29 @@ unsafe extern "system" fn token_provider(
     }
 
     match operation {
-        XAsyncOp::Begin => unsafe { xasync::schedule(provider_data.async_block, 0) },
+        XAsyncOp::Begin => {
+            bridge_debug("XUser token async provider | op=Begin");
+            unsafe { xasync::schedule(provider_data.async_block, 0) }
+        }
         XAsyncOp::DoWork => {
             let context = unsafe { &mut *context };
             let completion = context
                 .prepare()
                 .and_then(|()| context.required_size().ok_or(E_FAIL));
             match completion {
-                Ok(required_size) => unsafe {
-                    xasync::complete(provider_data.async_block, S_OK, required_size)
-                },
-                Err(error) => unsafe { xasync::complete(provider_data.async_block, error, 0) },
+                Ok(required_size) => {
+                    bridge_debug(&format!(
+                        "XUser token async provider | op=DoWork | result=S_OK | required_bytes={required_size}"
+                    ));
+                    unsafe { xasync::complete(provider_data.async_block, S_OK, required_size) }
+                }
+                Err(error) => {
+                    bridge_warn(&format!(
+                        "XUser token async provider | op=DoWork | result={} | required_bytes=0",
+                        format_hresult(error)
+                    ));
+                    unsafe { xasync::complete(provider_data.async_block, error, 0) }
+                }
             }
             S_OK
         }
@@ -266,6 +327,10 @@ unsafe extern "system" fn token_provider(
                 return E_FAIL;
             };
             if provider_data.buffer.is_null() || provider_data.buffer_size < required_size {
+                bridge_warn(&format!(
+                    "XUser token async provider | op=GetResult | result=E_NOT_SUFFICIENT_BUFFER | provided_bytes={} | required_bytes={required_size}",
+                    provider_data.buffer_size
+                ));
                 return E_NOT_SUFFICIENT_BUFFER;
             }
 
@@ -314,10 +379,19 @@ unsafe extern "system" fn token_provider(
                     });
                 }
             }
+            bridge_debug(&format!(
+                "XUser token async provider | op=GetResult | result=S_OK | encoding={} | output_bytes={} | authorization=redacted | signature=redacted",
+                if context.utf16 { "utf16" } else { "ansi" },
+                required_size,
+            ));
             S_OK
         }
-        XAsyncOp::Cancel => S_OK,
+        XAsyncOp::Cancel => {
+            bridge_debug("XUser token async provider | op=Cancel | result=S_OK");
+            S_OK
+        }
         XAsyncOp::Cleanup => {
+            bridge_debug("XUser token async provider | op=Cleanup");
             unsafe {
                 drop(Box::from_raw(context));
             }
@@ -338,6 +412,7 @@ unsafe fn begin_token_request(
     utf16: bool,
 ) -> HResult {
     if user.is_null() || async_block.is_null() || (body_size != 0 && body.is_null()) {
+        bridge_warn("XUser token/signature 请求参数无效 | result=E_POINTER");
         return E_POINTER;
     }
     if options & !TOKEN_OPTIONS_MASK != 0
@@ -349,6 +424,12 @@ unsafe fn begin_token_request(
         || !url.is_ascii()
         || body_size > MAX_REQUEST_BODY_SIZE
     {
+        bridge_warn(&format!(
+            "XUser token/signature 请求参数校验失败 | method_len={} | url_len={} | body_bytes={} | options=0x{options:08X} | result=E_INVALIDARG",
+            method.len(),
+            url.len(),
+            body_size,
+        ));
         return E_INVALIDARG;
     }
 
@@ -359,7 +440,13 @@ unsafe fn begin_token_request(
     };
     let context = match TokenContext::new(user, method, url, headers, body, utf16) {
         Ok(context) => Box::into_raw(Box::new(context)),
-        Err(error) => return error,
+        Err(error) => {
+            bridge_warn(&format!(
+                "XUser token/signature context 创建失败 | result={}",
+                format_hresult(error)
+            ));
+            return error;
+        }
     };
     let result = unsafe {
         xasync::begin(
@@ -371,9 +458,20 @@ unsafe fn begin_token_request(
         )
     };
     if result < 0 {
+        bridge_warn(&format!(
+            "XUser token/signature async begin 失败 | encoding={} | result={}",
+            if utf16 { "utf16" } else { "ansi" },
+            format_hresult(result)
+        ));
         unsafe {
             drop(Box::from_raw(context));
         }
+    } else {
+        bridge_debug(&format!(
+            "XUser token/signature async begin 成功 | encoding={} | result={}",
+            if utf16 { "utf16" } else { "ansi" },
+            format_hresult(result)
+        ));
     }
     result
 }
@@ -430,7 +528,19 @@ pub unsafe extern "system" fn get_token_and_signature_result_size(
     async_block: *mut XAsyncBlock,
     size: *mut usize,
 ) -> HResult {
-    unsafe { xasync::get_result_size(async_block, size) }
+    let result = unsafe { xasync::get_result_size(async_block, size) };
+    if result < 0 {
+        bridge_warn(&format!(
+            "XUser token/signature result-size 失败 | result={}",
+            format_hresult(result)
+        ));
+    } else if !size.is_null() {
+        bridge_debug(&format!(
+            "XUser token/signature result-size | required_bytes={}",
+            unsafe { *size }
+        ));
+    }
+    result
 }
 
 pub unsafe extern "system" fn get_token_and_signature_result(
@@ -450,6 +560,17 @@ pub unsafe extern "system" fn get_token_and_signature_result(
         unsafe {
             data.write(buffer.cast());
         }
+        bridge_debug(&format!(
+            "XUser token/signature result | encoding=ansi | result={} | buffer_bytes={} | used_bytes={} | authorization=redacted | signature=redacted",
+            format_hresult(result),
+            size,
+            if used.is_null() { 0 } else { unsafe { *used } },
+        ));
+    } else {
+        bridge_warn(&format!(
+            "XUser token/signature result 失败 | encoding=ansi | result={} | buffer_bytes={size}",
+            format_hresult(result)
+        ));
     }
     result
 }
@@ -524,6 +645,17 @@ pub unsafe extern "system" fn get_token_and_signature_utf16_result(
         unsafe {
             data.write(buffer.cast());
         }
+        bridge_debug(&format!(
+            "XUser token/signature result | encoding=utf16 | result={} | buffer_bytes={} | used_bytes={} | authorization=redacted | signature=redacted",
+            format_hresult(result),
+            size,
+            if used.is_null() { 0 } else { unsafe { *used } },
+        ));
+    } else {
+        bridge_warn(&format!(
+            "XUser token/signature result 失败 | encoding=utf16 | result={} | buffer_bytes={size}",
+            format_hresult(result)
+        ));
     }
     result
 }
@@ -639,10 +771,6 @@ fn select_policy_header_values(
 fn signing_policy_for_url(url: &str, headers: &[RequestHeader]) -> SigningPolicy {
     let host = url_host(url).unwrap_or_default();
 
-    // Microsoft XSAPI's default NSAL maps ordinary *.xboxlive.com endpoints,
-    // including userpresence.xboxlive.com, to policy v1 with no ExtraHeaders
-    // and an 8192-byte body limit. Adding contract/content headers to those
-    // signatures would be incorrect even though those headers are sent.
     if host == "device.mgt.xboxlive.com" || host == "data-vef.xboxlive.com" {
         return SigningPolicy::xbox_full_body();
     }
@@ -650,10 +778,6 @@ fn signing_policy_for_url(url: &str, headers: &[RequestHeader]) -> SigningPolicy
         return SigningPolicy::xbox_default();
     }
 
-    // BLoader currently has no title NSAL payload for custom Partner Center
-    // endpoints. Preserve the caller-provided order as a compatibility
-    // fallback instead of silently discarding every header. Transport-derived
-    // and always-signed headers are excluded.
     SigningPolicy::caller_headers(headers)
 }
 
@@ -721,6 +845,24 @@ fn request_target_from_url(url: &str) -> Option<String> {
     } else {
         Some(suffix.to_string())
     }
+}
+
+fn safe_request_path(target: &str) -> String {
+    let path = target.split_once('?').map_or(target, |(path, _)| path);
+    let path = path.split_once('#').map_or(path, |(path, _)| path);
+    let mut value = path
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(256)
+        .collect::<String>();
+    if value.is_empty() {
+        value.push('/');
+    }
+    value
+}
+
+fn format_hresult(result: HResult) -> String {
+    format!("0x{:08X}", result as u32)
 }
 
 unsafe fn utf16_to_string_bounded(value: *const u16, max_units: usize) -> Result<String, HResult> {
@@ -828,5 +970,10 @@ mod tests {
     fn header_validation_rejects_injection() {
         assert_eq!(validate_header("x-test", "ok\r\nbad"), Err(E_INVALIDARG));
         assert_eq!(validate_header("bad header", "ok"), Err(E_INVALIDARG));
+    }
+
+    #[test]
+    fn log_path_drops_query_parameters() {
+        assert_eq!(safe_request_path("/path/to/resource?secret=value"), "/path/to/resource");
     }
 }
