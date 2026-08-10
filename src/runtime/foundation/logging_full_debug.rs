@@ -6,7 +6,7 @@ pub use inner::{
     emergency_error_message, emergency_info_message, emergency_warn_message, error_message,
     info_message, is_ready, replay_console_message, scoped_debug_message, scoped_error_message,
     scoped_info_message, scoped_trace_message, scoped_warn_message, set_console_handle,
-    startup_banner, trace_message, warn_message, write_bootstrap_marker,
+    set_console_stream_handle, startup_banner, trace_message, warn_message, write_bootstrap_marker,
 };
 
 pub fn init(configured_level: &str) {
