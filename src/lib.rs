@@ -22,41 +22,23 @@ pub use crate::bl::host::{bl_i18n_current_locale, bl_i18n_tr, bl_register_mod_la
 pub use crate::core::d3d12_queue::bl_register_d3d12_render_callback;
 
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_camera_zoom_set_enabled(_enabled: bool) -> bool {
-    false
-}
+pub extern "system" fn bl_camera_zoom_set_enabled(_enabled: bool) -> bool { false }
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_camera_zoom_set_percent(_percent: u32) -> bool {
-    false
-}
+pub extern "system" fn bl_camera_zoom_set_percent(_percent: u32) -> bool { false }
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_camera_zoom_get_enabled() -> bool {
-    false
-}
+pub extern "system" fn bl_camera_zoom_get_enabled() -> bool { false }
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_camera_zoom_get_percent() -> u32 {
-    0
-}
+pub extern "system" fn bl_camera_zoom_get_percent() -> u32 { 0 }
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_gamma_set_enabled(_enabled: bool) -> bool {
-    false
-}
+pub extern "system" fn bl_gamma_set_enabled(_enabled: bool) -> bool { false }
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_gamma_set_value(_value: f32) -> bool {
-    false
-}
+pub extern "system" fn bl_gamma_set_value(_value: f32) -> bool { false }
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_gamma_get_enabled() -> bool {
-    false
-}
+pub extern "system" fn bl_gamma_get_enabled() -> bool { false }
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_gamma_get_value() -> f32 {
-    1.0
-}
+pub extern "system" fn bl_gamma_get_value() -> f32 { 1.0 }
 #[unsafe(no_mangle)]
-pub extern "system" fn bl_render3d_ready() -> bool {
-    false
-}
+pub extern "system" fn bl_render3d_ready() -> bool { false }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn bl_render3d_line(
@@ -72,9 +54,7 @@ pub extern "system" fn bl_render3d_line(
     _g: f32,
     _b: f32,
     _a: f32,
-) -> bool {
-    false
-}
+) -> bool { false }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DllMain(
@@ -88,11 +68,6 @@ pub unsafe extern "system" fn DllMain(
             utils::set_loader_module_handle(hinstance.0 as usize);
             runtime::foundation::crash_report::install_early();
 
-            // BMCBL adds BLoader.dll to Minecraft's PE import table. Windows
-            // documents lpvReserved != NULL for this static process-start load.
-            // DllMain only arms the OEP gate; all immediate Mod/preload loading
-            // is executed later on Minecraft's own startup thread after the
-            // loader lock has been released.
             let static_process_attach = !reserved.is_null();
             let gate_armed = core::pre_main_gate::install_for_process_start(static_process_attach);
             runtime::foundation::logging::write_bootstrap_marker(&format!(
@@ -103,20 +78,13 @@ pub unsafe extern "system" fn DllMain(
             let runtime_kind = runtime::foundation::runtime_environment::prime_detection();
             runtime::foundation::logging::write_bootstrap_marker(&format!(
                 "runtime.environment.early kind={} wine={}",
-                runtime_kind.as_str(),
-                runtime_kind.is_wine(),
+                runtime_kind.as_str(), runtime_kind.is_wine(),
             ));
             runtime::foundation::logging::write_bootstrap_marker(&format!(
                 "bloader.build version={} profile={} xuser_bridge=embedded protocol=1",
                 runtime::foundation::build_info::VERSION,
                 runtime::foundation::build_info::PROFILE,
             ));
-
-            // Never load xgameruntime.dll or install MinHook while DllMain owns
-            // the Windows loader lock. The OEP gate guarantees a pre-main phase
-            // after DllMain returns, so the XUser bridge can still be ready before
-            // Minecraft executes its first instruction without violating loader-lock
-            // constraints.
             runtime::foundation::logging::write_bootstrap_marker(
                 "dllmain.xuser_bridge.deferred target=premain-after-loader-lock",
             );
@@ -126,17 +94,11 @@ pub unsafe extern "system" fn DllMain(
                     "dllmain.bootstrap.deferred target=minecraft-startup-thread-oep",
                 );
             } else if static_process_attach {
-                // A static BMCBL launch without a working OEP gate would recreate
-                // the exact startup race this mode is intended to remove. Fail
-                // closed instead of silently falling back to a concurrent worker.
                 runtime::foundation::logging::write_bootstrap_marker(
                     "dllmain.bootstrap.fatal reason=static-attach-premain-gate-unavailable",
                 );
                 return 0;
             } else {
-                // Late/dynamic injection cannot provide true pre-main semantics
-                // because Minecraft may already have passed its OEP. Keep the
-                // legacy worker only as a compatibility path for that case.
                 runtime::foundation::logging::write_bootstrap_marker(
                     "dllmain.bootstrap.fallback target=bloader-late-attach reason=no-static-oep-gate",
                 );
@@ -145,11 +107,9 @@ pub unsafe extern "system" fn DllMain(
                     .spawn(run_bootstrap_late_attach)
                 {
                     Ok(_) => logging::write_bootstrap_marker("bootstrap.late_attach.spawn.ok"),
-                    Err(error) => {
-                        logging::write_bootstrap_marker(&format!(
-                            "bootstrap.late_attach.spawn.failed error={error}"
-                        ));
-                    }
+                    Err(error) => logging::write_bootstrap_marker(&format!(
+                        "bootstrap.late_attach.spawn.failed error={error}"
+                    )),
                 }
             }
         }
@@ -161,11 +121,6 @@ pub unsafe extern "system" fn DllMain(
     1
 }
 
-/// Invoked directly by the OEP VEH on Minecraft's original startup thread.
-///
-/// At this point BLoader's DllMain has already returned and the Windows loader
-/// lock is no longer held. The entire immediate startup/loading chain therefore
-/// runs serially on the same thread that will later execute Minecraft's OEP.
 pub(crate) fn run_bootstrap_on_startup_thread() -> bool {
     runtime::foundation::logging::write_bootstrap_marker(
         "bootstrap.inline.start execution=minecraft-startup-thread",
@@ -177,9 +132,6 @@ fn run_bootstrap_late_attach() {
     runtime::foundation::logging::write_bootstrap_marker(
         "bootstrap.thread.start execution=late-attach-worker",
     );
-    // A late attachment occurs after Minecraft may already have crossed its OEP.
-    // Treat the host process as released so delayed Mods can use the same
-    // non-graphics readiness state machine as the static PE-import path.
     core::runtime_ready::mark_oep_released("late-attach");
     let _ = run_bootstrap_sequence("late-attach-worker");
 }
@@ -195,8 +147,7 @@ fn run_bootstrap_sequence(execution_mode: &'static str) -> bool {
 
     runtime::foundation::crash_report::install();
 
-    let premain_result =
-        panic::catch_unwind(|| unsafe { prepare_premain_preloads(execution_mode) });
+    let premain_result = panic::catch_unwind(|| unsafe { prepare_premain_preloads(execution_mode) });
     let (preloader_summary, loaded_summary) = match premain_result {
         Ok(summary) => summary,
         Err(panic_payload) => {
@@ -234,9 +185,6 @@ unsafe fn prepare_premain_preloads(
         "bootstrap.preloader.premain.begin phase={execution_mode}"
     ));
 
-    // Strict static-start path: this synchronous LoadLibrary executes on the
-    // Minecraft startup thread itself. There is no separate BLoader bootstrap
-    // worker racing the host thread while PreLoader/LeviLamina initializes.
     let preloader_summary = core::preloader_proxy::try_load(&game_dir);
     runtime::foundation::logging::write_bootstrap_marker(&format!(
         "bootstrap.preloader.premain.done discovered={} state={:?} execution={execution_mode}",
@@ -299,19 +247,12 @@ unsafe fn bootstrap(
         schedule_post_oep_runtime_io(config.enable_debug_console);
     } else {
         if config.enable_debug_console {
-            unsafe {
-                core::console::init_console();
-            }
+            unsafe { core::console::init_console(); }
             runtime::foundation::logging::write_bootstrap_marker("bootstrap.console.ready");
         }
-        // Late attachment happens after the host CRT has already initialized, so
-        // process-wide stdio capture may be installed immediately in that mode.
         runtime::foundation::native_stdio::install_process_capture();
     }
 
-    // Replay any diagnostics captured before tracing became available. In the
-    // static PE-import path the process-wide CRT/stdout rebinding itself is
-    // intentionally deferred until after Minecraft's OEP has started.
     runtime::foundation::native_stdio::flush_pending();
     core::xuser_bridge::publish_pending_logs();
     setup_panic_hook();
@@ -329,17 +270,11 @@ unsafe fn bootstrap(
 
     let current_locale = runtime::foundation::i18n::current_locale();
     logging::startup_banner(
-        PKG_NAME,
-        VERSION,
-        application_name,
-        &application_version,
-        &current_locale,
+        PKG_NAME, VERSION, application_name, &application_version, &current_locale,
     );
     logging::info_message(&format!(
         "Host application: {} v{} | {}",
-        application_name,
-        application_version,
-        application_path.display()
+        application_name, application_version, application_path.display()
     ));
     logging::info_message(
         "Runtime profile: lightweight | panel=off | ArcUI=not-compiled | symbols=not-compiled | i18n=embedded",
@@ -350,24 +285,18 @@ unsafe fn bootstrap(
     );
 
     match preloader_summary.state {
-        core::preloader_proxy::PreloaderProxyState::Loaded => {
-            logging::scoped_info_message(
-                "preloader",
-                "PreLoader and its delegated preload chain completed synchronously before Minecraft OEP execution.",
-            );
-        }
-        core::preloader_proxy::PreloaderProxyState::Failed => {
-            logging::scoped_warn_message(
-                "preloader",
-                "Priority PreLoader failed; BLoader completed the legacy native preload fallback before Minecraft OEP execution.",
-            );
-        }
-        core::preloader_proxy::PreloaderProxyState::NotFound => {
-            logging::scoped_debug_message(
-                "preloader",
-                "No type=preload PreLoader.dll package was found; legacy native preloads were handled before Minecraft OEP execution.",
-            );
-        }
+        core::preloader_proxy::PreloaderProxyState::Loaded => logging::scoped_info_message(
+            "preloader",
+            "PreLoader and its delegated preload chain completed synchronously before Minecraft OEP execution.",
+        ),
+        core::preloader_proxy::PreloaderProxyState::Failed => logging::scoped_warn_message(
+            "preloader",
+            "Priority PreLoader failed; BLoader completed the legacy native preload fallback before Minecraft OEP execution.",
+        ),
+        core::preloader_proxy::PreloaderProxyState::NotFound => logging::scoped_debug_message(
+            "preloader",
+            "No type=preload PreLoader.dll package was found; legacy native preloads were handled before Minecraft OEP execution.",
+        ),
     }
 
     logging::scoped_info_message(
@@ -402,8 +331,7 @@ unsafe fn bootstrap(
             .name("bloader-native-load-error".to_string())
             .spawn(move || {
                 runtime::foundation::error_dialog::show_native_load_error(
-                    "BLoader Native Module Load Failed",
-                    &message,
+                    "BLoader Native Module Load Failed", &message,
                 );
             });
     } else if let Some(message) = native_load_success_message {
@@ -411,8 +339,7 @@ unsafe fn bootstrap(
             .name("bloader-native-load-success".to_string())
             .spawn(move || {
                 runtime::foundation::error_dialog::show_native_load_success(
-                    "BLoader Native Module Loaded",
-                    &message,
+                    "BLoader Native Module Loaded", &message,
                 );
             });
     }
@@ -424,9 +351,7 @@ unsafe fn bootstrap(
 
     logging::info_message(&format!(
         "{} v{} initialized. {}",
-        PKG_NAME,
-        VERSION,
-        runtime::foundation::i18n::tr("bootstrap.start")
+        PKG_NAME, VERSION, runtime::foundation::i18n::tr("bootstrap.start")
     ));
     logging::info_message(&format!(
         "Locale={} | {}",
@@ -434,7 +359,14 @@ unsafe fn bootstrap(
         runtime::foundation::i18n::tr("ui.pipeline.external")
     ));
 
-    core::file_redirection::install(&config, &game_dir);
+    if runtime::foundation::file_io_policy::writes_allowed() {
+        core::file_redirection::install(&config, &game_dir);
+    } else {
+        logging::scoped_info_message(
+            "file-redirection",
+            "Legacy UWP read-only mode: file redirection hooks are disabled to prevent target directory/file creation.",
+        );
+    }
     core::network_hook::install(&config);
 
     runtime::foundation::logging::write_bootstrap_marker(
@@ -490,15 +422,11 @@ fn schedule_post_oep_runtime_io(enable_debug_console: bool) {
             core::runtime_ready::wait_until_oep_delay(POST_OEP_RUNTIME_IO_DELAY_MS);
 
             if enable_debug_console {
-                unsafe {
-                    core::console::init_console();
-                }
+                unsafe { core::console::init_console(); }
                 runtime::foundation::logging::write_bootstrap_marker("post-oep.console.ready");
             }
 
-            unsafe {
-                runtime::foundation::native_stdio::install_process_capture();
-            }
+            unsafe { runtime::foundation::native_stdio::install_process_capture(); }
             runtime::foundation::native_stdio::flush_pending();
             runtime::foundation::logging::write_bootstrap_marker(&format!(
                 "post-oep.runtime_io.ready delay_ms={} console={} stdio=process-crt",
