@@ -12,6 +12,6 @@ pub use inner::{
 pub fn init(_configured_level: &str) {
     inner::init("debug");
     inner::write_bootstrap_marker(
-        "logging.validation.full-debug configured_level=ignored effective_level=debug sinks=latest+archive+console+OutputDebugString",
+        "logging.validation.full-debug configured_level=ignored effective_level=debug sinks=policy-selected",
     );
 }
