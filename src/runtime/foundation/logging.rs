@@ -2,7 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use chrono::Local;
 use tracing::{Level, debug, error, info, trace, warn};
@@ -20,7 +20,7 @@ use windows::Win32::System::Console::{
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 
-use crate::runtime::foundation::{build_info, file_io_policy};
+use crate::runtime::foundation::file_io_policy;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -34,6 +34,7 @@ unsafe impl Send for SendHandle {}
 unsafe impl Sync for SendHandle {}
 
 static CONSOLE_HANDLE: OnceLock<SendHandle> = OnceLock::new();
+static CONSOLE_FORCE_ANSI: AtomicBool = AtomicBool::new(false);
 static LOGGING_READY: OnceLock<()> = OnceLock::new();
 static LATEST_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 static ARCHIVE_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -42,7 +43,6 @@ static LATEST_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 static ARCHIVE_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
 // 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, 5=TRACE.
-// Persistent logs are intentionally independent from this console threshold.
 static CONSOLE_LEVEL: AtomicU8 = AtomicU8::new(3);
 
 pub fn set_console_level(level: &str) {
@@ -257,57 +257,27 @@ fn sanitize_file_component(value: &str) -> String {
 }
 
 pub fn set_console_handle(handle: HANDLE) {
-    let first_attach = CONSOLE_HANDLE.set(SendHandle(handle)).is_ok();
+    let _ = CONSOLE_HANDLE.set(SendHandle(handle));
+    CONSOLE_FORCE_ANSI.store(false, Ordering::Release);
     enable_console_ansi(handle);
-    if first_attach {
-        write_console_banner();
-    }
     write_bootstrap_marker(&format!(
-        "logging.console.ready handle=0x{:X} ansi={} layout=java-server-v1",
+        "logging.console.ready handle=0x{:X} ansi={} banner_owner=console-branding",
         handle.0 as usize,
         console_supports_ansi(),
     ));
 }
 
-fn write_console_banner() {
-    let host_version = file_io_policy::host_version().unwrap_or("unknown");
-    let mode = file_io_policy::mode_label();
-    let debug_destination = if file_io_policy::writes_allowed() {
-        "logs/latest.log"
-    } else {
-        "OutputDebugString (legacy UWP no-write)"
-    };
-    let art = [
-        r" ____  _                    _           ",
-        r"| __ )| |    ___   __ _  __| | ___ _ __",
-        r"|  _ \| |   / _ \ / _` |/ _` |/ _ \ '__|",
-        r"| |_) | |__| (_) | (_| | (_| |  __/ |   ",
-        r"|____/|_____\___/ \__,_|\__,_|\___|_|   ",
-    ];
-
-    write_bytes_to_console(b"\r\n");
-    for line in art {
-        if console_supports_ansi() {
-            write_bytes_to_console(format!("\x1b[96m{line}\x1b[0m\r\n").as_bytes());
-        } else {
-            write_bytes_to_console(format!("{line}\r\n").as_bytes());
-        }
-    }
-
-    let metadata = [
-        format!(
-            "  BLoader v{}  |  Minecraft {}  |  {}",
-            build_info::VERSION,
-            host_version,
-            build_info::LICENSE,
-        ),
-        format!("  Minecraft Bedrock Mod Loader  |  file_io={mode}"),
-        format!("  Full debug: {debug_destination}"),
-        String::new(),
-    ];
-    for line in metadata {
-        write_bytes_to_console(format!("{line}\r\n").as_bytes());
-    }
+/// Installs a non-console stream (for example a Windows Terminal named-pipe
+/// mirror) as the interactive output sink. ANSI is forced because GetConsoleMode
+/// is not defined for pipe handles.
+pub fn set_console_stream_handle(handle: HANDLE, ansi: bool) {
+    let _ = CONSOLE_HANDLE.set(SendHandle(handle));
+    CONSOLE_FORCE_ANSI.store(ansi, Ordering::Release);
+    write_bootstrap_marker(&format!(
+        "logging.console.stream.ready handle=0x{:X} ansi={} banner_owner=console-branding",
+        handle.0 as usize,
+        ansi,
+    ));
 }
 
 pub fn startup_banner(
@@ -452,16 +422,22 @@ fn console_should_show(level: Level, scope: &str, message: &str) -> bool {
         return false;
     }
 
-    // Per-request XUser signing telemetry is intentionally kept in the complete
-    // debug log at normal INFO console verbosity. The console only needs state
-    // transitions and failures, matching the signal density of Java servers.
+    if level == Level::INFO && scope == "xuser-bridge" {
+        if message.starts_with("XUser token/signature request")
+            || message.starts_with("BMCBL XUser pipe payload")
+            || message.starts_with("early XUser diagnostics replay complete")
+        {
+            return CONSOLE_LEVEL.load(Ordering::Acquire) >= 4;
+        }
+    }
+
     if level == Level::INFO
-        && scope == "xuser-bridge"
-        && (message.starts_with("XUser token/signature request")
-            || message.starts_with("BMCBL XUser pipe payload"))
+        && matches!(scope, "native-stdio" | "stdio-capture")
+        && message.starts_with("process stdio capture installed")
     {
         return CONSOLE_LEVEL.load(Ordering::Acquire) >= 4;
     }
+
     true
 }
 
@@ -486,27 +462,41 @@ fn format_console_line(level: Level, scope: &str, message: &str) -> String {
     }
 
     let level_color = match level {
-        Level::ERROR => "\x1b[91m",
-        Level::WARN => "\x1b[93m",
-        Level::INFO => "\x1b[97m",
-        Level::DEBUG => "\x1b[96m",
-        Level::TRACE => "\x1b[90m",
+        Level::ERROR => "\x1b[38;2;255;92;92m",
+        Level::WARN => "\x1b[38;2;255;196;87m",
+        Level::INFO => "\x1b[38;2;220;224;230m",
+        Level::DEBUG => "\x1b[38;2;112;183;255m",
+        Level::TRACE => "\x1b[38;2;128;134;145m",
     };
-    let source_color = if scope.starts_with("mod:")
-        || crate::runtime::foundation::mod_diagnostics::find_by_name(scope).is_some()
-    {
-        "\x1b[95m"
-    } else if scope == "xuser-bridge" || scope.starts_with("xuser-") {
-        "\x1b[94m"
-    } else if scope.contains("network") || scope.starts_with("net-") {
-        "\x1b[96m"
-    } else {
-        "\x1b[92m"
-    };
+    let source_color = source_color(scope, &source);
 
     format!(
-        "\x1b[90m[{timestamp} \x1b[0m{level_color}{level_text}\x1b[90m]\x1b[0m {source_color}[{source}]\x1b[0m: {message}\r\n"
+        "\x1b[38;2;120;126;136m[{timestamp} \x1b[0m{level_color}{level_text}\x1b[38;2;120;126;136m]\x1b[0m {source_color}[{source}]\x1b[0m: \x1b[38;2;220;224;230m{message}\x1b[0m\r\n"
     )
+}
+
+fn source_color(scope: &str, source: &str) -> &'static str {
+    if source == "BLoader" {
+        "\x1b[38;2;93;210;220m"
+    } else if source == "Minecraft" {
+        "\x1b[38;2;116;201;120m"
+    } else if source == "XUser" {
+        "\x1b[38;2;99;165;255m"
+    } else if source == "PreLoader" {
+        "\x1b[38;2;239;184;86m"
+    } else if source == "Proxy" {
+        "\x1b[38;2;190;135;255m"
+    } else if source == "StdIO" {
+        "\x1b[38;2;150;155;165m"
+    } else if source == "Network" {
+        "\x1b[38;2;86;205;210m"
+    } else if scope.starts_with("mod:")
+        || crate::runtime::foundation::mod_diagnostics::find_by_name(scope).is_some()
+    {
+        "\x1b[38;2;218;143;255m"
+    } else {
+        "\x1b[38;2;166;173;186m"
+    }
 }
 
 fn console_source(scope: &str) -> String {
@@ -516,17 +506,23 @@ fn console_source(scope: &str) -> String {
     if scope == "xuser-bridge" || scope.starts_with("xuser-") {
         return "XUser".to_string();
     }
-    if scope == "game-stdio" {
+    if matches!(scope, "game-stdio" | "minecraft") {
         return "Minecraft".to_string();
     }
     if matches!(scope, "native-stdio" | "stdio-capture") {
         return "StdIO".to_string();
     }
+    if scope == "preloader" {
+        return "PreLoader".to_string();
+    }
+    if scope == "proxy" {
+        return "Proxy".to_string();
+    }
     if scope.contains("network") || scope.starts_with("net-") {
         return "Network".to_string();
     }
-    if matches!(scope, "native-loader" | "preloader" | "runtime-ready") {
-        return "Loader".to_string();
+    if matches!(scope, "native-loader" | "runtime-ready") {
+        return "BLoader".to_string();
     }
     if matches!(
         scope,
@@ -542,6 +538,7 @@ fn console_source(scope: &str) -> String {
             | "compat"
             | "console"
             | "file-redirection"
+            | "premain-gate"
     ) {
         return "BLoader".to_string();
     }
@@ -644,6 +641,9 @@ fn write_bytes_to_console(bytes: &[u8]) {
 }
 
 fn console_supports_ansi() -> bool {
+    if CONSOLE_FORCE_ANSI.load(Ordering::Acquire) {
+        return true;
+    }
     let Some(handle) = CONSOLE_HANDLE.get().map(|value| value.0) else {
         return false;
     };
