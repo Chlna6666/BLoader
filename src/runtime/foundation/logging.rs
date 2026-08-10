@@ -19,6 +19,8 @@ use windows::Win32::System::Console::{
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 
+use crate::runtime::foundation::file_io_policy;
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn OutputDebugStringW(output: *const u16);
@@ -43,11 +45,31 @@ pub fn init(level: &str) {
         return;
     }
 
-    let latest_log_path = latest_log_path();
-    let archive_log_path = archive_log_path();
-    write_bootstrap_marker("logging.init.start");
+    write_bootstrap_marker(&format!(
+        "logging.init.start mode={} host_version={}",
+        file_io_policy::mode_label(),
+        file_io_policy::host_version().unwrap_or("unknown")
+    ));
 
     let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
+
+    if file_io_policy::legacy_uwp_no_write() {
+        match tracing_subscriber::registry().with(filter).try_init() {
+            Ok(()) => write_bootstrap_marker("logging.tracing.init.ok sink=fileless"),
+            Err(error) => write_bootstrap_marker(&format!(
+                "logging.tracing.init.failed sink=fileless error={error}"
+            )),
+        }
+        let _ = LOGGING_READY.set(());
+        write_bootstrap_marker(&format!(
+            "logging.init.ready level={level} mode={} sinks=console+OutputDebugString",
+            file_io_policy::mode_label()
+        ));
+        return;
+    }
+
+    let latest_log_path = latest_log_path();
+    let archive_log_path = archive_log_path();
     let latest_dir = latest_log_path
         .parent()
         .map(PathBuf::from)
@@ -92,12 +114,17 @@ pub fn init(level: &str) {
         .with(archive_file_layer)
         .try_init()
     {
-        Ok(()) => write_bootstrap_marker("logging.tracing.init.ok"),
-        Err(error) => write_bootstrap_marker(&format!("logging.tracing.init.failed {error}")),
+        Ok(()) => write_bootstrap_marker("logging.tracing.init.ok sink=files"),
+        Err(error) => write_bootstrap_marker(&format!(
+            "logging.tracing.init.failed sink=files error={error}"
+        )),
     }
 
     let _ = LOGGING_READY.set(());
-    write_bootstrap_marker(&format!("logging.init.ready level={level}"));
+    write_bootstrap_marker(&format!(
+        "logging.init.ready level={level} mode={} sinks=latest+archive+console+OutputDebugString",
+        file_io_policy::mode_label()
+    ));
 }
 
 pub fn is_ready() -> bool {
@@ -122,6 +149,10 @@ pub fn captured_process_output(stream: &str, message: &str) {
 }
 
 fn append_mod_log(mod_name: &str, mod_id: &str, stream: &str, message: &str) {
+    if !file_io_policy::writes_allowed() {
+        return;
+    }
+
     let dir = PathBuf::from("logs").join("mods");
     let _ = fs::create_dir_all(&dir);
     let file_name = format!(
@@ -177,12 +208,13 @@ pub fn startup_banner(
         Level::INFO,
         "bootstrap",
         &format!(
-            "{} v{} | host={} v{} | locale={} | crash=VEH+SEH | stdio=global",
+            "{} v{} | host={} v{} | locale={} | crash=VEH+SEH | stdio=global | file_io={}",
             loader_name,
             loader_version,
             application_name,
             application_version,
             locale,
+            file_io_policy::mode_label(),
         ),
     );
 }
@@ -387,6 +419,10 @@ fn prepare_archive_log_path() -> PathBuf {
 }
 
 fn write_bytes_to_bootstrap_file(bytes: &[u8]) {
+    if !file_io_policy::writes_allowed() {
+        return;
+    }
+
     for path in [latest_log_path(), archive_log_path()] {
         if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
             let _ = file.write_all(bytes);
