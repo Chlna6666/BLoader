@@ -9,7 +9,7 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 
-use crate::runtime::foundation::file_io_policy;
+use crate::runtime::foundation::{file_io_policy, logging};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ModIdentity {
@@ -73,10 +73,14 @@ fn active_scopes() -> &'static Mutex<Vec<ActiveScope>> {
 
 pub fn default_aliases(id: &str, name: &str, dll_path: &Path, extra: &[String]) -> Vec<String> {
     let mut aliases = Vec::new();
-    for value in [Some(id), Some(name), dll_path.file_stem().and_then(|value| value.to_str())]
-        .into_iter()
-        .flatten()
-        .chain(extra.iter().map(String::as_str))
+    for value in [
+        Some(id),
+        Some(name),
+        dll_path.file_stem().and_then(|value| value.to_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(extra.iter().map(String::as_str))
     {
         let normalized = value.trim();
         if normalized.is_empty()
@@ -297,9 +301,10 @@ pub fn resolve_output_owner(line: &str) -> Option<ModIdentity> {
     let mut candidates = registry
         .iter()
         .filter(|identity| {
-            identity.aliases.iter().any(|alias| {
-                alias.len() >= 4 && lower.contains(&alias.to_ascii_lowercase())
-            })
+            identity
+                .aliases
+                .iter()
+                .any(|alias| alias.len() >= 4 && lower.contains(&alias.to_ascii_lowercase()))
         })
         .cloned();
     let first = candidates.next()?;
@@ -421,10 +426,31 @@ pub fn record_lifecycle(identity: &ModIdentity, phase: &str, detail: &str) {
         phase: phase.to_string(),
         detail: detail.to_string(),
     };
+    let sequence = event.sequence;
     let mut queue = events().lock().unwrap_or_else(|error| error.into_inner());
     queue.push_back(event);
     while queue.len() > 256 {
         queue.pop_front();
+    }
+    drop(queue);
+
+    let scope = format!("mod:{}", identity.name);
+    let message = format!(
+        "lifecycle#{sequence} | id={} | version={} | kind={} | phase={} | state={} | {}",
+        identity.id,
+        identity.version.as_deref().unwrap_or("unknown"),
+        identity.kind,
+        phase,
+        identity.state,
+        detail,
+    );
+    match phase {
+        "load_success" => logging::scoped_info_message(&scope, &message),
+        "load_failed" | "crash" | "stdio_capture_failed" => {
+            logging::scoped_error_message(&scope, &message)
+        }
+        "scope_enter" | "scope_exit" => logging::scoped_trace_message(&scope, &message),
+        _ => logging::scoped_debug_message(&scope, &message),
     }
 }
 
@@ -481,5 +507,6 @@ fn canonical_text(path: &Path) -> String {
 }
 
 fn paths_equal_text(left: &str, right: &str) -> bool {
-    left.replace('/', "\\").eq_ignore_ascii_case(&right.replace('/', "\\"))
+    left.replace('/', "\\")
+        .eq_ignore_ascii_case(&right.replace('/', "\\"))
 }
