@@ -131,7 +131,9 @@ pub fn init(level: &str) {
         .with(archive_file_layer)
         .try_init()
     {
-        Ok(()) => write_bootstrap_marker("logging.tracing.init.ok sink=files metadata=target+thread+file+line"),
+        Ok(()) => write_bootstrap_marker(
+            "logging.tracing.init.ok sink=files metadata=target+thread+file+line",
+        ),
         Err(error) => write_bootstrap_marker(&format!(
             "logging.tracing.init.failed sink=files error={error}"
         )),
@@ -152,10 +154,11 @@ pub fn is_ready() -> bool {
 }
 
 pub fn captured_mod_output(mod_name: &str, mod_id: &str, stream: &str, message: &str) {
+    let scope = format!("mod:{mod_name}");
     log_message(
         Level::INFO,
-        mod_name,
-        &format!("{stream} | {message}"),
+        &scope,
+        &format!("{stream}> {message}"),
     );
     append_mod_log(mod_name, mod_id, stream, message);
 }
@@ -163,8 +166,8 @@ pub fn captured_mod_output(mod_name: &str, mod_id: &str, stream: &str, message: 
 pub fn captured_process_output(stream: &str, message: &str) {
     log_message(
         Level::INFO,
-        "native-stdio",
-        &format!("{stream} | {message}"),
+        "game-stdio",
+        &format!("{stream}> {message}"),
     );
 }
 
@@ -213,13 +216,47 @@ fn sanitize_file_component(value: &str) -> String {
 }
 
 pub fn set_console_handle(handle: HANDLE) {
-    let _ = CONSOLE_HANDLE.set(SendHandle(handle));
+    let first_attach = CONSOLE_HANDLE.set(SendHandle(handle)).is_ok();
     enable_console_ansi(handle);
+    if first_attach {
+        write_console_banner();
+    }
     write_bootstrap_marker(&format!(
-        "logging.console.ready handle=0x{:X} ansi={}",
+        "logging.console.ready handle=0x{:X} ansi={} layout=structured-v2",
         handle.0 as usize,
         console_supports_ansi(),
     ));
+}
+
+fn write_console_banner() {
+    let host_version = file_io_policy::host_version().unwrap_or("unknown");
+    let mode = file_io_policy::mode_label();
+    let width = 78usize;
+    let rule = "=".repeat(width);
+    let lines = [
+        rule.clone(),
+        format!(
+            " BLoader {:<10} Minecraft {:<16} {}",
+            format!("v{}", build_info::VERSION),
+            format!("v{host_version}"),
+            build_info::LICENSE,
+        ),
+        format!(
+            " Runtime Console | DEBUG diagnostics | file_io={} | secrets=redacted",
+            mode
+        ),
+        format!(" Repository: {}", build_info::REPOSITORY),
+        rule,
+        " TIME         LEVEL  GROUP    SOURCE             THREAD     MESSAGE".to_string(),
+        " -----------------------------------------------------------------------------".to_string(),
+    ];
+    for line in lines {
+        if console_supports_ansi() {
+            write_bytes_to_console(format!("\x1b[38;5;75m{line}\x1b[0m\r\n").as_bytes());
+        } else {
+            write_bytes_to_console(format!("{line}\r\n").as_bytes());
+        }
+    }
 }
 
 pub fn startup_banner(
@@ -310,14 +347,7 @@ pub fn write_bootstrap_marker(message: &str) {
     write_debug_string(&file_line);
 
     if CONSOLE_HANDLE.get().is_some() {
-        let console_line = format!(
-            "{} {:<5} {:<18} [tid={}] {}\r\n",
-            Local::now().format("%H:%M:%S%.3f"),
-            "BOOT",
-            "bootstrap",
-            current_thread_id(),
-            message
-        );
+        let console_line = format_console_line(Level::DEBUG, "bootstrap", message);
         write_bytes_to_console(console_line.as_bytes());
     }
 }
@@ -372,37 +402,84 @@ fn mirror_message(level: Level, scope: &str, message: &str) {
 fn format_console_line(level: Level, scope: &str, message: &str) -> String {
     let timestamp = Local::now().format("%H:%M:%S%.3f");
     let level_text = level_label(level);
-    let scope_text = truncate(scope, 18);
+    let (group, source) = console_route(scope);
+    let source_text = truncate(&source, 18);
     let thread_id = current_thread_id();
+    let message = message.replace('\r', "").replace('\n', " | ");
     let plain = format!(
-        "{} {:<5} {:<18} [tid={}] {}\r\n",
+        "{}  {:<5}  {:<7}  {:<18} t{:<7} {}\r\n",
         timestamp,
         level_text,
-        scope_text,
+        group,
+        source_text,
         thread_id,
-        message.replace('\r', "").replace('\n', " | ")
+        message,
     );
 
     if !console_supports_ansi() {
         return plain;
     }
 
-    let color = match level {
+    let level_color = match level {
         Level::ERROR => "\x1b[91m",
         Level::WARN => "\x1b[93m",
         Level::INFO => "\x1b[92m",
         Level::DEBUG => "\x1b[96m",
         Level::TRACE => "\x1b[90m",
     };
+    let group_color = match group.as_str() {
+        "MOD" => "\x1b[95m",
+        "XUSER" => "\x1b[94m",
+        "STDIO" => "\x1b[38;5;208m",
+        "NET" => "\x1b[38;5;45m",
+        "SYS" => "\x1b[38;5;75m",
+        _ => "\x1b[97m",
+    };
     format!(
-        "\x1b[90m{}\x1b[0m {}{:<5}\x1b[0m \x1b[38;5;75m{:<18}\x1b[0m \x1b[90m[tid={}]\x1b[0m {}\r\n",
+        "\x1b[90m{}\x1b[0m  {}{:<5}\x1b[0m  {}{:<7}\x1b[0m  \x1b[97m{:<18}\x1b[0m \x1b[90mt{:<7}\x1b[0m {}\r\n",
         timestamp,
-        color,
+        level_color,
         level_text,
-        scope_text,
+        group_color,
+        group,
+        source_text,
         thread_id,
-        message.replace('\r', "").replace('\n', " | ")
+        message,
     )
+}
+
+fn console_route(scope: &str) -> (String, String) {
+    if let Some(name) = scope.strip_prefix("mod:") {
+        return ("MOD".to_string(), name.to_string());
+    }
+    if scope == "xuser-bridge" || scope.starts_with("xuser-") {
+        return ("XUSER".to_string(), scope.trim_start_matches("xuser-").to_string());
+    }
+    if matches!(scope, "native-stdio" | "game-stdio" | "stdio-capture") {
+        return ("STDIO".to_string(), scope.to_string());
+    }
+    if scope.contains("network") || scope.starts_with("net-") {
+        return ("NET".to_string(), scope.to_string());
+    }
+    if matches!(scope, "native-loader" | "preloader" | "runtime-ready") {
+        return ("MOD".to_string(), scope.to_string());
+    }
+    if matches!(
+        scope,
+        "bootstrap"
+            | "identity"
+            | "build"
+            | "host"
+            | "process"
+            | "paths"
+            | "logging"
+            | "capabilities"
+            | "compat"
+            | "file-redirection"
+    ) {
+        return ("SYS".to_string(), scope.to_string());
+    }
+    ("BLOADER".to_string(), scope.to_string())
 }
 
 fn current_thread_id() -> u32 {
