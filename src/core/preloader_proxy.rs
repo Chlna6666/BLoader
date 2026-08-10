@@ -7,9 +7,7 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows::core::PCWSTR;
 
-use crate::runtime::foundation::{
-    crash_report, file_io_policy, logging, mod_diagnostics, native_stdio,
-};
+use crate::runtime::foundation::{crash_report, file_io_policy, logging, mod_diagnostics};
 
 const PRELOAD_TYPE: &str = "preload";
 const PRELOADER_DLL: &str = "PreLoader.dll";
@@ -195,23 +193,20 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
 
     mod_diagnostics::mark_loading(&identity, "preloader_priority_early");
     logging::write_bootstrap_marker(&format!(
-        "preloader.priority.load.begin path={} capture=native-stdio",
+        "preloader.priority.load.begin path={} capture=disabled-preloader-compat",
         expected.display()
     ));
 
-    // This executes after the loader lock has been released, so the same native
-    // stdout/stderr capture used for regular Mods is safe here. PreLoader can
-    // synchronously load LeviLamina and additional native Mods; their early
-    // printf/puts/std::cout/Rust stdout is captured before any console exists and
-    // later replayed through BLoader's console backlog.
+    // PreLoader owns a complex synchronous native bootstrap chain. Redirecting
+    // the process/CRT stdout and stderr around its LoadLibrary changes the host
+    // environment seen by PreLoader/LeviLamina and can trigger a C++ exception
+    // during initialization. Keep this earliest load path side-effect free.
+    // Early structured output is recovered later from the external log relay;
+    // regular BLoader-loaded native Mods still use native_stdio capture.
     let load_result = {
         let _scope = mod_diagnostics::enter_scope(&identity, "LoadLibrary:preloader_priority_early");
         let wide = wide_null(expected.as_os_str());
-        unsafe {
-            native_stdio::capture_library_load(&identity, "preloader_priority_early", || {
-                LoadLibraryW(PCWSTR(wide.as_ptr()))
-            })
-        }
+        LoadLibraryW(PCWSTR(wide.as_ptr()))
     };
     crash_report::rearm_unhandled_filter("after-preloader-priority-early-load");
 
