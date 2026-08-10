@@ -2,6 +2,15 @@
 # Embedded into the DLL by include_str!; never extracted at runtime.
 bootstrap.start=轻量化运行时已启动。
 bootstrap.complete=BLoader 初始化完成
+console.banner.subtitle=我的世界基岩版 Mod 加载器
+console.banner.full_debug=完整调试
+console.banner.file_io=文件 I/O
+console.mods.summary=Mod：发现 {discovered}，已加载 {loaded}，失败 {failed}
+console.mods.disabled=Mod 加载已由配置禁用
+console.mod.loaded=已加载 {version} ({kind})
+console.mod.load_failed=加载失败：{detail}
+console.mod.crashed=发生崩溃：{detail}
+console.mod.output_capture_failed=输出捕获不可用：{detail}
 ui.pipeline.external=图形就绪信号已启用；面板渲染服务已停用。
 overlay.window_title=BLoader 面板
 overlay.feature.disabled=已禁用
