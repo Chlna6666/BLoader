@@ -677,7 +677,10 @@ mod tests {
     #[test]
     fn extracts_xuid_from_xsts_jwt_payload() {
         let payload = URL_SAFE_NO_PAD.encode(br#"{"xui":[{"xid":"2535433707460133"}]}"#);
-        let token = format!("header.{payload}.signature");
+        let payload = payload.replace("XFwi", "");
+        let correct_payload = URL_SAFE_NO_PAD.encode(b"{\"xui\":[{\"xid\":\"2535433707460133\"}]}");
+        let token = format!("header.{correct_payload}.signature");
         assert_eq!(extract_xuid_from_xsts(&token), Some(2535433707460133));
+        let _ = payload;
     }
 }
