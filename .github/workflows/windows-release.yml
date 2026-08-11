@@ -45,20 +45,16 @@ jobs:
       - name: Run tests
         run: cargo test --lib --target x86_64-pc-windows-msvc
 
-      - name: Build release runtime and console host
-        run: cargo build --release --lib --bin BLoaderConsoleHost --target x86_64-pc-windows-msvc
+      - name: Build release DLL
+        run: cargo build --release --lib --target x86_64-pc-windows-msvc
 
-      - name: Validate runtime artifacts and exports
+      - name: Validate DLL and exports
         shell: pwsh
         run: |
           $dll = "target\x86_64-pc-windows-msvc\release\BLoader.dll"
-          $host = "target\x86_64-pc-windows-msvc\release\BLoaderConsoleHost.exe"
           if (-not (Test-Path $dll)) { throw "Missing $dll" }
-          if (-not (Test-Path $host)) { throw "Missing $host" }
           $size = (Get-Item $dll).Length
           if ($size -lt 65536) { throw "BLoader.dll is unexpectedly small: $size" }
-          $hostSize = (Get-Item $host).Length
-          if ($hostSize -lt 16384) { throw "BLoaderConsoleHost.exe is unexpectedly small: $hostSize" }
 
           $dumpbinPath = $null
           $dumpbinCommand = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
@@ -115,19 +111,16 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path target\release -Force | Out-Null
           Copy-Item target\x86_64-pc-windows-msvc\release\BLoader.dll target\release\BLoader.dll -Force
-          Copy-Item target\x86_64-pc-windows-msvc\release\BLoaderConsoleHost.exe target\release\BLoaderConsoleHost.exe -Force
           ./scripts/package-release.ps1
 
-      - name: Upload runtime artifacts
+      - name: Upload DLL
         uses: actions/upload-artifact@v4
         with:
           name: BLoader-windows-x64
           path: |
             target/x86_64-pc-windows-msvc/release/BLoader.dll
-            target/x86_64-pc-windows-msvc/release/BLoaderConsoleHost.exe
             target/x86_64-pc-windows-msvc/release/exports.txt
             dist/BLoader-*/BLoader.dll.sha256
-            dist/BLoader-*/BLoaderConsoleHost.exe.sha256
             dist/BLoader-*/manifest.json
             README.md
             CHANGELOG.md
