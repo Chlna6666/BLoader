@@ -2,7 +2,9 @@
 #![allow(dead_code)]
 #![allow(non_snake_case)]
 
+use std::fs;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -19,11 +21,14 @@ use windows::Win32::System::Console::{
     STD_OUTPUT_HANDLE, SetConsoleMode, SetConsoleTitleW, SetStdHandle,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DeleteMenu, GetSystemMenu, IsWindowVisible, MF_BYCOMMAND, SC_CLOSE, SW_SHOW, ShowWindow,
+    DeleteMenu, GetSystemMenu, MF_BYCOMMAND, SC_CLOSE, SW_SHOW, ShowWindow,
 };
 use windows::core::PCWSTR;
 
 const CLASSIC_SCROLLBACK_LINES: i16 = 12_000;
+static CONSOLE_WINDOW_READY: AtomicBool = AtomicBool::new(false);
+static CONSOLE_LOGGING_READY: AtomicBool = AtomicBool::new(false);
+static CONSOLE_STDIO_READY: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -38,84 +43,57 @@ unsafe extern "system" {
     fn set_console_screen_buffer_size_raw(handle: *mut core::ffi::c_void, size: RawCoord) -> i32;
 }
 
-/// Opens the runtime console immediately once the post-OEP worker reaches this
-/// point. Existing console associations are always reused. BLoader never tears
-/// down one console just to allocate another; AllocConsole is used only when the
-/// process has no console association at all.
-pub unsafe fn init_console() {
-    let existing_window = GetConsoleWindow();
-    let has_associated_console = existing_window.0 != null_mut();
-    let has_visible_console = has_associated_console && IsWindowVisible(existing_window).as_bool();
-
-    logging::write_bootstrap_marker(&format!(
-        "console.visibility.probe associated={} visible={} backend=classic-direct allocation={}",
-        has_associated_console,
-        has_visible_console,
-        if has_associated_console { "reuse" } else { "single" }
-    ));
-
-    init_classic_console(has_associated_console);
+/// Lightweight pre-main probe. It only reads the existing JSON and never
+/// starts the config watcher, rewrites the config, or initializes logging.
+pub fn early_console_requested() -> bool {
+    let loader_cfg = crate::utils::get_loader_directory().join("config.json");
+    let exe_cfg = crate::utils::get_exe_directory().join("config.json");
+    let path = if loader_cfg.exists() { loader_cfg } else { exe_cfg };
+    let Ok(content) = fs::read_to_string(path) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&content)
+        .ok()
+        .and_then(|value| value.get("enable_debug_console").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
 }
 
-unsafe fn init_classic_console(has_existing_console: bool) {
+pub fn window_ready() -> bool {
+    CONSOLE_WINDOW_READY.load(Ordering::Acquire)
+}
+
+/// Creates the one and only visible console window before the slow PreLoader
+/// chain begins. This intentionally does NOT call SetStdHandle, touch stdin,
+/// install CRT capture, or mutate Minecraft process stdio state while the
+/// premain trampoline still owns the startup thread context.
+pub unsafe fn init_console_window_early() {
+    if CONSOLE_WINDOW_READY.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
     let mut window = GetConsoleWindow();
-    if !has_existing_console {
-        let _ = AllocConsole();
+    let reused = window.0 != null_mut();
+    if !reused {
+        if AllocConsole().is_err() {
+            CONSOLE_WINDOW_READY.store(false, Ordering::Release);
+            logging::write_bootstrap_marker("console.early.alloc.failed");
+            return;
+        }
         window = GetConsoleWindow();
     }
 
     set_runtime_console_title();
-
     if window.0 != null_mut() {
         let menu = GetSystemMenu(window, false);
         if !menu.is_invalid() {
             let _ = DeleteMenu(menu, SC_CLOSE, MF_BYCOMMAND);
         }
-        // For a normal Console Host this guarantees visibility. Under a
-        // pseudoconsole/terminal delegation this HWND may be message-only; in
-        // either case we keep the existing association instead of reallocating.
         let _ = ShowWindow(window, SW_SHOW);
     }
 
-    let h_conout = CreateFileW(
-        windows::core::w!("CONOUT$"),
-        GENERIC_READ.0 | GENERIC_WRITE.0,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        None,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        None,
-    )
-    .unwrap_or_default();
-
-    let h_conin = CreateFileW(
-        windows::core::w!("CONIN$"),
-        GENERIC_READ.0 | GENERIC_WRITE.0,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        None,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        None,
-    )
-    .unwrap_or_default();
-
+    let h_conout = open_conout();
     if !h_conout.is_invalid() {
-        let _ = SetStdHandle(STD_OUTPUT_HANDLE, h_conout);
-        let _ = SetStdHandle(STD_ERROR_HANDLE, h_conout);
-
-        let mut mode = CONSOLE_MODE(0);
-        if GetConsoleMode(h_conout, &mut mode).is_ok() {
-            let _ = SetConsoleMode(
-                h_conout,
-                CONSOLE_MODE(
-                    mode.0
-                        | ENABLE_PROCESSED_OUTPUT.0
-                        | ENABLE_WRAP_AT_EOL_OUTPUT.0
-                        | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0,
-                ),
-            );
-        }
-
+        configure_output(h_conout);
         configure_classic_scrollback(h_conout);
         render_branding(
             h_conout,
@@ -123,8 +101,64 @@ unsafe fn init_classic_console(has_existing_console: bool) {
             console_has_vt(h_conout),
             true,
         );
-        emit_runtime_identity();
-        logging::set_console_handle(h_conout);
+    }
+
+    logging::write_bootstrap_marker(&format!(
+        "console.early.window.ready source={} process_stdio=false crt_capture=false",
+        if reused { "existing-associated" } else { "allocated-once" }
+    ));
+}
+
+/// Connects BLoader's own structured logging sink to the already-created
+/// console. Safe to call before Minecraft OEP because it does not change the
+/// process-wide standard handles.
+pub unsafe fn activate_console_logging() {
+    if CONSOLE_LOGGING_READY.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if !window_ready() {
+        CONSOLE_LOGGING_READY.store(false, Ordering::Release);
+        return;
+    }
+
+    let h_conout = open_conout();
+    if h_conout.is_invalid() {
+        CONSOLE_LOGGING_READY.store(false, Ordering::Release);
+        return;
+    }
+
+    configure_output(h_conout);
+    emit_runtime_identity();
+    logging::set_console_handle(h_conout);
+    logging::scoped_debug_message(
+        "console",
+        &format!(
+            "runtime console logging ready | backend=classic-early-single-window | columns={} | file_io={} | process_stdio=false",
+            visible_columns(h_conout),
+            file_io_policy::mode_label(),
+        ),
+    );
+}
+
+/// Binds Minecraft's process standard handles only after OEP has been released.
+/// The console window already exists, so this operation never creates another
+/// window and never calls FreeConsole/AllocConsole.
+pub unsafe fn bind_process_stdio() {
+    if CONSOLE_STDIO_READY.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if !window_ready() {
+        CONSOLE_STDIO_READY.store(false, Ordering::Release);
+        return;
+    }
+
+    let h_conout = open_conout();
+    let h_conin = open_conin();
+
+    if !h_conout.is_invalid() {
+        configure_output(h_conout);
+        let _ = SetStdHandle(STD_OUTPUT_HANDLE, h_conout);
+        let _ = SetStdHandle(STD_ERROR_HANDLE, h_conout);
     }
 
     if !h_conin.is_invalid() {
@@ -147,14 +181,66 @@ unsafe fn init_classic_console(has_existing_console: bool) {
 
     logging::scoped_debug_message(
         "console",
-        &format!(
-            "runtime console ready | backend=classic-direct | source={} | quick_edit=true | scrollback={} | columns={} | file_io={} | handshake_ms=0 | realloc=false",
-            if has_existing_console { "existing-associated" } else { "allocated-once" },
-            CLASSIC_SCROLLBACK_LINES,
-            visible_columns(h_conout),
-            file_io_policy::mode_label(),
-        ),
+        "runtime console stdio bound | phase=post-oep | allocation=none | realloc=false",
     );
+}
+
+/// Full initialization path used by late-attach scenarios where Minecraft OEP
+/// is already running and there is no premain context to protect.
+pub unsafe fn init_console() {
+    init_console_window_early();
+    activate_console_logging();
+    bind_process_stdio();
+}
+
+fn open_conout() -> HANDLE {
+    unsafe {
+        CreateFileW(
+            windows::core::w!("CONOUT$"),
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        .unwrap_or_default()
+    }
+}
+
+fn open_conin() -> HANDLE {
+    unsafe {
+        CreateFileW(
+            windows::core::w!("CONIN$"),
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        .unwrap_or_default()
+    }
+}
+
+fn configure_output(handle: HANDLE) {
+    if handle.is_invalid() {
+        return;
+    }
+    unsafe {
+        let mut mode = CONSOLE_MODE(0);
+        if GetConsoleMode(handle, &mut mode).is_ok() {
+            let _ = SetConsoleMode(
+                handle,
+                CONSOLE_MODE(
+                    mode.0
+                        | ENABLE_PROCESSED_OUTPUT.0
+                        | ENABLE_WRAP_AT_EOL_OUTPUT.0
+                        | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0,
+                ),
+            );
+        }
+    }
 }
 
 fn configure_classic_scrollback(handle: HANDLE) {
