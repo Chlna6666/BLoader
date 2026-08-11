@@ -2,10 +2,7 @@
 #![allow(dead_code)]
 #![allow(non_snake_case)]
 
-use std::ffi::c_void;
 use std::ptr::null_mut;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -21,21 +18,12 @@ use windows::Win32::System::Console::{
     GetConsoleScreenBufferInfo, GetConsoleWindow, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
     STD_OUTPUT_HANDLE, SetConsoleMode, SetConsoleTitleW, SetStdHandle,
 };
-use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
     DeleteMenu, GetSystemMenu, IsWindowVisible, MF_BYCOMMAND, SC_CLOSE, SW_SHOW, ShowWindow,
 };
 use windows::core::PCWSTR;
 
 const CLASSIC_SCROLLBACK_LINES: i16 = 12_000;
-const EXTERNAL_CONSOLE_COLUMNS: usize = 120;
-const ERROR_PIPE_CONNECTED: u32 = 535;
-const PIPE_ACCESS_OUTBOUND: u32 = 0x0000_0002;
-const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
-const EXTERNAL_CONSOLE_HANDSHAKE_TIMEOUT_MS: u64 = 2_500;
-const BACKEND_PENDING: u8 = 0;
-const BACKEND_EXTERNAL: u8 = 1;
-const BACKEND_CLASSIC: u8 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -46,48 +34,24 @@ struct RawCoord {
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
-    fn CreateNamedPipeW(
-        name: *const u16,
-        open_mode: u32,
-        pipe_mode: u32,
-        max_instances: u32,
-        out_buffer_size: u32,
-        in_buffer_size: u32,
-        default_timeout: u32,
-        security_attributes: *const c_void,
-    ) -> *mut c_void;
-    fn ConnectNamedPipe(pipe: *mut c_void, overlapped: *mut c_void) -> i32;
-    #[link_name = "CloseHandle"]
-    fn close_handle_raw(handle: *mut c_void) -> i32;
-    #[link_name = "GetLastError"]
-    fn get_last_error_raw() -> u32;
     #[link_name = "SetConsoleScreenBufferSize"]
-    fn set_console_screen_buffer_size_raw(handle: *mut c_void, size: RawCoord) -> i32;
+    fn set_console_screen_buffer_size_raw(handle: *mut core::ffi::c_void, size: RawCoord) -> i32;
 }
 
+/// Opens the runtime console immediately once the post-OEP worker reaches this
+/// point. There is no Windows Terminal spawn, named-pipe handshake, watchdog,
+/// shell bridge, or auxiliary host process on the default path.
 pub unsafe fn init_console() {
     let existing_window = GetConsoleWindow();
     let has_associated_console = existing_window.0 != null_mut();
     let has_visible_console = has_associated_console && IsWindowVisible(existing_window).as_bool();
 
     logging::write_bootstrap_marker(&format!(
-        "console.visibility.probe associated={} visible={}",
+        "console.visibility.probe associated={} visible={} backend=classic-direct",
         has_associated_console, has_visible_console
     ));
 
-    if has_visible_console {
-        init_classic_console(true);
-        return;
-    }
-
-    // BLoader no longer launches Windows Terminal itself. The launcher owns
-    // terminal lifecycle and connects BMCBL.exe --bloader-console-host to this
-    // process-scoped pipe. Standalone launches retain the classic fallback.
-    if open_external_console_pipe_async() {
-        return;
-    }
-
-    init_classic_console(false);
+    init_classic_console(has_visible_console);
 }
 
 unsafe fn init_classic_console(is_existing_visible: bool) {
@@ -183,141 +147,13 @@ unsafe fn init_classic_console(is_existing_visible: bool) {
     logging::scoped_debug_message(
         "console",
         &format!(
-            "runtime console ready | backend=classic-fallback | source={} | quick_edit=true | scrollback={} | columns={} | file_io={}",
+            "runtime console ready | backend=classic-direct | source={} | quick_edit=true | scrollback={} | columns={} | file_io={} | handshake_ms=0",
             if is_existing_visible { "existing-visible" } else { "allocated-visible" },
             CLASSIC_SCROLLBACK_LINES,
             visible_columns(h_conout),
             file_io_policy::mode_label(),
         ),
     );
-}
-
-fn open_external_console_pipe_async() -> bool {
-    let pid = unsafe { GetCurrentProcessId() };
-    let pipe_leaf = format!("BLoader.Console.{pid}");
-    let pipe_path = format!(r"\\.\pipe\{pipe_leaf}");
-    let pipe_wide: Vec<u16> = pipe_path.encode_utf16().chain(Some(0)).collect();
-
-    let raw_pipe = unsafe {
-        CreateNamedPipeW(
-            pipe_wide.as_ptr(),
-            PIPE_ACCESS_OUTBOUND,
-            PIPE_REJECT_REMOTE_CLIENTS,
-            1,
-            64 * 1024,
-            4 * 1024,
-            0,
-            std::ptr::null(),
-        )
-    };
-    if raw_pipe.is_null() || raw_pipe as isize == -1 {
-        logging::write_bootstrap_marker("console.external.pipe.create.failed fallback=classic");
-        return false;
-    }
-
-    logging::write_bootstrap_marker(&format!(
-        "console.external.pipe.ready name={} owner=bmcbl terminal_launcher=bmcbl",
-        pipe_leaf
-    ));
-
-    let backend = Arc::new(AtomicU8::new(BACKEND_PENDING));
-    let connector_backend = Arc::clone(&backend);
-    let raw_value = raw_pipe as usize;
-    let connector = thread::Builder::new()
-        .name("bloader-console-pipe".to_string())
-        .spawn(move || {
-            let raw_pipe = raw_value as *mut c_void;
-            let connected = unsafe {
-                ConnectNamedPipe(raw_pipe, null_mut()) != 0
-                    || get_last_error_raw() == ERROR_PIPE_CONNECTED
-            };
-            if !connected {
-                unsafe { close_handle_raw(raw_pipe); }
-                if connector_backend
-                    .compare_exchange(
-                        BACKEND_PENDING,
-                        BACKEND_CLASSIC,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    logging::scoped_warn_message(
-                        "console",
-                        "External console pipe connection failed; switching to a visible classic console.",
-                    );
-                    unsafe { init_classic_console(false); }
-                }
-                return;
-            }
-
-            if connector_backend
-                .compare_exchange(
-                    BACKEND_PENDING,
-                    BACKEND_EXTERNAL,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
-                unsafe { close_handle_raw(raw_pipe); }
-                return;
-            }
-
-            let handle = HANDLE(raw_pipe);
-            // BMCBL requests a 120-column WT session, so BLoader can render the
-            // authoritative banner itself without a second host binary or DLL.
-            render_branding(handle, EXTERNAL_CONSOLE_COLUMNS, true, true);
-            emit_runtime_identity();
-            logging::set_console_stream_handle(handle, true);
-            logging::scoped_debug_message(
-                "console",
-                "runtime console ready | backend=external-windows-terminal | owner=bmcbl | transport=named-pipe | host=BMCBL.exe | shell=false | rundll32=false | extra_exe=false",
-            );
-        });
-
-    if connector.is_err() {
-        unsafe { close_handle_raw(raw_pipe); }
-        logging::write_bootstrap_marker("console.external.connector.spawn.failed fallback=classic");
-        return false;
-    }
-
-    let watchdog_backend = Arc::clone(&backend);
-    if thread::Builder::new()
-        .name("bloader-console-watchdog".to_string())
-        .spawn(move || {
-            thread::sleep(Duration::from_millis(EXTERNAL_CONSOLE_HANDSHAKE_TIMEOUT_MS));
-            if watchdog_backend
-                .compare_exchange(
-                    BACKEND_PENDING,
-                    BACKEND_CLASSIC,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                logging::scoped_warn_message(
-                    "console",
-                    "External Windows Terminal client was not connected; switching to a visible classic console.",
-                );
-                unsafe { init_classic_console(false); }
-            }
-        })
-        .is_err()
-        && backend
-            .compare_exchange(
-                BACKEND_PENDING,
-                BACKEND_CLASSIC,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    {
-        logging::write_bootstrap_marker("console.external.watchdog.spawn.failed fallback=classic");
-        unsafe { init_classic_console(false); }
-    }
-
-    true
 }
 
 fn configure_classic_scrollback(handle: HANDLE) {
@@ -514,14 +350,4 @@ pub fn start_input_listener() {
         .spawn(|| {
             thread::sleep(Duration::from_millis(100));
         });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn external_console_width_matches_bmcbl_terminal_request() {
-        assert_eq!(EXTERNAL_CONSOLE_COLUMNS, 120);
-    }
 }
