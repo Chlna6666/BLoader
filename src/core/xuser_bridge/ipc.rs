@@ -2,7 +2,6 @@
 
 use core::ffi::c_void;
 use serde::Deserialize;
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     mem, ptr,
@@ -253,30 +252,25 @@ fn receive_payload() -> Result<Option<Vec<u8>>, String> {
 }
 
 fn parse_session(payload: &[u8]) -> Result<Session, String> {
-    let envelope: Value = serde_json::from_slice(payload).map_err(|error| {
+    let document: WireDocument = serde_json::from_slice(payload).map_err(|error| {
+        let kind = match error.classify() {
+            serde_json::error::Category::Data => "utoken-schema-mismatch",
+            serde_json::error::Category::Syntax => "json-syntax-invalid",
+            serde_json::error::Category::Eof => "json-truncated",
+            serde_json::error::Category::Io => "json-io-error",
+        };
         format!(
-            "BMCBL XUser payload JSON syntax invalid | line={} | column={} | category={:?}",
+            "BMCBL XUser payload decode failed | kind={kind} | line={} | column={} | expected_auth_mode={AUTH_MODE}",
             error.line(),
             error.column(),
-            error.classify(),
         )
     })?;
-    let auth_mode = envelope.get("auth_mode").and_then(Value::as_str);
-    if auth_mode != Some(AUTH_MODE) {
+    if document.auth_mode.as_deref() != Some(AUTH_MODE) {
         return Err(format!(
             "BMCBL XUser payload protocol mismatch | expected_auth_mode={AUTH_MODE} | received_auth_mode={}",
-            auth_mode.unwrap_or("<missing-or-non-string>")
+            document.auth_mode.as_deref().unwrap_or("<missing>")
         ));
     }
-
-    let document: WireDocument = serde_json::from_value(envelope).map_err(|error| {
-        format!(
-            "BMCBL XUser UToken payload schema mismatch | auth_mode={AUTH_MODE} | line={} | column={} | category={:?}",
-            error.line(),
-            error.column(),
-            error.classify(),
-        )
-    })?;
 
     let xuid = parse_nonzero_decimal(&document.xbl_xuid)
         .ok_or_else(|| "invalid XUID".to_string())?;
@@ -427,7 +421,8 @@ mod tests {
             "user_token": "test-user-token",
             "user_token_expiry_epoch": "4102444800"
         });
-        let document: WireDocument = serde_json::from_value(payload).unwrap();
+        let encoded = serde_json::to_vec(&payload).unwrap();
+        let document: WireDocument = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(document.auth_mode.as_deref(), Some(AUTH_MODE));
         assert_eq!(document.xbl_gamertag, "BMCBLTest");
         assert_eq!(document.user_token, "test-user-token");
