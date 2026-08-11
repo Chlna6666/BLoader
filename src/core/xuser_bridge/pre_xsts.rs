@@ -3,7 +3,7 @@
 use core::ffi::c_void;
 use std::sync::OnceLock;
 
-use super::{bridge_debug, bridge_info, bridge_warn};
+use super::super::{bridge_debug, bridge_info, bridge_warn};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DiscoverySummary {
@@ -51,7 +51,7 @@ unsafe fn discover() -> Result<DiscoverySummary, String> {
         .collect::<Vec<_>>();
 
     bridge_info(&format!(
-        "开始定位 Microsoft Runtime pre-XSTS 聚合候选 | module=xgameruntime.dll | image_size=0x{image_size:X} | sections={} | executable_sections={} | secrets_logged=false",
+        "开始定位 Microsoft Runtime pre-XSTS 聚合候选 | module=xgameruntime.dll | image_size=0x{image_size:X} | readable_sections={} | executable_sections={} | secrets_logged=false",
         sections.len(),
         executable.len(),
     ));
@@ -69,11 +69,11 @@ unsafe fn discover() -> Result<DiscoverySummary, String> {
         )
     };
 
-    log_marker("UserTokens", &user_tokens);
-    log_marker("DeviceToken", &device_token);
-    log_marker("TitleToken", &title_token);
-    log_marker("xsts/authorize", &xsts_authorize);
-    log_marker("xsts.auth.xboxlive.com", &xsts_host);
+    log_marker(base, "UserTokens", &user_tokens);
+    log_marker(base, "DeviceToken", &device_token);
+    log_marker(base, "TitleToken", &title_token);
+    log_marker(base, "xsts/authorize", &xsts_authorize);
+    log_marker(base, "xsts.auth.xboxlive.com", &xsts_host);
 
     let summary = DiscoverySummary {
         user_tokens_markers: user_tokens.addresses.len(),
@@ -152,19 +152,19 @@ unsafe fn locate_marker(
     MarkerLocations { addresses, xrefs }
 }
 
-fn log_marker(name: &str, locations: &MarkerLocations) {
+fn log_marker(base: usize, name: &str, locations: &MarkerLocations) {
     let marker_rvas = locations
         .addresses
         .iter()
         .take(8)
-        .map(|address| format!("0x{:X}", rva(*address)))
+        .map(|address| format!("0x{:X}", address.saturating_sub(base)))
         .collect::<Vec<_>>()
         .join(",");
     let xref_rvas = locations
         .xrefs
         .iter()
         .take(16)
-        .map(|address| format!("0x{:X}", rva(*address)))
+        .map(|address| format!("0x{:X}", address.saturating_sub(base)))
         .collect::<Vec<_>>()
         .join(",");
     bridge_debug(&format!(
@@ -172,12 +172,6 @@ fn log_marker(name: &str, locations: &MarkerLocations) {
         locations.addresses.len(),
         locations.xrefs.len(),
     ));
-}
-
-fn rva(address: usize) -> usize {
-    let module_name = wide("xgameruntime.dll");
-    let module = unsafe { GetModuleHandleW(module_name.as_ptr()) } as usize;
-    address.saturating_sub(module)
 }
 
 fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
@@ -260,7 +254,9 @@ unsafe fn parse_pe_sections(base: usize) -> Result<(usize, Vec<Section>), String
         let virtual_address = unsafe { read_u32(header + 12) } as usize;
         let raw_size = unsafe { read_u32(header + 16) } as usize;
         let characteristics = unsafe { read_u32(header + 36) };
-        if virtual_address >= image_size {
+        let readable = characteristics & 0x4000_0000 != 0;
+        let executable = characteristics & 0x2000_0000 != 0;
+        if (!readable && !executable) || virtual_address >= image_size {
             continue;
         }
         let requested = virtual_size.max(raw_size);
@@ -271,11 +267,11 @@ unsafe fn parse_pe_sections(base: usize) -> Result<(usize, Vec<Section>), String
         sections.push(Section {
             rva: virtual_address,
             size,
-            executable: characteristics & 0x2000_0000 != 0,
+            executable,
         });
     }
     if sections.is_empty() {
-        return Err("xgameruntime.dll has no mapped PE sections".to_string());
+        return Err("xgameruntime.dll has no readable mapped PE sections".to_string());
     }
     Ok((image_size, sections))
 }
