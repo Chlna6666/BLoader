@@ -5,9 +5,10 @@ mod lifecycle;
 
 use core::ffi::{c_char, c_void};
 use std::{
+    collections::HashSet,
     mem, ptr,
     sync::{
-        OnceLock,
+        Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -26,6 +27,7 @@ use super::{
 use lifecycle::{XTaskQueueRegistrationToken, XUserChangeEventCallback};
 
 const E_GAMEUSER_USER_NOT_FOUND: HResult = 0x8924_5104_u32 as i32;
+const XUSER_ADD_DEFAULT_USER_SILENTLY: u32 = 0x01;
 const XUSER_ADD_NAME: &[u8] = b"XUserAddAsync.BMCBL\0";
 static XUSER_ADD_IDENTITY: u8 = 0x42;
 
@@ -51,7 +53,8 @@ static USER_VTABLE: OnceLock<XUserVtable> = OnceLock::new();
 static GAMERTAG_VTABLE: OnceLock<XUserGamertagVtable> = OnceLock::new();
 static USER_OBJECT: OnceLock<XUserObject> = OnceLock::new();
 static NATIVE_BASE_INTERFACE: AtomicUsize = AtomicUsize::new(0);
-static MATCHING_NATIVE_USER: OnceLock<Option<usize>> = OnceLock::new();
+static MATCHING_NATIVE_USER: AtomicUsize = AtomicUsize::new(0);
+static NATIVE_ADD_ASYNCS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
 
 fn user_object() -> Option<&'static XUserObject> {
     session()?;
@@ -130,51 +133,65 @@ pub(crate) fn native_base_slot(index: usize) -> Option<usize> {
     (slot != 0).then_some(slot)
 }
 
-/// Resolves an already-available Microsoft XUser whose XUID exactly matches
-/// the BMCBL session. This never calls XUserAddAsync and therefore never opens
-/// the PC account bootstrapper when Windows has no signed-in Xbox user.
+/// Returns the hidden Microsoft handle established by the gated same-account
+/// XUserAddAsync path. Different-account and no-system-account sessions never
+/// populate this slot.
 pub(crate) fn native_user_for_custom_identity() -> Option<XUserHandle> {
-    MATCHING_NATIVE_USER
-        .get_or_init(resolve_matching_native_user)
-        .map(|value| value as XUserHandle)
+    let value = MATCHING_NATIVE_USER.load(Ordering::Acquire);
+    (value != 0).then_some(value as XUserHandle)
 }
 
-fn resolve_matching_native_user() -> Option<usize> {
-    let runtime = session()?;
-    let interface = native_base_interface()?;
-    let slot = native_base_slot(12)?;
-    type FindByIdFn = unsafe extern "system" fn(*mut c_void, u64, *mut XUserHandle) -> HResult;
-    let find_by_id: FindByIdFn = unsafe { mem::transmute(slot) };
-    let mut user = ptr::null_mut();
-    let status = unsafe { find_by_id(interface, runtime.xuid, &mut user) };
-    if status < 0 || user.is_null() {
-        bridge_info(&format!(
-            "未发现与 BMCBL XUID 一致的系统 native XUser | custom_xuid={} | native_user=absent-or-not-title-visible | system_login_ui=not-invoked | custom_xuser=available",
-            runtime.xuid
-        ));
-        return None;
+fn remember_native_add(async_block: *mut XAsyncBlock) {
+    if async_block.is_null() {
+        return;
     }
+    NATIVE_ADD_ASYNCS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(async_block as usize);
+}
 
-    let get_id_slot = native_base_slot(11)?;
-    type GetIdFn = unsafe extern "system" fn(*mut c_void, XUserHandle, *mut u64) -> HResult;
-    let get_id: GetIdFn = unsafe { mem::transmute(get_id_slot) };
-    let mut native_xuid = 0u64;
-    let status = unsafe { get_id(interface, user, &mut native_xuid) };
-    if status < 0 || native_xuid != runtime.xuid {
-        bridge_warn(&format!(
-            "系统 native XUser 身份校验失败；不会用于 BMCBL Token 路由 | custom_xuid={} | native_xuid={} | result=0x{:08X}",
-            runtime.xuid,
-            native_xuid,
-            status as u32
-        ));
-        return None;
+fn take_native_add(async_block: *mut XAsyncBlock) -> bool {
+    if async_block.is_null() {
+        return false;
     }
+    NATIVE_ADD_ASYNCS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&(async_block as usize))
+}
 
-    bridge_info(&format!(
-        "发现与 BMCBL 账号完全一致的系统 native XUser；仅用于同账号官方 Token 快速路径 | xuid={} | custom_handle=independent | native_handle=hidden",
-        runtime.xuid
-    ));
-    Some(user as usize)
+fn native_user_id(user: XUserHandle) -> Result<u64, HResult> {
+    if user.is_null() {
+        return Err(E_INVALIDARG);
+    }
+    let interface = native_base_interface().ok_or(E_FAIL)?;
+    let slot = native_base_slot(11).ok_or(E_FAIL)?;
+    type Function = unsafe extern "system" fn(*mut c_void, XUserHandle, *mut u64) -> HResult;
+    let function: Function = unsafe { mem::transmute(slot) };
+    let mut xuid = 0u64;
+    let status = unsafe { function(interface, user, &mut xuid) };
+    if status < 0 || xuid == 0 {
+        return Err(if status < 0 { status } else { E_FAIL });
+    }
+    Ok(xuid)
+}
+
+fn close_native_user(user: XUserHandle) {
+    if user.is_null() {
+        return;
+    }
+    let Some(interface) = native_base_interface() else {
+        return;
+    };
+    let Some(slot) = native_base_slot(4) else {
+        return;
+    };
+    type Function = unsafe extern "system" fn(*mut c_void, XUserHandle);
+    let function: Function = unsafe { mem::transmute(slot) };
+    unsafe { function(interface, user) };
 }
 
 pub fn valid_user(user: XUserHandle) -> bool {
@@ -321,14 +338,7 @@ unsafe extern "system" fn xuser_add_provider(
     }
 }
 
-unsafe extern "system" fn add_async(
-    _interface: *mut c_void,
-    _options: u32,
-    async_block: *mut XAsyncBlock,
-) -> HResult {
-    if async_block.is_null() {
-        return E_POINTER;
-    }
+unsafe fn begin_synthetic_add(async_block: *mut XAsyncBlock) -> HResult {
     let Some(handle) = provider_interface() else {
         return E_FAIL;
     };
@@ -354,8 +364,60 @@ unsafe extern "system" fn add_async(
         let _ = lifecycle::release_user_handle();
         return result;
     }
-    bridge_debug("XUserAddAsync route=bmcbl-synthetic-user | native_user_required=false");
-    S_OK
+    result
+}
+
+unsafe extern "system" fn add_async(
+    _interface: *mut c_void,
+    _options: u32,
+    async_block: *mut XAsyncBlock,
+) -> HResult {
+    if async_block.is_null() {
+        return E_POINTER;
+    }
+
+    let native_already_ready = MATCHING_NATIVE_USER.load(Ordering::Acquire) != 0;
+    let same_account_hint = session().is_some_and(|runtime| runtime.native_same_account_hint());
+    if same_account_hint && !native_already_ready {
+        if let (Some(interface), Some(slot)) = (native_base_interface(), native_base_slot(7)) {
+            type Function = unsafe extern "system" fn(*mut c_void, u32, *mut XAsyncBlock) -> HResult;
+            let function: Function = unsafe { mem::transmute(slot) };
+            let result = unsafe {
+                function(
+                    interface,
+                    XUSER_ADD_DEFAULT_USER_SILENTLY,
+                    async_block,
+                )
+            };
+            if result >= 0 {
+                remember_native_add(async_block);
+                bridge_info(&format!(
+                    "BMCBL 与 Windows 系统 XUID 提示一致；正在建立隐藏 native XUser 能力句柄 | xuid={} | native_add=AddDefaultUserSilently | public_handle=synthetic | ui=disabled",
+                    session().map(|runtime| runtime.xuid).unwrap_or_default()
+                ));
+                return result;
+            }
+            bridge_warn(&format!(
+                "同账号 native XUserAddAsync 无法启动；继续建立 synthetic XUser | result=0x{:08X} | token_route=pre-xsts-or-fail-closed",
+                result as u32
+            ));
+        }
+    }
+
+    let result = unsafe { begin_synthetic_add(async_block) };
+    if result >= 0 {
+        bridge_debug(&format!(
+            "XUserAddAsync route=bmcbl-synthetic-user | native_user_required=false | native_system_relation={} | system_login_ui=not-invoked",
+            session().map_or("none", |runtime| {
+                match runtime.native_system_xuid_hint {
+                    Some(native) if native == runtime.xuid => "same-no-native-capability",
+                    Some(_) => "different",
+                    None => "none",
+                }
+            })
+        ));
+    }
+    result
 }
 
 unsafe extern "system" fn add_result(
@@ -366,6 +428,87 @@ unsafe extern "system" fn add_result(
     if async_block.is_null() || user.is_null() {
         return E_POINTER;
     }
+
+    if take_native_add(async_block) {
+        let Some(interface) = native_base_interface() else {
+            return E_FAIL;
+        };
+        let Some(slot) = native_base_slot(8) else {
+            return E_FAIL;
+        };
+        type Function = unsafe extern "system" fn(
+            *mut c_void,
+            *mut XAsyncBlock,
+            *mut XUserHandle,
+        ) -> HResult;
+        let function: Function = unsafe { mem::transmute(slot) };
+        let mut native_user = ptr::null_mut();
+        let native_result = unsafe { function(interface, async_block, &mut native_user) };
+        if native_result >= 0 && !native_user.is_null() {
+            match native_user_id(native_user) {
+                Ok(native_xuid) if session().is_some_and(|runtime| native_xuid == runtime.xuid) => {
+                    let existing = MATCHING_NATIVE_USER.compare_exchange(
+                        0,
+                        native_user as usize,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                    if let Err(existing) = existing {
+                        if existing != native_user as usize {
+                            close_native_user(native_user);
+                        }
+                    }
+                    let status = lifecycle::acquire_added_handle();
+                    if status < 0 {
+                        return status;
+                    }
+                    let Some(handle) = provider_interface() else {
+                        let _ = lifecycle::release_user_handle();
+                        return E_FAIL;
+                    };
+                    unsafe { user.write(handle) };
+                    bridge_info(&format!(
+                        "隐藏 native XUser 能力句柄已验证并绑定；Minecraft 仍接收 synthetic XUser | xuid={native_xuid} | native_handle=hidden | public_handle=synthetic | token_route=same-account-native-capability"
+                    ));
+                    return S_OK;
+                }
+                Ok(native_xuid) => {
+                    close_native_user(native_user);
+                    bridge_warn(&format!(
+                        "native XUserAddResult 返回了错误账号；拒绝绑定该能力句柄 | native_xuid={native_xuid} | custom_xuid={} | action=synthetic-only",
+                        session().map(|runtime| runtime.xuid).unwrap_or_default()
+                    ));
+                }
+                Err(status) => {
+                    close_native_user(native_user);
+                    bridge_warn(&format!(
+                        "native XUserAddResult 身份无法验证；拒绝绑定该能力句柄 | result=0x{:08X} | action=synthetic-only",
+                        status as u32
+                    ));
+                }
+            }
+        } else {
+            bridge_warn(&format!(
+                "同账号 native XUserAddResult 未建立可验证能力用户；返回 synthetic XUser 防止触发系统 UI | result=0x{:08X} | token_route=pre-xsts-or-fail-closed",
+                native_result as u32
+            ));
+        }
+
+        // The local hint can be stale. Never turn a failed silent native add into
+        // an interactive add. Keep the BMCBL user alive and let the token layer
+        // use pre-XSTS injection discovery/fail-closed instead.
+        let status = lifecycle::acquire_added_handle();
+        if status < 0 {
+            return status;
+        }
+        let Some(handle) = provider_interface() else {
+            let _ = lifecycle::release_user_handle();
+            return E_FAIL;
+        };
+        unsafe { user.write(handle) };
+        return S_OK;
+    }
+
     let result = unsafe {
         xasync::get_result(
             async_block,
