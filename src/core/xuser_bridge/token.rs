@@ -31,6 +31,7 @@ static ROUTE_LOGGED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static DIAGNOSTIC_PROBES_STARTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 const XUSER_ADD_DEFAULT_USER_SILENTLY: u32 = 0x01;
+const XUSER_TOKEN_FORCE_REFRESH: u32 = 0x01;
 
 macro_rules! hresult_try {
     ($expression:expr) => {
@@ -124,8 +125,13 @@ fn close_native_user(user: XUserHandle) {
 }
 
 fn start_pre_xsts_diagnostic_probe(relying_party: &str, url: &str, options: u32) {
-    let key = format!("{relying_party}|{url}");
+    let key = relying_party.to_string();
     if !diagnostic_probe_once(key) {
+        log_once(format!("diagnostic-duplicate:{relying_party}"), || {
+            bridge_info(&format!(
+                "pre-XSTS builder 诊断已存在；跳过重复启动 | rp={relying_party} | reason=diagnostic-already-started-or-completed | secrets_logged=false"
+            ));
+        });
         return;
     }
 
@@ -244,6 +250,8 @@ fn start_native_token_diagnostic_probe(
     };
     let method = CString::new("GET").expect("static diagnostic method has no interior NUL");
 
+    let diagnostic_options = options | XUSER_TOKEN_FORCE_REFRESH;
+
     let context = Box::new(NativeTokenProbeContext {
         relying_party,
         native_user,
@@ -281,7 +289,7 @@ fn start_native_token_diagnostic_probe(
         function(
             interface,
             native_user,
-            options,
+            diagnostic_options,
             method_ptr,
             url_ptr,
             0,
@@ -305,7 +313,7 @@ fn start_native_token_diagnostic_probe(
     }
 
     bridge_info(&format!(
-        "pre-XSTS builder 诊断 native token 请求已启动 | rp={relying_party_for_log} | native_xuid={native_xuid} | mode=trigger-builder-probe-only | result_returned_to_minecraft=false | result_discarded=true | secrets_logged=false"
+        "pre-XSTS builder 诊断 native token 请求已启动 | rp={relying_party_for_log} | native_xuid={native_xuid} | mode=trigger-builder-probe-only | diagnostic_force_refresh=true | original_options=0x{options:08X} | diagnostic_options=0x{diagnostic_options:08X} | result_returned_to_minecraft=false | result_discarded=true | secrets_logged=false"
     ));
 }
 
