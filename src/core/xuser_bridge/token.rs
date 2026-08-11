@@ -27,11 +27,11 @@ const MULTIPLAYER_RP: &str = "https://multiplayer.minecraft.net/";
 const REALMS_RP: &str = "https://pocket.realms.minecraft.net/";
 const LICENSING_RP: &str = "http://licensing.xboxlive.com";
 
-static ROUTE_LOGGED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-static DIAGNOSTIC_PROBES_STARTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-
 const XUSER_ADD_DEFAULT_USER_SILENTLY: u32 = 0x01;
 const XUSER_TOKEN_FORCE_REFRESH: u32 = 0x01;
+
+static ROUTE_LOGGED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static DIAGNOSTIC_PROBES_STARTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 macro_rules! hresult_try {
     ($expression:expr) => {
@@ -61,18 +61,19 @@ fn native_token_slot(index: usize) -> Result<usize, HResult> {
     xuser::native_base_slot(index).ok_or(E_FAIL)
 }
 
-fn diagnostic_probe_once(key: String) -> bool {
+fn diagnostic_probe_once(relying_party: &str) -> bool {
     DIAGNOSTIC_PROBES_STARTED
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(key)
+        .insert(relying_party.to_string())
 }
 
 struct NativeAddProbeContext {
     relying_party: String,
     url: String,
-    options: u32,
+    original_options: u32,
+    diagnostic_options: u32,
 }
 
 struct NativeTokenProbeContext {
@@ -81,6 +82,8 @@ struct NativeTokenProbeContext {
     native_xuid: u64,
     method: CString,
     url: CString,
+    original_options: u32,
+    diagnostic_options: u32,
 }
 
 fn native_add_result(async_block: *mut XAsyncBlock, user: *mut XUserHandle) -> HResult {
@@ -125,15 +128,14 @@ fn close_native_user(user: XUserHandle) {
 }
 
 fn start_pre_xsts_diagnostic_probe(relying_party: &str, url: &str, options: u32) {
-    let key = relying_party.to_string();
-    if !diagnostic_probe_once(key) {
-        log_once(format!("diagnostic-duplicate:{relying_party}"), || {
-            bridge_info(&format!(
-                "pre-XSTS builder 诊断已存在；跳过重复启动 | rp={relying_party} | reason=diagnostic-already-started-or-completed | secrets_logged=false"
-            ));
-        });
+    if !diagnostic_probe_once(relying_party) {
+        bridge_info(&format!(
+            "pre-XSTS builder 诊断已存在；跳过重复启动 | rp={relying_party} | reason=diagnostic-already-started | result_discarded=true | secrets_logged=false"
+        ));
         return;
     }
+
+    let diagnostic_options = options | XUSER_TOKEN_FORCE_REFRESH;
 
     let (Ok(interface), Ok(slot)) = (native_token_interface(), native_token_slot(7)) else {
         bridge_warn(&format!(
@@ -145,7 +147,8 @@ fn start_pre_xsts_diagnostic_probe(relying_party: &str, url: &str, options: u32)
     let context = Box::new(NativeAddProbeContext {
         relying_party: relying_party.to_string(),
         url: url.to_string(),
-        options,
+        original_options: options,
+        diagnostic_options,
     });
     let context_ptr = Box::into_raw(context);
 
@@ -173,7 +176,7 @@ fn start_pre_xsts_diagnostic_probe(relying_party: &str, url: &str, options: u32)
     }
 
     bridge_info(&format!(
-        "pre-XSTS builder 诊断 native Add 已启动 | rp={relying_party} | mode=silent-diagnostic | system_login_ui=not-invoked | result_discarded=true | secrets_logged=false"
+        "pre-XSTS builder 诊断 native Add 已启动 | rp={relying_party} | mode=silent-diagnostic | system_login_ui=not-invoked | original_options=0x{options:08X} | diagnostic_options=0x{diagnostic_options:08X} | diagnostic_force_refresh=true | result_discarded=true | secrets_logged=false"
     ));
 }
 
@@ -192,7 +195,8 @@ unsafe extern "system" fn native_add_probe_complete(async_block: *mut XAsyncBloc
     let NativeAddProbeContext {
         relying_party,
         url,
-        options,
+        original_options,
+        diagnostic_options,
     } = *context;
 
     let mut native_user = ptr::null_mut();
@@ -220,16 +224,24 @@ unsafe extern "system" fn native_add_probe_complete(async_block: *mut XAsyncBloc
     };
 
     bridge_info(&format!(
-        "pre-XSTS builder 诊断 native 用户已建立 | rp={relying_party} | native_xuid={native_xuid} | purpose=trigger-builder-probe-only | result_discarded=true | secrets_logged=false"
+        "pre-XSTS builder 诊断 native 用户已建立 | rp={relying_party} | native_xuid={native_xuid} | purpose=trigger-builder-probe-only | diagnostic_force_refresh=true | result_discarded=true | secrets_logged=false"
     ));
 
-    start_native_token_diagnostic_probe(relying_party, url, options, native_user, native_xuid);
+    start_native_token_diagnostic_probe(
+        relying_party,
+        url,
+        original_options,
+        diagnostic_options,
+        native_user,
+        native_xuid,
+    );
 }
 
 fn start_native_token_diagnostic_probe(
     relying_party: String,
     url: String,
-    options: u32,
+    original_options: u32,
+    diagnostic_options: u32,
     native_user: XUserHandle,
     native_xuid: u64,
 ) {
@@ -250,14 +262,14 @@ fn start_native_token_diagnostic_probe(
     };
     let method = CString::new("GET").expect("static diagnostic method has no interior NUL");
 
-    let diagnostic_options = options | XUSER_TOKEN_FORCE_REFRESH;
-
     let context = Box::new(NativeTokenProbeContext {
         relying_party,
         native_user,
         native_xuid,
         method,
         url,
+        original_options,
+        diagnostic_options,
     });
     let method_ptr = context.method.as_ptr();
     let url_ptr = context.url.as_ptr();
@@ -306,14 +318,14 @@ fn start_native_token_diagnostic_probe(
         }
         close_native_user(native_user);
         bridge_warn(&format!(
-            "pre-XSTS builder 诊断 native token 请求启动失败；已关闭诊断 native 句柄 | rp={relying_party_for_log} | native_xuid={native_xuid} | result=0x{:08X} | result_returned_to_minecraft=false | secrets_logged=false",
+            "pre-XSTS builder 诊断 native token 请求启动失败；已关闭诊断 native 句柄 | rp={relying_party_for_log} | native_xuid={native_xuid} | result=0x{:08X} | original_options=0x{original_options:08X} | diagnostic_options=0x{diagnostic_options:08X} | diagnostic_force_refresh=true | result_returned_to_minecraft=false | secrets_logged=false",
             result as u32
         ));
         return;
     }
 
     bridge_info(&format!(
-        "pre-XSTS builder 诊断 native token 请求已启动 | rp={relying_party_for_log} | native_xuid={native_xuid} | mode=trigger-builder-probe-only | diagnostic_force_refresh=true | original_options=0x{options:08X} | diagnostic_options=0x{diagnostic_options:08X} | result_returned_to_minecraft=false | result_discarded=true | secrets_logged=false"
+        "pre-XSTS builder 诊断 native token 请求已启动 | rp={relying_party_for_log} | native_xuid={native_xuid} | mode=trigger-builder-probe-only | original_options=0x{original_options:08X} | diagnostic_options=0x{diagnostic_options:08X} | diagnostic_force_refresh=true | result_returned_to_minecraft=false | result_discarded=true | secrets_logged=false"
     ));
 }
 
@@ -334,11 +346,13 @@ unsafe extern "system" fn native_token_probe_complete(async_block: *mut XAsyncBl
     unsafe { drop(Box::from_raw(async_block)) };
 
     bridge_info(&format!(
-        "pre-XSTS builder 诊断 native token 请求完成并丢弃结果 | rp={} | native_xuid={} | result_size_status=0x{:08X} | result_size={} | result_returned_to_minecraft=false | token_body_read=false | secrets_logged=false",
+        "pre-XSTS builder 诊断 native token 请求完成并丢弃结果 | rp={} | native_xuid={} | result_size_status=0x{:08X} | result_size={} | original_options=0x{:08X} | diagnostic_options=0x{:08X} | diagnostic_force_refresh=true | result_returned_to_minecraft=false | token_body_read=false | secrets_logged=false",
         context.relying_party,
         context.native_xuid,
         size_status as u32,
         result_size,
+        context.original_options,
+        context.diagnostic_options,
     ));
 
     close_native_user(context.native_user);
@@ -359,7 +373,11 @@ fn native_token_result_size(async_block: *mut XAsyncBlock, size: *mut usize) -> 
 ///
 /// Different-account and no-system-account cases intentionally share the same
 /// path: neither is allowed to borrow an unrelated native user's final XSTS.
-fn official_user_for_request(relying_party: &str, url: &str, options: u32) -> Result<XUserHandle, HResult> {
+fn official_user_for_request(
+    relying_party: &str,
+    url: &str,
+    options: u32,
+) -> Result<XUserHandle, HResult> {
     let runtime = session().ok_or(E_FAIL)?;
     if runtime.custom_user_token().is_none() {
         bridge_warn(&format!(
