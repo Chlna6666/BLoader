@@ -14,7 +14,7 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Console::{
     AllocConsole, CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS,
     ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WRAP_AT_EOL_OUTPUT, FreeConsole, GetConsoleMode,
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WRAP_AT_EOL_OUTPUT, GetConsoleMode,
     GetConsoleScreenBufferInfo, GetConsoleWindow, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
     STD_OUTPUT_HANDLE, SetConsoleMode, SetConsoleTitleW, SetStdHandle,
 };
@@ -39,29 +39,27 @@ unsafe extern "system" {
 }
 
 /// Opens the runtime console immediately once the post-OEP worker reaches this
-/// point. There is no Windows Terminal spawn, named-pipe handshake, watchdog,
-/// shell bridge, or auxiliary host process on the default path.
+/// point. Existing console associations are always reused. BLoader never tears
+/// down one console just to allocate another; AllocConsole is used only when the
+/// process has no console association at all.
 pub unsafe fn init_console() {
     let existing_window = GetConsoleWindow();
     let has_associated_console = existing_window.0 != null_mut();
     let has_visible_console = has_associated_console && IsWindowVisible(existing_window).as_bool();
 
     logging::write_bootstrap_marker(&format!(
-        "console.visibility.probe associated={} visible={} backend=classic-direct",
-        has_associated_console, has_visible_console
+        "console.visibility.probe associated={} visible={} backend=classic-direct allocation={}",
+        has_associated_console,
+        has_visible_console,
+        if has_associated_console { "reuse" } else { "single" }
     ));
 
-    init_classic_console(has_visible_console);
+    init_classic_console(has_associated_console);
 }
 
-unsafe fn init_classic_console(is_existing_visible: bool) {
+unsafe fn init_classic_console(has_existing_console: bool) {
     let mut window = GetConsoleWindow();
-    if is_existing_visible {
-        let _ = ShowWindow(window, SW_SHOW);
-    } else {
-        if window.0 != null_mut() {
-            let _ = FreeConsole();
-        }
+    if !has_existing_console {
         let _ = AllocConsole();
         window = GetConsoleWindow();
     }
@@ -73,6 +71,9 @@ unsafe fn init_classic_console(is_existing_visible: bool) {
         if !menu.is_invalid() {
             let _ = DeleteMenu(menu, SC_CLOSE, MF_BYCOMMAND);
         }
+        // For a normal Console Host this guarantees visibility. Under a
+        // pseudoconsole/terminal delegation this HWND may be message-only; in
+        // either case we keep the existing association instead of reallocating.
         let _ = ShowWindow(window, SW_SHOW);
     }
 
@@ -147,8 +148,8 @@ unsafe fn init_classic_console(is_existing_visible: bool) {
     logging::scoped_debug_message(
         "console",
         &format!(
-            "runtime console ready | backend=classic-direct | source={} | quick_edit=true | scrollback={} | columns={} | file_io={} | handshake_ms=0",
-            if is_existing_visible { "existing-visible" } else { "allocated-visible" },
+            "runtime console ready | backend=classic-direct | source={} | quick_edit=true | scrollback={} | columns={} | file_io={} | handshake_ms=0 | realloc=false",
+            if has_existing_console { "existing-associated" } else { "allocated-once" },
             CLASSIC_SCROLLBACK_LINES,
             visible_columns(h_conout),
             file_io_policy::mode_label(),
