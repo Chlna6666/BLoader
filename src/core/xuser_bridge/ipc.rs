@@ -22,7 +22,7 @@ const PIPE_VERSION: u32 = 1;
 const PIPE_HEADER_SIZE: usize = 80;
 const MAX_PAYLOAD_SIZE: usize = 256 * 1024;
 const MIN_TOKEN_REMAINING_SECONDS: u64 = 30;
-const AUTH_MODE: &str = "official-runtime-user-token-v3";
+const AUTH_MODE: &str = "official-runtime-user-token-v4";
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const OPEN_EXISTING: u32 = 3;
@@ -109,6 +109,10 @@ pub struct Session {
     pub privileges: Vec<u32>,
     pub tokens: Vec<TokenRecord>,
     pub user_token: UserToken,
+    /// Non-secret BMCBL observation of the Windows Xbox identity. This value
+    /// only gates whether native AddDefaultUserSilently may be attempted; any
+    /// returned native handle is independently verified by GetId before use.
+    pub native_system_xuid_hint: Option<u64>,
 }
 
 unsafe impl Send for Session {}
@@ -118,6 +122,10 @@ impl Session {
     pub fn custom_user_token(&self) -> Option<&str> {
         (self.user_token.expires_at > now_epoch().saturating_add(MIN_TOKEN_REMAINING_SECONDS))
             .then_some(self.user_token.token.as_str())
+    }
+
+    pub fn native_same_account_hint(&self) -> bool {
+        self.native_system_xuid_hint == Some(self.xuid)
     }
 }
 
@@ -133,6 +141,8 @@ struct WireDocument {
     xbl_privileges: Option<String>,
     user_token: String,
     user_token_expiry_epoch: String,
+    #[serde(default)]
+    native_system_xuid_hint: Option<String>,
 }
 
 /// Opens exactly one BMCBL pipe named for the current Minecraft PID. If the
@@ -253,7 +263,7 @@ fn receive_payload() -> Result<Option<Vec<u8>>, String> {
 fn parse_session(payload: &[u8]) -> Result<Session, String> {
     let document: WireDocument = serde_json::from_slice(payload).map_err(|error| {
         let kind = match error.classify() {
-            serde_json::error::Category::Data => "utoken-v3-schema-mismatch",
+            serde_json::error::Category::Data => "utoken-v4-schema-mismatch",
             serde_json::error::Category::Syntax => "json-syntax-invalid",
             serde_json::error::Category::Eof => "json-truncated",
             serde_json::error::Category::Io => "json-io-error",
@@ -286,6 +296,13 @@ fn parse_session(payload: &[u8]) -> Result<Session, String> {
     {
         return Err("invalid or expired Xbox UToken".to_string());
     }
+    let native_system_xuid_hint = match document.native_system_xuid_hint.as_deref() {
+        Some(value) if !value.is_empty() => Some(
+            parse_nonzero_decimal(value)
+                .ok_or_else(|| "invalid native system XUID hint".to_string())?,
+        ),
+        _ => None,
+    };
 
     let age_group = match document
         .xbl_age_group
@@ -309,8 +326,13 @@ fn parse_session(payload: &[u8]) -> Result<Session, String> {
     privileges.sort_unstable();
     privileges.dedup();
 
+    let native_relation = match native_system_xuid_hint {
+        Some(native) if native == xuid => "same",
+        Some(_) => "different",
+        None => "none",
+    };
     bridge_debug(&format!(
-        "BMCBL XUser UToken-only v3 session parsed | xbox_xuid={xuid} | gamertag_chars={} | privilege_count={} | user_token_remaining={}s | MSA=not-transferred | DToken=official-runtime | TToken=official-runtime | final_xsts=official-runtime | signature=official-runtime | secrets_logged=false",
+        "BMCBL XUser UToken-only v4 session parsed | xbox_xuid={xuid} | gamertag_chars={} | privilege_count={} | user_token_remaining={}s | native_system_identity={native_relation} | MSA=not-transferred | DToken=official-runtime | TToken=official-runtime | final_xsts=official-runtime | signature=official-runtime | secrets_logged=false",
         document.xbl_gamertag.chars().count(),
         privileges.len(),
         expires_at.saturating_sub(now),
@@ -330,6 +352,7 @@ fn parse_session(payload: &[u8]) -> Result<Session, String> {
             token: document.user_token.clone(),
             expires_at,
         },
+        native_system_xuid_hint,
     })
 }
 
@@ -411,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn utoken_v3_wire_document_accepts_current_bmcbl_schema() {
+    fn utoken_v4_wire_document_accepts_system_hint() {
         let payload = serde_json::json!({
             "auth_mode": AUTH_MODE,
             "xbl_xuid": "2535413569375435",
@@ -419,12 +442,17 @@ mod tests {
             "xbl_age_group": "Adult",
             "xbl_privileges": "185 254",
             "user_token": "test-user-token",
-            "user_token_expiry_epoch": "4102444800"
+            "user_token_expiry_epoch": "4102444800",
+            "native_system_xuid_hint": "2535413569375435"
         });
         let encoded = serde_json::to_vec(&payload).unwrap();
         let document: WireDocument = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(document.auth_mode.as_deref(), Some(AUTH_MODE));
         assert_eq!(document.xbl_gamertag, "BMCBLTest");
         assert_eq!(document.user_token, "test-user-token");
+        assert_eq!(
+            document.native_system_xuid_hint.as_deref(),
+            Some("2535413569375435")
+        );
     }
 }
