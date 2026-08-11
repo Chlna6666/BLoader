@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 #![allow(non_snake_case)]
 
-use std::ffi::{CStr, c_void};
+use std::ffi::c_void;
 use std::process::{Command, Stdio};
 use std::ptr::null_mut;
 use std::sync::Arc;
@@ -13,15 +13,14 @@ use std::time::Duration;
 use crate::runtime::foundation::{build_info, console_branding, file_io_policy, i18n, logging};
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
-    WriteFile,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, WriteFile,
 };
 use windows::Win32::System::Console::{
     AllocConsole, CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS,
     ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
     ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WRAP_AT_EOL_OUTPUT, FreeConsole, GetConsoleMode,
-    GetConsoleScreenBufferInfo, GetConsoleWindow, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
-    STD_OUTPUT_HANDLE, SetConsoleMode, SetConsoleOutputCP, SetConsoleTitleW, SetStdHandle,
+    GetConsoleScreenBufferInfo, GetConsoleWindow, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE, SetConsoleMode, SetConsoleTitleW, SetStdHandle,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -33,12 +32,11 @@ const CLASSIC_SCROLLBACK_LINES: i16 = 12_000;
 const ERROR_PIPE_CONNECTED: u32 = 535;
 const PIPE_ACCESS_OUTBOUND: u32 = 0x0000_0002;
 const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
-const BRIDGE_OPEN_RETRIES: usize = 750;
-const BRIDGE_OPEN_RETRY_MS: u64 = 2;
-const WINDOWS_TERMINAL_HANDSHAKE_TIMEOUT_MS: u64 = 1_200;
+const WINDOWS_TERMINAL_HANDSHAKE_TIMEOUT_MS: u64 = 2_500;
 const BACKEND_PENDING: u8 = 0;
 const BACKEND_WINDOWS_TERMINAL: u8 = 1;
 const BACKEND_CLASSIC: u8 = 2;
+const CONSOLE_HOST_EXE: &str = "BLoaderConsoleHost.exe";
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -159,9 +157,6 @@ unsafe fn init_classic_console(is_existing_visible: bool) {
             true,
         );
 
-        // Queue the synthetic identity block before installing the sink. The
-        // sink installation flushes all earlier startup logs only after the
-        // banner is complete, then starts the external structured-log relay.
         emit_runtime_identity();
         logging::set_console_handle(h_conout);
     }
@@ -225,18 +220,17 @@ fn launch_windows_terminal_async() -> bool {
         logging::write_bootstrap_marker("console.windows_terminal.loader_dir.missing fallback=classic");
         return false;
     };
-    let Some(loader_name) = loader_path.file_name().and_then(|name| name.to_str()) else {
+
+    let host_path = loader_dir.join(CONSOLE_HOST_EXE);
+    if !host_path.is_file() {
         unsafe { close_handle_raw(raw_pipe); }
-        logging::write_bootstrap_marker("console.windows_terminal.loader_name.invalid fallback=classic");
-        return false;
-    };
-    if loader_name.contains(',') {
-        unsafe { close_handle_raw(raw_pipe); }
-        logging::write_bootstrap_marker("console.windows_terminal.loader_name.comma fallback=classic");
+        logging::write_bootstrap_marker(&format!(
+            "console.windows_terminal.host.missing path={} fallback=classic",
+            host_path.display()
+        ));
         return false;
     }
 
-    let bridge_entry = format!(r".\{loader_name},BLoaderConsoleBridge");
     let title = format!(
         "BLoader {} | Minecraft {} | Runtime Console",
         build_info::VERSION,
@@ -244,21 +238,16 @@ fn launch_windows_terminal_async() -> bool {
     );
 
     logging::write_bootstrap_marker(&format!(
-        "console.windows_terminal.spawn.begin dir={} bridge={} pipe={}",
-        loader_dir.display(), bridge_entry, pipe_leaf
+        "console.windows_terminal.spawn.begin dir={} host={} pipe={} transport=named-pipe",
+        loader_dir.display(), host_path.display(), pipe_leaf
     ));
 
     let mut wt = Command::new("wt.exe");
-    wt.args(["-w", "new", "new-tab", "--startingDirectory"]);
+    wt.args(["-w", "-1", "new-tab", "--startingDirectory"]);
     wt.arg(loader_dir.as_os_str());
-    wt.args([
-        "--title",
-        title.as_str(),
-        "--suppressApplicationTitle",
-        "rundll32.exe",
-        bridge_entry.as_str(),
-        pipe_path.as_str(),
-    ]);
+    wt.args(["--title", title.as_str(), "--suppressApplicationTitle"]);
+    wt.arg(host_path.as_os_str());
+    wt.args(["--pipe", pipe_path.as_str()]);
 
     if let Err(error) = wt
         .stdin(Stdio::null())
@@ -323,7 +312,7 @@ fn launch_windows_terminal_async() -> bool {
             logging::set_console_stream_handle(handle, true);
             logging::scoped_debug_message(
                 "console",
-                "runtime console ready | backend=windows-terminal | transport=named-pipe | reader=bloader-rundll32-native | banner=bridge-real-width | shell=false | powershell=false | startup_blocking=false",
+                "runtime console ready | backend=windows-terminal | transport=named-pipe | reader=BLoaderConsoleHost.exe | banner=host-real-width | shell=false | rundll32=false | startup_blocking=false",
             );
         });
 
@@ -375,110 +364,9 @@ fn launch_windows_terminal_async() -> bool {
     true
 }
 
-/// Runtime entry used only by the rundll32 Windows Terminal bridge process.
-/// The bridge draws the banner in the actual WT/ConPTY and then pumps the
-/// Minecraft process' named-pipe log stream to stdout.
-pub unsafe fn run_rundll32_console_bridge(cmdline: *const u8) {
-    let Some(pipe_path) = (unsafe { decode_bridge_cmdline(cmdline.cast()) }) else {
-        return;
-    };
-    let pipe_path = pipe_path.trim().trim_matches('"');
-    if pipe_path.is_empty() || !pipe_path.starts_with(r"\\.\pipe\BLoader.Console.") {
-        return;
-    }
-
-    let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }.unwrap_or_default();
-    if stdout.is_invalid() {
-        return;
-    }
-
-    unsafe {
-        let _ = SetConsoleOutputCP(65001);
-        let mut mode = CONSOLE_MODE(0);
-        if GetConsoleMode(stdout, &mut mode).is_ok() {
-            let _ = SetConsoleMode(
-                stdout,
-                CONSOLE_MODE(
-                    mode.0
-                        | ENABLE_PROCESSED_OUTPUT.0
-                        | ENABLE_WRAP_AT_EOL_OUTPUT.0
-                        | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0,
-                ),
-            );
-        }
-    }
-
-    render_branding(stdout, visible_columns(stdout), true, true);
-
-    let wide: Vec<u16> = pipe_path.encode_utf16().chain(Some(0)).collect();
-    let mut pipe = HANDLE::default();
-    for _ in 0..BRIDGE_OPEN_RETRIES {
-        match unsafe {
-            CreateFileW(
-                PCWSTR(wide.as_ptr()),
-                GENERIC_READ.0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                None,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                None,
-            )
-        } {
-            Ok(handle) if !handle.is_invalid() => {
-                pipe = handle;
-                break;
-            }
-            _ => thread::sleep(Duration::from_millis(BRIDGE_OPEN_RETRY_MS)),
-        }
-    }
-    if pipe.is_invalid() {
-        let _ = write_all_handle(
-            stdout,
-            b"\r\nBLoader: runtime log bridge connection failed.\r\n",
-        );
-        return;
-    }
-
-    let mut buffer = [0u8; 16 * 1024];
-    loop {
-        let mut read = 0u32;
-        if unsafe { ReadFile(pipe, Some(&mut buffer), Some(&mut read), None) }.is_err() || read == 0 {
-            break;
-        }
-        if !write_all_handle(stdout, &buffer[..read as usize]) {
-            break;
-        }
-    }
-
-    unsafe { close_handle_raw(pipe.0); }
-}
-
-unsafe fn decode_bridge_cmdline(cmdline: *const c_void) -> Option<String> {
-    if cmdline.is_null() {
-        return None;
-    }
-
-    let bytes = cmdline.cast::<u8>();
-    if unsafe { *bytes.add(1) } == 0 {
-        let wide = cmdline.cast::<u16>();
-        let mut len = 0usize;
-        while len < 32_768 && unsafe { *wide.add(len) } != 0 {
-            len += 1;
-        }
-        if len == 0 || len == 32_768 {
-            return None;
-        }
-        return Some(String::from_utf16_lossy(unsafe {
-            std::slice::from_raw_parts(wide, len)
-        }));
-    }
-
-    Some(
-        unsafe { CStr::from_ptr(cmdline.cast()) }
-            .to_string_lossy()
-            .into_owned(),
-    )
-}
+/// Legacy ABI compatibility only. Runtime Windows Terminal hosting no longer uses
+/// rundll32 or a DLL export; BLoaderConsoleHost.exe owns the client side.
+pub unsafe fn run_rundll32_console_bridge(_cmdline: *const u8) {}
 
 fn configure_classic_scrollback(handle: HANDLE) {
     if handle.is_invalid() {
@@ -610,9 +498,6 @@ fn replay_mod_inventory() {
     logging::info_message(&text);
 }
 
-/// Publishes state that is only authoritative after the synchronous preload and
-/// normal Mod loading phases have completed. This deliberately has no fixed
-/// sleep: slow PreLoader chains must not produce an early/incorrect inventory.
 pub fn publish_runtime_state() {
     replay_pre_main_load_state();
     replay_mod_inventory();
@@ -684,10 +569,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bridge_entry_uses_explicit_relative_dll_path() {
-        let loader_name = "BLoader.dll";
-        let bridge_entry = format!(r".\{loader_name},BLoaderConsoleBridge");
-        assert_eq!(bridge_entry, r".\BLoader.dll,BLoaderConsoleBridge");
-        assert!(!bridge_entry.contains(":"));
+    fn console_host_name_is_stable() {
+        assert_eq!(CONSOLE_HOST_EXE, "BLoaderConsoleHost.exe");
     }
 }
