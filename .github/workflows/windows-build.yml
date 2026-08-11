@@ -43,3 +43,5 @@ jobs:
           path: |
             target/x86_64-pc-windows-msvc/release/BLoader.dll
             target/x86_64-pc-windows-msvc/release/BLoader.pdb
+            target/x86_64-pc-windows-msvc/release/BLoaderConsoleHost.exe
+            target/x86_64-pc-windows-msvc/release/BLoaderConsoleHost.pdb
