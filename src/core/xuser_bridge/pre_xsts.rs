@@ -6,8 +6,8 @@ use sha2::{Digest as _, Sha256};
 use std::{
     mem, ptr,
     sync::{
-        OnceLock,
         atomic::{AtomicU32, AtomicUsize, Ordering},
+        OnceLock,
     },
 };
 
@@ -90,6 +90,7 @@ static ORIGINAL_PRE_XSTS_BUILDER: AtomicUsize = AtomicUsize::new(0);
 static PRE_XSTS_PROBE_CALLS: AtomicU32 = AtomicU32::new(0);
 static PROBE_MODULE_BASE: AtomicUsize = AtomicUsize::new(0);
 static PROBE_MODULE_SIZE: AtomicUsize = AtomicUsize::new(0);
+
 const MAX_PROBE_LOG_CALLS: u32 = 16;
 
 pub fn ensure_discovered() -> Result<DiscoverySummary, String> {
@@ -138,8 +139,6 @@ unsafe fn discover() -> Result<DiscoverySummary, String> {
         )
     };
 
-    // These are intentionally INFO-level. A non-debug user run must still carry
-    // the exact RVAs needed to match a local disassembly and write the next hook.
     log_marker(base, "UserTokens", &user_tokens);
     log_marker(base, "DeviceToken", &device_token);
     log_marker(base, "TitleToken", &title_token);
@@ -481,19 +480,13 @@ unsafe fn classify_probe_value(value: usize) -> String {
 
     format!(
         "mapped:state=0x{:X}:protect=0x{:X}:type=0x{:X}:region=0x{:X}:in_xgameruntime={}",
-        info.state,
-        info.protect,
-        info.type_,
-        info.region_size,
-        in_xgameruntime,
+        info.state, info.protect, info.type_, info.region_size, in_xgameruntime,
     )
 }
 
 unsafe fn lookup_function_bounds(base: usize, control_pc: usize) -> Option<FunctionBounds> {
     let mut image_base = 0u64;
-    let entry = unsafe {
-        RtlLookupFunctionEntry(control_pc as u64, &mut image_base, ptr::null_mut())
-    };
+    let entry = unsafe { RtlLookupFunctionEntry(control_pc as u64, &mut image_base, ptr::null_mut()) };
     if entry.is_null() || image_base as usize != base {
         return None;
     }
@@ -519,11 +512,7 @@ fn count_xrefs_in_function(locations: &MarkerLocations, bounds: FunctionBounds) 
 unsafe fn rip_lea_destination_register(address: usize) -> Option<&'static str> {
     let first = unsafe { read_u8(address) };
     let (rex, opcode, modrm) = if (0x40..=0x4f).contains(&first) {
-        (
-            first,
-            unsafe { read_u8(address + 1) },
-            unsafe { read_u8(address + 2) },
-        )
+        (first, unsafe { read_u8(address + 1) }, unsafe { read_u8(address + 2) })
     } else {
         (0, first, unsafe { read_u8(address + 1) })
     };
@@ -605,9 +594,7 @@ unsafe fn mapped_sections_sha256_prefix(base: usize, sections: &[Section]) -> St
     for section in sections {
         hasher.update((section.rva as u64).to_le_bytes());
         hasher.update((section.size as u64).to_le_bytes());
-        let bytes = unsafe {
-            core::slice::from_raw_parts((base + section.rva) as *const u8, section.size)
-        };
+        let bytes = unsafe { core::slice::from_raw_parts((base + section.rva) as *const u8, section.size) };
         hasher.update(bytes);
     }
     let digest = hasher.finalize();
@@ -767,13 +754,15 @@ mod tests {
 
     #[test]
     fn direct_call_scanner_resolves_rel32_target() {
-        let base = 0x1000usize;
-        let xref = 0x1100usize;
-        let target = 0x1200usize;
-        let displacement = (target as isize - (xref + 5) as isize) as i32;
-        let mut code = vec![0xe8];
-        code.extend_from_slice(&displacement.to_le_bytes());
-        let calls = unsafe { direct_call_candidates(base, 0x1000, xref, xref + code.len(), code.len()) };
-        assert_eq!(calls, vec![(xref, target)]);
+        let target_offset = 0x20usize;
+        let mut code = vec![0xe8, 0, 0, 0, 0, 0x90, 0x90, 0x90];
+        let base = code.as_ptr() as usize;
+        let call = base;
+        let target = base + target_offset;
+        let displacement = (target as isize - (call + 5) as isize) as i32;
+        code[1..5].copy_from_slice(&displacement.to_le_bytes());
+
+        let calls = unsafe { direct_call_candidates(base, 0x1000, call, call + code.len(), code.len()) };
+        assert_eq!(calls, vec![(call, target)]);
     }
 }
