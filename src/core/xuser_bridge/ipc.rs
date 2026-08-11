@@ -22,7 +22,7 @@ const PIPE_VERSION: u32 = 1;
 const PIPE_HEADER_SIZE: usize = 80;
 const MAX_PAYLOAD_SIZE: usize = 256 * 1024;
 const MIN_TOKEN_REMAINING_SECONDS: u64 = 30;
-const AUTH_MODE: &str = "official-runtime-user-token-v2";
+const AUTH_MODE: &str = "official-runtime-user-token-v3";
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const OPEN_EXISTING: u32 = 3;
@@ -95,13 +95,6 @@ pub struct UserToken {
     pub expires_at: u64,
 }
 
-#[derive(Zeroize, ZeroizeOnDrop)]
-pub struct MsaAccessToken {
-    pub token: String,
-    #[zeroize(skip)]
-    pub expires_at: u64,
-}
-
 /// Secret-free route summary used only by startup diagnostics.
 pub struct TokenRecord {
     pub relying_party: String,
@@ -116,7 +109,6 @@ pub struct Session {
     pub privileges: Vec<u32>,
     pub tokens: Vec<TokenRecord>,
     pub user_token: UserToken,
-    pub msa_access_token: MsaAccessToken,
 }
 
 unsafe impl Send for Session {}
@@ -126,12 +118,6 @@ impl Session {
     pub fn custom_user_token(&self) -> Option<&str> {
         (self.user_token.expires_at > now_epoch().saturating_add(MIN_TOKEN_REMAINING_SECONDS))
             .then_some(self.user_token.token.as_str())
-    }
-
-    pub fn custom_msa_access_token(&self) -> Option<&str> {
-        (self.msa_access_token.expires_at
-            > now_epoch().saturating_add(MIN_TOKEN_REMAINING_SECONDS))
-        .then_some(self.msa_access_token.token.as_str())
     }
 }
 
@@ -147,8 +133,6 @@ struct WireDocument {
     xbl_privileges: Option<String>,
     user_token: String,
     user_token_expiry_epoch: String,
-    msa_access_token: String,
-    msa_access_token_expiry_epoch: String,
 }
 
 /// Opens exactly one BMCBL pipe named for the current Minecraft PID. If the
@@ -269,7 +253,7 @@ fn receive_payload() -> Result<Option<Vec<u8>>, String> {
 fn parse_session(payload: &[u8]) -> Result<Session, String> {
     let document: WireDocument = serde_json::from_slice(payload).map_err(|error| {
         let kind = match error.classify() {
-            serde_json::error::Category::Data => "native-credential-schema-mismatch",
+            serde_json::error::Category::Data => "utoken-v3-schema-mismatch",
             serde_json::error::Category::Syntax => "json-syntax-invalid",
             serde_json::error::Category::Eof => "json-truncated",
             serde_json::error::Category::Io => "json-io-error",
@@ -292,24 +276,15 @@ fn parse_session(payload: &[u8]) -> Result<Session, String> {
     if document.xbl_gamertag.trim().is_empty() {
         return Err("empty gamertag".to_string());
     }
-    let user_expires_at = document
+    let expires_at = document
         .user_token_expiry_epoch
         .parse::<u64>()
         .map_err(|_| "invalid UToken expiry".to_string())?;
-    let msa_expires_at = document
-        .msa_access_token_expiry_epoch
-        .parse::<u64>()
-        .map_err(|_| "invalid MSA access token expiry".to_string())?;
     let now = now_epoch();
     if document.user_token.is_empty()
-        || user_expires_at <= now.saturating_add(MIN_TOKEN_REMAINING_SECONDS)
+        || expires_at <= now.saturating_add(MIN_TOKEN_REMAINING_SECONDS)
     {
         return Err("invalid or expired Xbox UToken".to_string());
-    }
-    if document.msa_access_token.is_empty()
-        || msa_expires_at <= now.saturating_add(MIN_TOKEN_REMAINING_SECONDS)
-    {
-        return Err("invalid or expired Microsoft access token".to_string());
     }
 
     let age_group = match document
@@ -335,11 +310,10 @@ fn parse_session(payload: &[u8]) -> Result<Session, String> {
     privileges.dedup();
 
     bridge_debug(&format!(
-        "BMCBL XUser native-credential session parsed | xbox_xuid={xuid} | gamertag_chars={} | privilege_count={} | user_token_remaining={}s | msa_access_token_remaining={}s | final_xsts=official-runtime | signing_key=official-runtime | secrets_logged=false",
+        "BMCBL XUser UToken-only v3 session parsed | xbox_xuid={xuid} | gamertag_chars={} | privilege_count={} | user_token_remaining={}s | MSA=not-transferred | DToken=official-runtime | TToken=official-runtime | final_xsts=official-runtime | signature=official-runtime | secrets_logged=false",
         document.xbl_gamertag.chars().count(),
         privileges.len(),
-        user_expires_at.saturating_sub(now),
-        msa_expires_at.saturating_sub(now),
+        expires_at.saturating_sub(now),
     ));
 
     Ok(Session {
@@ -348,23 +322,13 @@ fn parse_session(payload: &[u8]) -> Result<Session, String> {
         gamertag: document.xbl_gamertag.clone(),
         age_group,
         privileges,
-        tokens: vec![
-            TokenRecord {
-                relying_party: "xasu-user-token".to_string(),
-                expires_at: user_expires_at,
-            },
-            TokenRecord {
-                relying_party: "msa-access-token".to_string(),
-                expires_at: msa_expires_at,
-            },
-        ],
+        tokens: vec![TokenRecord {
+            relying_party: "xasu-user-token".to_string(),
+            expires_at,
+        }],
         user_token: UserToken {
             token: document.user_token.clone(),
-            expires_at: user_expires_at,
-        },
-        msa_access_token: MsaAccessToken {
-            token: document.msa_access_token.clone(),
-            expires_at: msa_expires_at,
+            expires_at,
         },
     })
 }
@@ -447,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn native_credential_wire_document_accepts_current_bmcbl_schema() {
+    fn utoken_v3_wire_document_accepts_current_bmcbl_schema() {
         let payload = serde_json::json!({
             "auth_mode": AUTH_MODE,
             "xbl_xuid": "2535413569375435",
@@ -455,15 +419,12 @@ mod tests {
             "xbl_age_group": "Adult",
             "xbl_privileges": "185 254",
             "user_token": "test-user-token",
-            "user_token_expiry_epoch": "4102444800",
-            "msa_access_token": "test-msa-access-token",
-            "msa_access_token_expiry_epoch": "4102444800"
+            "user_token_expiry_epoch": "4102444800"
         });
         let encoded = serde_json::to_vec(&payload).unwrap();
         let document: WireDocument = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(document.auth_mode.as_deref(), Some(AUTH_MODE));
         assert_eq!(document.xbl_gamertag, "BMCBLTest");
         assert_eq!(document.user_token, "test-user-token");
-        assert_eq!(document.msa_access_token, "test-msa-access-token");
     }
 }
