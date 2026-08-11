@@ -4,7 +4,7 @@ use core::ffi::c_void;
 use sha2::{Digest as _, Sha256};
 use std::{ptr, sync::OnceLock};
 
-use super::super::{bridge_debug, bridge_info, bridge_warn};
+use super::super::{bridge_info, bridge_warn};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DiscoverySummary {
@@ -65,6 +65,7 @@ unsafe fn discover() -> Result<DiscoverySummary, String> {
     if module.is_null() {
         return Err("xgameruntime.dll is not loaded".to_string());
     }
+
     let base = module as usize;
     let (image_size, sections) = unsafe { parse_pe_sections(base) }?;
     let executable = sections
@@ -72,9 +73,10 @@ unsafe fn discover() -> Result<DiscoverySummary, String> {
         .copied()
         .filter(|section| section.executable)
         .collect::<Vec<_>>();
+    let module_hash = unsafe { mapped_sections_sha256_prefix(base, &sections) };
 
     bridge_info(&format!(
-        "开始定位 Microsoft Runtime pre-XSTS 聚合候选 | module=xgameruntime.dll | image_size=0x{image_size:X} | readable_sections={} | executable_sections={} | secrets_logged=false",
+        "开始定位 Microsoft Runtime pre-XSTS 聚合候选 | module=xgameruntime.dll | image_size=0x{image_size:X} | readable_sections={} | executable_sections={} | mapped_sections_sha256_prefix={module_hash} | secrets_logged=false",
         sections.len(),
         executable.len(),
     ));
@@ -92,6 +94,8 @@ unsafe fn discover() -> Result<DiscoverySummary, String> {
         )
     };
 
+    // These are intentionally INFO-level. A non-debug user run must still carry
+    // the exact RVAs needed to match a local disassembly and write the next hook.
     log_marker(base, "UserTokens", &user_tokens);
     log_marker(base, "DeviceToken", &device_token);
     log_marker(base, "TitleToken", &title_token);
@@ -134,7 +138,7 @@ unsafe fn discover() -> Result<DiscoverySummary, String> {
         );
     } else {
         bridge_info(&format!(
-            "Microsoft Runtime pre-XSTS builder 函数边界已解析 | user_tokens_markers={} | user_tokens_text_xrefs={} | function_candidates={} | high_confidence_candidates={} | next=resolve-builder-call-abi",
+            "Microsoft Runtime pre-XSTS builder 函数边界已解析 | user_tokens_markers={} | user_tokens_text_xrefs={} | function_candidates={} | high_confidence_candidates={} | mapped_sections_sha256_prefix={module_hash} | next=resolve-builder-call-abi",
             summary.user_tokens_markers,
             summary.user_tokens_xrefs,
             summary.user_tokens_function_candidates,
@@ -199,19 +203,19 @@ fn log_marker(base: usize, name: &str, locations: &MarkerLocations) {
     let marker_rvas = locations
         .addresses
         .iter()
-        .take(8)
+        .take(16)
         .map(|address| format!("0x{:X}", address.saturating_sub(base)))
         .collect::<Vec<_>>()
         .join(",");
     let xref_rvas = locations
         .xrefs
         .iter()
-        .take(16)
+        .take(32)
         .map(|address| format!("0x{:X}", address.saturating_sub(base)))
         .collect::<Vec<_>>()
         .join(",");
-    bridge_debug(&format!(
-        "pre-XSTS marker scan | marker={name} | occurrences={} | text_xrefs={} | marker_rvas=[{marker_rvas}] | xref_rvas=[{xref_rvas}]",
+    bridge_info(&format!(
+        "pre-XSTS marker scan | marker={name} | occurrences={} | text_xrefs={} | marker_rvas=[{marker_rvas}] | xref_rvas=[{xref_rvas}] | secrets_logged=false",
         locations.addresses.len(),
         locations.xrefs.len(),
     ));
@@ -255,26 +259,19 @@ unsafe fn log_user_tokens_function_candidates(
         }
 
         let lea_register = unsafe { rip_lea_destination_register(*xref) }.unwrap_or("unknown");
-        let direct_calls = unsafe {
-            direct_call_candidates_after_xref(base, image_size, *xref, bounds.end, 96)
+        let direct_calls_after_xref = unsafe {
+            direct_call_candidates(base, image_size, *xref, bounds.end, 160)
         };
-        let direct_call_summary = direct_calls
-            .iter()
-            .take(12)
-            .map(|(call, target)| {
-                format!(
-                    "0x{:X}->0x{:X}(+0x{:X})",
-                    call.saturating_sub(base),
-                    target.saturating_sub(base),
-                    call.saturating_sub(*xref),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
+        let direct_calls_in_function = unsafe {
+            direct_call_candidates(base, image_size, bounds.begin, bounds.end, bounds.end - bounds.begin)
+        };
+        let after_xref_summary = format_direct_calls(base, *xref, &direct_calls_after_xref);
+        let function_call_summary = format_direct_calls(base, bounds.begin, &direct_calls_in_function);
         let function_hash = unsafe { function_sha256_prefix(bounds) };
+        let xref_window_hash = unsafe { window_sha256_prefix(*xref, 96, bounds.end) };
 
         bridge_info(&format!(
-            "pre-XSTS UserTokens function candidate | xref_rva=0x{:X} | function_begin_rva=0x{:X} | function_end_rva=0x{:X} | function_size=0x{:X} | unwind_rva=0x{:X} | lea_destination={} | DeviceToken_xrefs_in_function={} | TitleToken_xrefs_in_function={} | xsts_authorize_xrefs_in_function={} | xsts_host_xrefs_in_function={} | co_marker_classes={} | direct_call_candidates_after_xref=[{}] | function_sha256_prefix={} | secrets_logged=false",
+            "pre-XSTS UserTokens function candidate | xref_rva=0x{:X} | function_begin_rva=0x{:X} | function_end_rva=0x{:X} | function_size=0x{:X} | unwind_rva=0x{:X} | lea_destination={} | DeviceToken_xrefs_in_function={} | TitleToken_xrefs_in_function={} | xsts_authorize_xrefs_in_function={} | xsts_host_xrefs_in_function={} | co_marker_classes={} | direct_call_candidates_after_xref=[{}] | direct_call_targets_in_function=[{}] | function_sha256_prefix={} | xref_window_sha256_prefix={} | secrets_logged=false",
             xref.saturating_sub(base),
             bounds.begin.saturating_sub(base),
             bounds.end.saturating_sub(base),
@@ -286,8 +283,10 @@ unsafe fn log_user_tokens_function_candidates(
             authorize_refs,
             host_refs,
             co_marker_classes,
-            direct_call_summary,
+            after_xref_summary,
+            function_call_summary,
             function_hash,
+            xref_window_hash,
         ));
     }
 
@@ -343,18 +342,18 @@ unsafe fn rip_lea_destination_register(address: usize) -> Option<&'static str> {
     REGISTERS.get(register as usize).copied()
 }
 
-unsafe fn direct_call_candidates_after_xref(
+unsafe fn direct_call_candidates(
     base: usize,
     image_size: usize,
-    xref: usize,
-    function_end: usize,
+    start: usize,
+    end: usize,
     max_bytes: usize,
 ) -> Vec<(usize, usize)> {
-    let end = xref.saturating_add(max_bytes).min(function_end);
-    if end <= xref || end - xref < 5 {
+    let end = start.saturating_add(max_bytes).min(end);
+    if end <= start || end - start < 5 {
         return Vec::new();
     }
-    let code = unsafe { core::slice::from_raw_parts(xref as *const u8, end - xref) };
+    let code = unsafe { core::slice::from_raw_parts(start as *const u8, end - start) };
     let image_end = base.saturating_add(image_size);
     let mut calls = Vec::new();
     for index in 0..=code.len() - 5 {
@@ -362,7 +361,7 @@ unsafe fn direct_call_candidates_after_xref(
             continue;
         }
         let displacement = i32::from_le_bytes(code[index + 1..index + 5].try_into().unwrap()) as isize;
-        let call = xref + index;
+        let call = start + index;
         let target = (call + 5).wrapping_add_signed(displacement);
         if target >= base && target < image_end {
             calls.push((call, target));
@@ -371,12 +370,58 @@ unsafe fn direct_call_candidates_after_xref(
     calls
 }
 
+fn format_direct_calls(base: usize, anchor: usize, calls: &[(usize, usize)]) -> String {
+    calls
+        .iter()
+        .take(16)
+        .map(|(call, target)| {
+            format!(
+                "0x{:X}->0x{:X}(+0x{:X})",
+                call.saturating_sub(base),
+                target.saturating_sub(base),
+                call.saturating_sub(anchor),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 unsafe fn function_sha256_prefix(bounds: FunctionBounds) -> String {
     let size = bounds.end.saturating_sub(bounds.begin).min(1024 * 1024);
     if size == 0 {
         return "none".to_string();
     }
     let bytes = unsafe { core::slice::from_raw_parts(bounds.begin as *const u8, size) };
+    sha256_prefix(bytes)
+}
+
+unsafe fn window_sha256_prefix(start: usize, max_bytes: usize, function_end: usize) -> String {
+    let end = start.saturating_add(max_bytes).min(function_end);
+    if end <= start {
+        return "none".to_string();
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(start as *const u8, end - start) };
+    sha256_prefix(bytes)
+}
+
+unsafe fn mapped_sections_sha256_prefix(base: usize, sections: &[Section]) -> String {
+    let mut hasher = Sha256::new();
+    for section in sections {
+        hasher.update((section.rva as u64).to_le_bytes());
+        hasher.update((section.size as u64).to_le_bytes());
+        let bytes = unsafe {
+            core::slice::from_raw_parts((base + section.rva) as *const u8, section.size)
+        };
+        hasher.update(bytes);
+    }
+    let digest = hasher.finalize();
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn sha256_prefix(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest[..8]
         .iter()
@@ -466,7 +511,8 @@ unsafe fn parse_pe_sections(base: usize) -> Result<(usize, Vec<Section>), String
         let characteristics = unsafe { read_u32(header + 36) };
         let readable = characteristics & 0x4000_0000 != 0;
         let executable = characteristics & 0x2000_0000 != 0;
-        if (!readable && !executable) || virtual_address >= image_size {
+        let discardable = characteristics & 0x0200_0000 != 0;
+        if discardable || (!readable && !executable) || virtual_address >= image_size {
             continue;
         }
         let requested = virtual_size.max(raw_size);
@@ -531,19 +577,7 @@ mod tests {
         let displacement = (target as isize - (xref + 5) as isize) as i32;
         let mut code = vec![0xe8];
         code.extend_from_slice(&displacement.to_le_bytes());
-        let calls = code
-            .windows(5)
-            .enumerate()
-            .filter_map(|(index, value)| {
-                if value[0] != 0xe8 {
-                    return None;
-                }
-                let displacement = i32::from_le_bytes(value[1..5].try_into().unwrap()) as isize;
-                let call = xref + index;
-                Some((call, (call + 5).wrapping_add_signed(displacement)))
-            })
-            .collect::<Vec<_>>();
+        let calls = unsafe { direct_call_candidates(base, 0x1000, xref, xref + code.len(), code.len()) };
         assert_eq!(calls, vec![(xref, target)]);
-        assert!(target >= base);
     }
 }
