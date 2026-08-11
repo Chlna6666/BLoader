@@ -2,8 +2,12 @@
 
 use core::ffi::c_void;
 use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{mem, ptr, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    mem, ptr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{
@@ -249,11 +253,30 @@ fn receive_payload() -> Result<Option<Vec<u8>>, String> {
 }
 
 fn parse_session(payload: &[u8]) -> Result<Session, String> {
-    let document: WireDocument = serde_json::from_slice(payload)
-        .map_err(|_| "pre-authentication payload is not valid JSON".to_string())?;
-    if document.auth_mode.as_deref().is_some_and(|mode| mode != AUTH_MODE) {
-        return Err("unsupported BMCBL Xbox authentication mode".to_string());
+    let envelope: Value = serde_json::from_slice(payload).map_err(|error| {
+        format!(
+            "BMCBL XUser payload JSON syntax invalid | line={} | column={} | category={:?}",
+            error.line(),
+            error.column(),
+            error.classify(),
+        )
+    })?;
+    let auth_mode = envelope.get("auth_mode").and_then(Value::as_str);
+    if auth_mode != Some(AUTH_MODE) {
+        return Err(format!(
+            "BMCBL XUser payload protocol mismatch | expected_auth_mode={AUTH_MODE} | received_auth_mode={}",
+            auth_mode.unwrap_or("<missing-or-non-string>")
+        ));
     }
+
+    let document: WireDocument = serde_json::from_value(envelope).map_err(|error| {
+        format!(
+            "BMCBL XUser UToken payload schema mismatch | auth_mode={AUTH_MODE} | line={} | column={} | category={:?}",
+            error.line(),
+            error.column(),
+            error.classify(),
+        )
+    })?;
 
     let xuid = parse_nonzero_decimal(&document.xbl_xuid)
         .ok_or_else(|| "invalid XUID".to_string())?;
@@ -391,5 +414,22 @@ mod tests {
         assert_eq!(parse_nonzero_decimal("123"), Some(123));
         assert_eq!(parse_nonzero_decimal("0"), None);
         assert_eq!(parse_nonzero_decimal("12x"), None);
+    }
+
+    #[test]
+    fn utoken_wire_document_accepts_current_bmcbl_schema() {
+        let payload = serde_json::json!({
+            "auth_mode": AUTH_MODE,
+            "xbl_xuid": "2535413569375435",
+            "xbl_gamertag": "BMCBLTest",
+            "xbl_age_group": "Adult",
+            "xbl_privileges": "185 254",
+            "user_token": "test-user-token",
+            "user_token_expiry_epoch": "4102444800"
+        });
+        let document: WireDocument = serde_json::from_value(payload).unwrap();
+        assert_eq!(document.auth_mode.as_deref(), Some(AUTH_MODE));
+        assert_eq!(document.xbl_gamertag, "BMCBLTest");
+        assert_eq!(document.user_token, "test-user-token");
     }
 }
