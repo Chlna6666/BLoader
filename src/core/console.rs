@@ -26,6 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PCWSTR;
 
 const CLASSIC_SCROLLBACK_LINES: i16 = 12_000;
+const BMCBL_TERMINAL_HOST_PID_ENV: &str = "BMCBL_TERMINAL_HOST_PID";
 static CONSOLE_WINDOW_READY: AtomicBool = AtomicBool::new(false);
 static CONSOLE_LOGGING_READY: AtomicBool = AtomicBool::new(false);
 static CONSOLE_STDIO_READY: AtomicBool = AtomicBool::new(false);
@@ -41,6 +42,8 @@ struct RawCoord {
 unsafe extern "system" {
     #[link_name = "SetConsoleScreenBufferSize"]
     fn set_console_screen_buffer_size_raw(handle: *mut core::ffi::c_void, size: RawCoord) -> i32;
+    #[link_name = "AttachConsole"]
+    fn attach_console_raw(process_id: u32) -> i32;
 }
 
 /// Lightweight pre-main probe. It only reads the existing JSON and never
@@ -62,24 +65,63 @@ pub fn window_ready() -> bool {
     CONSOLE_WINDOW_READY.load(Ordering::Acquire)
 }
 
-/// Creates the one and only visible console window before the slow PreLoader
-/// chain begins. This intentionally does NOT call SetStdHandle, touch stdin,
-/// install CRT capture, or mutate Minecraft process stdio state while the
-/// premain trampoline still owns the startup thread context.
+fn try_attach_bmcbl_terminal_host() -> Option<u32> {
+    let pid = std::env::var(BMCBL_TERMINAL_HOST_PID_ENV)
+        .ok()?
+        .parse::<u32>()
+        .ok()?;
+    if pid == 0 {
+        return None;
+    }
+
+    let attached = unsafe { attach_console_raw(pid) != 0 };
+    let associated = unsafe { GetConsoleWindow().0 != null_mut() };
+    logging::write_bootstrap_marker(&format!(
+        "console.bmcbl_terminal_host.attach pid={} attached={} associated={}",
+        pid, attached, associated
+    ));
+    if attached && associated { Some(pid) } else { None }
+}
+
+/// Creates or attaches the one and only visible console before the slow
+/// PreLoader chain begins. When BMCBL launched the game through Windows
+/// Terminal, BLoader joins that terminal with AttachConsole instead of creating
+/// a second Console Host window. This stage intentionally does NOT call
+/// SetStdHandle, touch stdin, install CRT capture, or otherwise mutate
+/// Minecraft process stdio while the premain trampoline owns the startup
+/// thread context.
 pub unsafe fn init_console_window_early() {
     if CONSOLE_WINDOW_READY.swap(true, Ordering::AcqRel) {
         return;
     }
 
     let mut window = GetConsoleWindow();
-    let reused = window.0 != null_mut();
-    if !reused {
+    let mut source = if window.0 != null_mut() {
+        "existing-associated"
+    } else {
+        "none"
+    };
+
+    if window.0 == null_mut()
+        && let Some(host_pid) = try_attach_bmcbl_terminal_host()
+    {
+        window = GetConsoleWindow();
+        if window.0 != null_mut() {
+            source = "bmcbl-windows-terminal";
+            logging::write_bootstrap_marker(&format!(
+                "console.early.windows_terminal.ready host_pid={host_pid}"
+            ));
+        }
+    }
+
+    if window.0 == null_mut() {
         if AllocConsole().is_err() {
             CONSOLE_WINDOW_READY.store(false, Ordering::Release);
             logging::write_bootstrap_marker("console.early.alloc.failed");
             return;
         }
         window = GetConsoleWindow();
+        source = "allocated-once";
     }
 
     set_runtime_console_title();
@@ -105,13 +147,13 @@ pub unsafe fn init_console_window_early() {
 
     logging::write_bootstrap_marker(&format!(
         "console.early.window.ready source={} process_stdio=false crt_capture=false",
-        if reused { "existing-associated" } else { "allocated-once" }
+        source
     ));
 }
 
-/// Connects BLoader's own structured logging sink to the already-created
-/// console. Safe to call before Minecraft OEP because it does not change the
-/// process-wide standard handles.
+/// Connects BLoader's own structured logging sink to the already-created or
+/// attached console. Safe to call before Minecraft OEP because it does not
+/// change the process-wide standard handles.
 pub unsafe fn activate_console_logging() {
     if CONSOLE_LOGGING_READY.swap(true, Ordering::AcqRel) {
         return;
@@ -133,7 +175,7 @@ pub unsafe fn activate_console_logging() {
     logging::scoped_debug_message(
         "console",
         &format!(
-            "runtime console logging ready | backend=classic-early-single-window | columns={} | file_io={} | process_stdio=false",
+            "runtime console logging ready | backend=attached-early-single-window | columns={} | file_io={} | process_stdio=false",
             visible_columns(h_conout),
             file_io_policy::mode_label(),
         ),
