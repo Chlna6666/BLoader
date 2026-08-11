@@ -18,7 +18,7 @@ resolver = "2"
 
 [package]
 name = "BLoader"
-version = "0.2.51"
+version = "0.2.52"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/Chlna6666/BLoader"
@@ -63,10 +63,6 @@ version = "0.62.2"
 features = ["Win32_Foundation", "Win32_System_SystemServices", "Win32_System_SystemInformation", "Win32_System_LibraryLoader", "Win32_System_Console", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_IO", "Win32_UI", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Environment", "Win32_Security_Authorization", "Win32_System_Memory", "Win32_System_Kernel", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D_Fxc", "Win32_Graphics_Direct3D11", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_System_ProcessStatus", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp"]
 [build-dependencies]
 winres = "0.1"
-
-[[bin]]
-name = "BLoaderConsoleHost"
-path = "src/bin/bloader_console_host.rs"
 
 [[bin]]
 name = "blgen"
