@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -23,7 +23,7 @@ use windows::Win32::System::Console::{
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 
-use crate::runtime::foundation::file_io_policy;
+use crate::runtime::foundation::{file_io_policy, i18n};
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -42,12 +42,17 @@ unsafe impl Sync for SendHandle {}
 
 #[derive(Clone)]
 struct ConsoleBacklogRecord {
+    timestamp_full: String,
+    timestamp_clock: String,
+    sequence: u64,
     level: Level,
     scope: String,
     message: String,
 }
 
 struct ExternalStructuredLine {
+    timestamp_full: String,
+    timestamp_clock: String,
     level: Level,
     source: String,
     message: String,
@@ -56,6 +61,8 @@ struct ExternalStructuredLine {
 static CONSOLE_HANDLE: OnceLock<SendHandle> = OnceLock::new();
 static CONSOLE_FORCE_ANSI: AtomicBool = AtomicBool::new(false);
 static CONSOLE_BACKLOG: OnceLock<Mutex<VecDeque<ConsoleBacklogRecord>>> = OnceLock::new();
+static CONSOLE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static CONSOLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static EXTERNAL_LOG_RELAY_STARTED: OnceLock<()> = OnceLock::new();
 static LOGGING_READY: OnceLock<()> = OnceLock::new();
 static LATEST_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -69,6 +76,18 @@ static CONSOLE_LEVEL: AtomicU8 = AtomicU8::new(3);
 
 fn console_backlog() -> &'static Mutex<VecDeque<ConsoleBacklogRecord>> {
     CONSOLE_BACKLOG.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn console_write_lock() -> &'static Mutex<()> {
+    CONSOLE_WRITE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn current_console_timestamp() -> (String, String) {
+    let now = Local::now();
+    (
+        now.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+        now.format("%H:%M:%S").to_string(),
+    )
 }
 
 pub fn set_console_level(level: &str) {
@@ -203,6 +222,11 @@ pub fn console_is_ready() -> bool {
 }
 
 pub fn replay_console_message(level: &str, scope: &str, message: &str) {
+    let (_, timestamp_clock) = current_console_timestamp();
+    replay_console_message_at(level, scope, message, &timestamp_clock);
+}
+
+fn replay_console_message_at(level: &str, scope: &str, message: &str, timestamp_clock: &str) {
     if !console_is_ready() {
         return;
     }
@@ -214,14 +238,23 @@ pub fn replay_console_message(level: &str, scope: &str, message: &str) {
         _ => Level::INFO,
     };
     if console_should_show(level, scope, message) {
-        write_bytes_to_console(format_console_line(level, scope, message).as_bytes());
+        write_bytes_to_console(
+            format_console_line_at(timestamp_clock, level, scope, message).as_bytes(),
+        );
     }
 }
 
 pub fn captured_mod_output(mod_name: &str, mod_id: &str, stream: &str, message: &str) {
     if let Some(external) = parse_external_structured_line(message) {
         let scope = format!("mod:{}", external.source);
-        log_message(external.level, &scope, &external.message);
+        mirror_message_at(
+            external.level,
+            &scope,
+            &external.message,
+            &external.timestamp_full,
+            &external.timestamp_clock,
+        );
+        emit_event(external.level, &scope, &external.message);
         append_mod_log(mod_name, mod_id, stream, message);
         return;
     }
@@ -239,7 +272,14 @@ pub fn captured_mod_output(mod_name: &str, mod_id: &str, stream: &str, message: 
 pub fn captured_process_output(stream: &str, message: &str) {
     if let Some(external) = parse_external_structured_line(message) {
         let scope = format!("mod:{}", external.source);
-        log_message(external.level, &scope, &external.message);
+        mirror_message_at(
+            external.level,
+            &scope,
+            &external.message,
+            &external.timestamp_full,
+            &external.timestamp_clock,
+        );
+        emit_event(external.level, &scope, &external.message);
         return;
     }
 
@@ -296,6 +336,7 @@ fn sanitize_file_component(value: &str) -> String {
 }
 
 pub fn set_console_handle(handle: HANDLE) {
+    let relay_offset = queue_external_log_history();
     let _ = CONSOLE_HANDLE.set(SendHandle(handle));
     CONSOLE_FORCE_ANSI.store(false, Ordering::Release);
     enable_console_ansi(handle);
@@ -305,13 +346,14 @@ pub fn set_console_handle(handle: HANDLE) {
         console_supports_ansi(),
     ));
     flush_console_backlog();
-    start_external_log_relay();
+    start_external_log_relay(relay_offset);
 }
 
 /// Installs a non-console stream (for example a Windows Terminal named-pipe
 /// mirror) as the interactive output sink. ANSI is forced because GetConsoleMode
 /// is not defined for pipe handles.
 pub fn set_console_stream_handle(handle: HANDLE, ansi: bool) {
+    let relay_offset = queue_external_log_history();
     let _ = CONSOLE_HANDLE.set(SendHandle(handle));
     CONSOLE_FORCE_ANSI.store(ansi, Ordering::Release);
     write_bootstrap_marker(&format!(
@@ -320,7 +362,7 @@ pub fn set_console_stream_handle(handle: HANDLE, ansi: bool) {
         ansi,
     ));
     flush_console_backlog();
-    start_external_log_relay();
+    start_external_log_relay(relay_offset);
 }
 
 pub fn startup_banner(
@@ -328,19 +370,12 @@ pub fn startup_banner(
     _loader_version: &str,
     application_name: &str,
     application_version: &str,
-    locale: &str,
+    _locale: &str,
 ) {
-    log_message(
-        Level::INFO,
-        "loader",
-        &format!(
-            "Starting for {} {} (locale={}, file_io={})",
-            application_name,
-            application_version,
-            locale,
-            file_io_policy::mode_label(),
-        ),
-    );
+    let message = i18n::tr("console.starting")
+        .replace("{app}", application_name)
+        .replace("{version}", application_version);
+    log_message(Level::INFO, "loader", &message);
 }
 
 pub fn info_message(message: &str) {
@@ -449,13 +484,24 @@ fn emit_event(level: Level, scope: &str, message: &str) {
 }
 
 fn mirror_message(level: Level, scope: &str, message: &str) {
+    let (timestamp_full, timestamp_clock) = current_console_timestamp();
+    mirror_message_at(level, scope, message, &timestamp_full, &timestamp_clock);
+}
+
+fn mirror_message_at(
+    level: Level,
+    scope: &str,
+    message: &str,
+    timestamp_full: &str,
+    timestamp_clock: &str,
+) {
     if console_should_show(level, scope, message) {
         if console_is_ready() {
-            write_bytes_to_console(format_console_line(level, scope, message).as_bytes());
-        } else if !(scope.starts_with("mod:") && message.starts_with("Loaded ")) {
-            // Final Mod inventory is already replayed by console.rs. Avoid one
-            // duplicate status line while retaining raw Mod output and failures.
-            queue_console_backlog(level, scope, message);
+            write_bytes_to_console(
+                format_console_line_at(timestamp_clock, level, scope, message).as_bytes(),
+            );
+        } else {
+            queue_console_backlog_at(level, scope, message, timestamp_full, timestamp_clock);
         }
     }
 
@@ -472,6 +518,17 @@ fn mirror_message(level: Level, scope: &str, message: &str) {
 }
 
 fn queue_console_backlog(level: Level, scope: &str, message: &str) {
+    let (timestamp_full, timestamp_clock) = current_console_timestamp();
+    queue_console_backlog_at(level, scope, message, &timestamp_full, &timestamp_clock);
+}
+
+fn queue_console_backlog_at(
+    level: Level,
+    scope: &str,
+    message: &str,
+    timestamp_full: &str,
+    timestamp_clock: &str,
+) {
     let mut backlog = console_backlog()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -479,6 +536,9 @@ fn queue_console_backlog(level: Level, scope: &str, message: &str) {
         backlog.pop_front();
     }
     backlog.push_back(ConsoleBacklogRecord {
+        timestamp_full: timestamp_full.to_string(),
+        timestamp_clock: timestamp_clock.to_string(),
+        sequence: CONSOLE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
         level,
         scope: scope.to_string(),
         message: message.to_string(),
@@ -489,33 +549,75 @@ fn flush_console_backlog() {
     if !console_is_ready() {
         return;
     }
-    let records = {
+    let mut records = {
         let mut backlog = console_backlog()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         backlog.drain(..).collect::<Vec<_>>()
     };
+    records.sort_by(|left, right| {
+        left.timestamp_full
+            .cmp(&right.timestamp_full)
+            .then(left.sequence.cmp(&right.sequence))
+    });
     for record in records {
         if console_should_show(record.level, &record.scope, &record.message) {
             write_bytes_to_console(
-                format_console_line(record.level, &record.scope, &record.message).as_bytes(),
+                format_console_line_at(
+                    &record.timestamp_clock,
+                    record.level,
+                    &record.scope,
+                    &record.message,
+                )
+                .as_bytes(),
             );
         }
     }
 }
 
-fn start_external_log_relay() {
+fn queue_external_log_history() -> u64 {
+    if !file_io_policy::writes_allowed() {
+        return 0;
+    }
+
+    let path = PathBuf::from("logs").join("latest.log");
+    let Ok(bytes) = fs::read(&path) else {
+        return 0;
+    };
+    let end_offset = bytes.len() as u64;
+    for raw in bytes.split(|byte| *byte == b'\n') {
+        if raw.is_empty() {
+            continue;
+        }
+        let line = String::from_utf8_lossy(raw).trim_end_matches('\r').to_string();
+        let Some(external) = parse_external_structured_line(&line) else {
+            continue;
+        };
+        let scope = format!("mod:{}", external.source);
+        if console_should_show(external.level, &scope, &external.message) {
+            queue_console_backlog_at(
+                external.level,
+                &scope,
+                &external.message,
+                &external.timestamp_full,
+                &external.timestamp_clock,
+            );
+        }
+    }
+    end_offset
+}
+
+fn start_external_log_relay(start_offset: u64) {
     if !file_io_policy::writes_allowed() || EXTERNAL_LOG_RELAY_STARTED.set(()).is_err() {
         return;
     }
     let path = PathBuf::from("logs").join("latest.log");
     let _ = thread::Builder::new()
         .name("bloader-external-log-relay".to_string())
-        .spawn(move || tail_external_structured_log(&path));
+        .spawn(move || tail_external_structured_log(&path, start_offset));
 }
 
-fn tail_external_structured_log(path: &Path) {
-    let mut offset = 0u64;
+fn tail_external_structured_log(path: &Path, mut offset: u64) {
     let mut pending = Vec::<u8>::new();
     let mut buffer = [0u8; 16 * 1024];
 
@@ -569,7 +671,12 @@ fn drain_external_structured_lines(pending: &mut Vec<u8>) {
             continue;
         };
         let scope = format!("mod:{}", external.source);
-        replay_console_message(level_label(external.level), &scope, &external.message);
+        replay_console_message_at(
+            level_label(external.level),
+            &scope,
+            &external.message,
+            &external.timestamp_clock,
+        );
     }
     if consumed > 0 {
         pending.drain(..consumed);
@@ -583,6 +690,14 @@ fn parse_external_structured_line(line: &str) -> Option<ExternalStructuredLine> 
     let level_token = header.split_whitespace().last()?;
     let level = external_level(level_token)?;
 
+    let timestamp_full = header.strip_suffix(level_token)?.trim();
+    let timestamp_clock = timestamp_full
+        .split_whitespace()
+        .last()
+        .map(|value| value.chars().take(8).collect::<String>())
+        .filter(|value| value.len() == 8)
+        .unwrap_or_else(|| current_console_timestamp().1);
+
     let second = first[first_end + 1..].trim_start().strip_prefix('[')?;
     let second_end = second.find(']')?;
     let source = second[..second_end].trim();
@@ -595,6 +710,8 @@ fn parse_external_structured_line(line: &str) -> Option<ExternalStructuredLine> 
 
     let message = sanitize_terminal_text(second[second_end + 1..].trim_start());
     Some(ExternalStructuredLine {
+        timestamp_full: timestamp_full.to_string(),
+        timestamp_clock,
         level,
         source: source.to_string(),
         message,
@@ -656,10 +773,15 @@ fn console_should_show(level: Level, scope: &str, message: &str) -> bool {
         return false;
     }
 
+    if level == Level::INFO && scope.starts_with("mod:") && message.trim().is_empty() {
+        return false;
+    }
+
     if level == Level::INFO && scope == "xuser-bridge" {
         if message.starts_with("XUser token/signature request")
             || message.starts_with("BMCBL XUser pipe payload")
             || message.starts_with("early XUser diagnostics replay complete")
+            || message.starts_with("XUser Bridge 入口已执行 | protocol=")
         {
             return CONSOLE_LEVEL.load(Ordering::Acquire) >= 4;
         }
@@ -670,6 +792,34 @@ fn console_should_show(level: Level, scope: &str, message: &str) -> bool {
         && message.starts_with("process stdio capture installed")
     {
         return CONSOLE_LEVEL.load(Ordering::Acquire) >= 4;
+    }
+
+    if level == Level::INFO {
+        let loader_noise = scope == "loader"
+            && (message.starts_with("[config] Loading configuration file from:")
+                || message.starts_with("[config] Hot-reload file watcher active")
+                || message.starts_with("Config applied |")
+                || message.starts_with("i18n ready:")
+                || message.starts_with("Minecraft symbol subsystem:")
+                || message.starts_with("Runtime environment:")
+                || message.starts_with("Host application:")
+                || message.starts_with("Runtime profile:")
+                || message.starts_with("Locale=")
+                || message.starts_with("[file-redirection]")
+                || message.starts_with("[net-hook]")
+                || message.starts_with("Loading Mod:"));
+        let bootstrap_noise = scope == "bootstrap"
+            && message.starts_with("Immediate startup execution mode:");
+        let premain_noise = scope == "premain-gate"
+            && message.starts_with("Critical preload phase completed");
+        let native_noise = scope == "native-loader"
+            && (message.starts_with("LOAD_SUCCESS |") || message.starts_with("SUMMARY |"));
+        let readiness_noise = scope == "runtime-ready"
+            && message.starts_with("Delayed Mod readiness uses");
+
+        if loader_noise || bootstrap_noise || premain_noise || native_noise || readiness_noise {
+            return CONSOLE_LEVEL.load(Ordering::Acquire) >= 4;
+        }
     }
 
     true
@@ -686,13 +836,19 @@ fn level_rank(level: Level) -> u8 {
 }
 
 fn format_console_line(level: Level, scope: &str, message: &str) -> String {
-    let timestamp = Local::now().format("%H:%M:%S");
+    let (_, timestamp_clock) = current_console_timestamp();
+    format_console_line_at(&timestamp_clock, level, scope, message)
+}
+
+fn format_console_line_at(timestamp: &str, level: Level, scope: &str, message: &str) -> String {
     let level_text = level_label(level);
     let source = truncate(&console_source(scope), 28);
-    let message = message.replace('\r', "").replace('\n', " | ");
+    let message = localized_console_message(scope, message)
+        .replace('\r', "")
+        .replace('\n', " | ");
 
     if !console_supports_ansi() {
-        return format!("[{timestamp} {level_text}] [{source}]: {message}\r\n");
+        return format!("[{timestamp} {level_text}] [{source}] {message}\r\n");
     }
 
     let level_color = match level {
@@ -705,8 +861,80 @@ fn format_console_line(level: Level, scope: &str, message: &str) -> String {
     let source_color = source_color(scope, &source);
 
     format!(
-        "\x1b[38;2;120;126;136m[{timestamp} \x1b[0m{level_color}{level_text}\x1b[38;2;120;126;136m]\x1b[0m {source_color}[{source}]\x1b[0m: \x1b[38;2;220;224;230m{message}\x1b[0m\r\n"
+        "\x1b[38;2;120;126;136m[{timestamp} \x1b[0m{level_color}{level_text}\x1b[38;2;120;126;136m]\x1b[0m {source_color}[{source}]\x1b[0m \x1b[38;2;220;224;230m{message}\x1b[0m\r\n"
     )
+}
+
+fn localized_console_message(scope: &str, message: &str) -> String {
+    if message.starts_with("Priority preload detected | ") {
+        let name = message
+            .split('|')
+            .nth(1)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("PreLoader");
+        return i18n::tr("console.preloader.priority_detected").replace("{name}", name);
+    }
+
+    if message.starts_with("Priority preload active | ") {
+        let elapsed_ms = message
+            .split('|')
+            .find_map(|part| part.trim().strip_prefix("elapsed="))
+            .and_then(|value| value.strip_suffix("ms"))
+            .map(str::trim)
+            .unwrap_or("?");
+        return i18n::tr("console.preloader.priority_active")
+            .replace("{elapsed_ms}", elapsed_ms);
+    }
+
+    if message
+        == "PreLoader and its delegated preload chain completed synchronously before Minecraft OEP execution."
+    {
+        return i18n::tr("console.preloader.chain_complete");
+    }
+
+    if message
+        == "Windows Terminal bridge connection failed; switching to a visible classic console."
+    {
+        return i18n::tr("console.wt.connect_failed");
+    }
+
+    if message
+        == "Windows Terminal bridge handshake timed out; switching to a visible classic console."
+    {
+        return i18n::tr("console.wt.timeout");
+    }
+
+    if scope == "xuser-bridge"
+        && message.contains("未检测到 BMCBL 安全一次性管道")
+        && message.contains("官方 XUser")
+    {
+        return i18n::tr("console.xuser.official");
+    }
+
+    if scope.starts_with("mod:") {
+        if let Some(rest) = message.strip_prefix("Loaded ") {
+            let version = rest.split(" (").next().unwrap_or(rest).trim();
+            if i18n::current_locale().starts_with("zh") {
+                return format!("已加载 {version}");
+            }
+            return format!("Loaded {version}");
+        }
+    }
+
+    if message.starts_with("BLoader v") && message.contains(" initialized. ") {
+        if let Some(version) = message
+            .strip_prefix("BLoader v")
+            .and_then(|value| value.split_whitespace().next())
+        {
+            if i18n::current_locale().starts_with("zh") {
+                return format!("BLoader v{version} 已启动");
+            }
+            return format!("BLoader v{version} started");
+        }
+    }
+
+    message.to_string()
 }
 
 fn source_color(scope: &str, source: &str) -> &'static str {
@@ -868,6 +1096,9 @@ fn write_bytes_to_console(bytes: &[u8]) {
         return;
     }
 
+    let _guard = console_write_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let mut offset = 0usize;
     while offset < bytes.len() {
         unsafe {
