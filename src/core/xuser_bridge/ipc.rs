@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use core::ffi::c_void;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -15,6 +16,7 @@ use super::{
         XUSER_AGE_GROUP_UNKNOWN, XUserLocalId,
     },
     bridge_debug, bridge_info,
+    crypto::SigningKey,
 };
 
 const PIPE_MAGIC: &[u8; 8] = b"BMCBLXU1";
@@ -22,7 +24,14 @@ const PIPE_VERSION: u32 = 1;
 const PIPE_HEADER_SIZE: usize = 80;
 const MAX_PAYLOAD_SIZE: usize = 256 * 1024;
 const MIN_TOKEN_REMAINING_SECONDS: u64 = 30;
-const AUTH_MODE: &str = "official-runtime-user-token";
+const AUTH_MODE: &str = "hybrid-native-or-bmcbl-token-v1";
+const FALLBACK_MODE: &str = "bmcbl-preauth-v1";
+
+const XBOX_LIVE_RP: &str = "http://xboxlive.com";
+const PLAYFAB_RP: &str = "https://b980a380.minecraft.playfabapi.com/";
+const MULTIPLAYER_RP: &str = "https://multiplayer.minecraft.net/";
+const REALMS_RP: &str = "https://pocket.realms.minecraft.net/";
+const LICENSING_RP: &str = "http://licensing.xboxlive.com";
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const OPEN_EXISTING: u32 = 3;
@@ -95,8 +104,21 @@ pub struct UserToken {
     pub expires_at: u64,
 }
 
-/// Compatibility/diagnostic route used by the existing bridge startup logger.
-/// It deliberately contains no bearer token or UHS value.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct FallbackToken {
+    pub token: String,
+    pub user_hash: String,
+    pub relying_party: String,
+    #[zeroize(skip)]
+    pub expires_at: u64,
+}
+
+pub struct CrossAccountFallback {
+    pub tokens: Vec<FallbackToken>,
+    pub signing_key: SigningKey,
+}
+
+/// Secret-free route summary used only by startup diagnostics.
 pub struct TokenRecord {
     pub relying_party: String,
     pub expires_at: u64,
@@ -110,6 +132,7 @@ pub struct Session {
     pub privileges: Vec<u32>,
     pub tokens: Vec<TokenRecord>,
     pub user_token: UserToken,
+    pub fallback: Option<CrossAccountFallback>,
 }
 
 unsafe impl Send for Session {}
@@ -120,12 +143,29 @@ impl Session {
         (self.user_token.expires_at > now_epoch().saturating_add(MIN_TOKEN_REMAINING_SECONDS))
             .then_some(self.user_token.token.as_str())
     }
+
+    pub fn fallback_token_for_relying_party(&self, relying_party: &str) -> Option<&FallbackToken> {
+        self.fallback
+            .as_ref()?
+            .tokens
+            .iter()
+            .find(|token| {
+                token.relying_party == relying_party
+                    && token.expires_at > now_epoch().saturating_add(MIN_TOKEN_REMAINING_SECONDS)
+            })
+    }
+
+    pub fn fallback_signing_key(&self) -> Option<&SigningKey> {
+        self.fallback.as_ref().map(|fallback| &fallback.signing_key)
+    }
 }
 
 #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 struct WireDocument {
     #[serde(default)]
     auth_mode: Option<String>,
+    #[serde(default)]
+    cross_account_fallback: Option<String>,
     xbl_xuid: String,
     xbl_gamertag: String,
     #[serde(default)]
@@ -134,6 +174,47 @@ struct WireDocument {
     xbl_privileges: Option<String>,
     user_token: String,
     user_token_expiry_epoch: String,
+
+    #[serde(default)]
+    ecc_private_blob_b64: Option<String>,
+    #[serde(default)]
+    xbl_token: Option<String>,
+    #[serde(default)]
+    xbl_uhs: Option<String>,
+    #[serde(default)]
+    xbl_token_expiry_epoch: Option<String>,
+    #[serde(default)]
+    sisu_token: Option<String>,
+    #[serde(default)]
+    sisu_uhs: Option<String>,
+    #[serde(default)]
+    sisu_rp: Option<String>,
+    #[serde(default)]
+    sisu_expiry_epoch: Option<String>,
+    #[serde(default)]
+    mp_token: Option<String>,
+    #[serde(default)]
+    mp_uhs: Option<String>,
+    #[serde(default)]
+    mp_rp: Option<String>,
+    #[serde(default)]
+    mp_expiry_epoch: Option<String>,
+    #[serde(default)]
+    realms_token: Option<String>,
+    #[serde(default)]
+    realms_uhs: Option<String>,
+    #[serde(default)]
+    realms_rp: Option<String>,
+    #[serde(default)]
+    realms_expiry_epoch: Option<String>,
+    #[serde(default)]
+    lic_token: Option<String>,
+    #[serde(default)]
+    lic_uhs: Option<String>,
+    #[serde(default)]
+    lic_rp: Option<String>,
+    #[serde(default)]
+    lic_expiry_epoch: Option<String>,
 }
 
 /// Opens exactly one BMCBL pipe named for the current Minecraft PID. If the
@@ -254,7 +335,7 @@ fn receive_payload() -> Result<Option<Vec<u8>>, String> {
 fn parse_session(payload: &[u8]) -> Result<Session, String> {
     let document: WireDocument = serde_json::from_slice(payload).map_err(|error| {
         let kind = match error.classify() {
-            serde_json::error::Category::Data => "utoken-schema-mismatch",
+            serde_json::error::Category::Data => "hybrid-schema-mismatch",
             serde_json::error::Category::Syntax => "json-syntax-invalid",
             serde_json::error::Category::Eof => "json-truncated",
             serde_json::error::Category::Io => "json-io-error",
@@ -309,28 +390,144 @@ fn parse_session(payload: &[u8]) -> Result<Session, String> {
     privileges.sort_unstable();
     privileges.dedup();
 
+    let fallback = parse_fallback(&document)?;
+    let local_id = document
+        .xbl_uhs
+        .as_deref()
+        .and_then(parse_nonzero_decimal)
+        .unwrap_or(xuid);
+
+    let mut routes = vec![TokenRecord {
+        relying_party: "xasu-user-token".to_string(),
+        expires_at,
+    }];
+    if let Some(fallback) = fallback.as_ref() {
+        routes.extend(fallback.tokens.iter().map(|token| TokenRecord {
+            relying_party: format!("fallback:{}", token.relying_party),
+            expires_at: token.expires_at,
+        }));
+    }
+
     bridge_debug(&format!(
-        "BMCBL XUser UToken session parsed | xbox_xuid={xuid} | gamertag_chars={} | privilege_count={} | user_token_remaining={}s | final_xsts=official-runtime | signing_key=official-runtime | secrets_logged=false",
+        "BMCBL XUser hybrid session parsed | xbox_xuid={xuid} | gamertag_chars={} | privilege_count={} | user_token_remaining={}s | cross_account_fallback={} | same_account_runtime=official | secrets_logged=false",
         document.xbl_gamertag.chars().count(),
         privileges.len(),
         expires_at.saturating_sub(now_epoch()),
+        if fallback.is_some() { "ready" } else { "unavailable" },
     ));
 
     Ok(Session {
         xuid,
-        local_id: XUserLocalId { value: xuid },
+        local_id: XUserLocalId { value: local_id },
         gamertag: document.xbl_gamertag.clone(),
         age_group,
         privileges,
-        tokens: vec![TokenRecord {
-            relying_party: "xasu-user-token".to_string(),
-            expires_at,
-        }],
+        tokens: routes,
         user_token: UserToken {
             token: document.user_token.clone(),
             expires_at,
         },
+        fallback,
     })
+}
+
+fn parse_fallback(document: &WireDocument) -> Result<Option<CrossAccountFallback>, String> {
+    if document.cross_account_fallback.as_deref() != Some(FALLBACK_MODE) {
+        return Ok(None);
+    }
+
+    let encoded_key = required(&document.ecc_private_blob_b64, "ecc_private_blob_b64")?;
+    let mut private_blob = STANDARD
+        .decode(encoded_key)
+        .map_err(|_| "invalid P-256 private key encoding".to_string())?;
+    let signing_key = SigningKey::import_private_blob(mem::take(&mut private_blob))?;
+    private_blob.zeroize();
+
+    let mut tokens = vec![
+        fallback_token(
+            required(&document.xbl_token, "xbl_token")?,
+            required(&document.xbl_uhs, "xbl_uhs")?,
+            XBOX_LIVE_RP,
+            required(&document.xbl_token_expiry_epoch, "xbl_token_expiry_epoch")?,
+        )?,
+        fallback_token(
+            required(&document.sisu_token, "sisu_token")?,
+            required(&document.sisu_uhs, "sisu_uhs")?,
+            checked_rp(document.sisu_rp.as_deref(), PLAYFAB_RP)?,
+            required(&document.sisu_expiry_epoch, "sisu_expiry_epoch")?,
+        )?,
+        fallback_token(
+            required(&document.mp_token, "mp_token")?,
+            required(&document.mp_uhs, "mp_uhs")?,
+            checked_rp(document.mp_rp.as_deref(), MULTIPLAYER_RP)?,
+            required(&document.mp_expiry_epoch, "mp_expiry_epoch")?,
+        )?,
+        fallback_token(
+            required(&document.realms_token, "realms_token")?,
+            required(&document.realms_uhs, "realms_uhs")?,
+            checked_rp(document.realms_rp.as_deref(), REALMS_RP)?,
+            required(&document.realms_expiry_epoch, "realms_expiry_epoch")?,
+        )?,
+    ];
+
+    match (
+        document.lic_token.as_deref(),
+        document.lic_uhs.as_deref(),
+        document.lic_expiry_epoch.as_deref(),
+    ) {
+        (None, None, None) => {}
+        (Some(value), Some(hash), Some(expiry)) => tokens.push(fallback_token(
+            value,
+            hash,
+            checked_rp(document.lic_rp.as_deref(), LICENSING_RP)?,
+            expiry,
+        )?),
+        _ => return Err("incomplete licensing fallback token".to_string()),
+    }
+
+    Ok(Some(CrossAccountFallback {
+        tokens,
+        signing_key,
+    }))
+}
+
+fn required<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str, String> {
+    value
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("missing cross-account fallback field: {name}"))
+}
+
+fn fallback_token(
+    value: &str,
+    user_hash: &str,
+    relying_party: &str,
+    expiry: &str,
+) -> Result<FallbackToken, String> {
+    let expires_at = expiry
+        .parse::<u64>()
+        .map_err(|_| "invalid fallback token expiry".to_string())?;
+    if value.is_empty()
+        || user_hash.is_empty()
+        || relying_party.is_empty()
+        || expires_at <= now_epoch().saturating_add(MIN_TOKEN_REMAINING_SECONDS)
+    {
+        return Err("invalid or expired cross-account fallback token".to_string());
+    }
+    Ok(FallbackToken {
+        token: value.to_string(),
+        user_hash: user_hash.to_string(),
+        relying_party: relying_party.to_string(),
+        expires_at,
+    })
+}
+
+fn checked_rp<'a>(provided: Option<&'a str>, expected: &'a str) -> Result<&'a str, String> {
+    match provided {
+        Some(value) if value != expected => Err("unexpected Xbox relying party".to_string()),
+        Some(value) => Ok(value),
+        None => Ok(expected),
+    }
 }
 
 fn parse_nonzero_decimal(value: &str) -> Option<u64> {
@@ -411,20 +608,8 @@ mod tests {
     }
 
     #[test]
-    fn utoken_wire_document_accepts_current_bmcbl_schema() {
-        let payload = serde_json::json!({
-            "auth_mode": AUTH_MODE,
-            "xbl_xuid": "2535413569375435",
-            "xbl_gamertag": "BMCBLTest",
-            "xbl_age_group": "Adult",
-            "xbl_privileges": "185 254",
-            "user_token": "test-user-token",
-            "user_token_expiry_epoch": "4102444800"
-        });
-        let encoded = serde_json::to_vec(&payload).unwrap();
-        let document: WireDocument = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(document.auth_mode.as_deref(), Some(AUTH_MODE));
-        assert_eq!(document.xbl_gamertag, "BMCBLTest");
-        assert_eq!(document.user_token, "test-user-token");
+    fn relying_party_validation_is_strict() {
+        assert_eq!(checked_rp(Some(PLAYFAB_RP), PLAYFAB_RP), Ok(PLAYFAB_RP));
+        assert!(checked_rp(Some("https://wrong.example/"), PLAYFAB_RP).is_err());
     }
 }
