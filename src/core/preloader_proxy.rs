@@ -74,6 +74,16 @@ struct ProxyStatus<'a> {
 }
 
 pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
+    // The preloader proxy is the first ordinary Rust code reached immediately
+    // before the potentially slow synchronous PreLoader/LeviLamina chain. Show
+    // the single BLoader console window here so direct Minecraft.Windows.exe
+    // launches do not wait 10+ seconds for OEP release before any console is
+    // visible. The early path deliberately does not bind process STD handles or
+    // touch CRT state; those operations remain post-OEP.
+    if crate::core::console::early_console_requested() {
+        crate::core::console::init_console_window_early();
+    }
+
     let started = Instant::now();
     let mut candidates = discover_candidates(&game_dir.join("mods"));
     candidates.sort_by(|a, b| a.path.cmp(&b.path));
