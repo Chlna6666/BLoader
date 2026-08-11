@@ -5,14 +5,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$dllTarget = Join-Path $root "target\$Configuration\BLoader.dll"
-$hostTarget = Join-Path $root "target\$Configuration\BLoaderConsoleHost.exe"
+$target = Join-Path $root "target\$Configuration\BLoader.dll"
 
-if (-not (Test-Path $dllTarget)) {
-    throw "BLoader.dll not found: $dllTarget"
-}
-if (-not (Test-Path $hostTarget)) {
-    throw "BLoaderConsoleHost.exe not found: $hostTarget"
+if (-not (Test-Path $target)) {
+    throw "BLoader.dll not found: $target"
 }
 
 $cargo = Get-Content (Join-Path $root "Cargo.toml") -Raw
@@ -33,9 +29,7 @@ Remove-Item $archiveChecksum -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
 $dll = Join-Path $stage "BLoader.dll"
-$host = Join-Path $stage "BLoaderConsoleHost.exe"
-Copy-Item $dllTarget $dll -Force
-Copy-Item $hostTarget $host -Force
+Copy-Item $target $dll -Force
 
 foreach ($file in @("README.md", "LICENSE", "CHANGELOG.md")) {
     $source = Join-Path $root $file
@@ -45,9 +39,7 @@ foreach ($file in @("README.md", "LICENSE", "CHANGELOG.md")) {
 }
 
 $dllHash = (Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant()
-$hostHash = (Get-FileHash $host -Algorithm SHA256).Hash.ToLowerInvariant()
 "$dllHash  BLoader.dll" | Set-Content (Join-Path $stage "BLoader.dll.sha256") -Encoding utf8NoBOM
-"$hostHash  BLoaderConsoleHost.exe" | Set-Content (Join-Path $stage "BLoaderConsoleHost.exe.sha256") -Encoding utf8NoBOM
 
 $sourceCommit = if ($env:BLOADER_SOURCE_SHA) {
     $env:BLOADER_SOURCE_SHA
@@ -74,18 +66,13 @@ $manifest = [ordered]@{
             size = (Get-Item $dll).Length
             sha256 = $dllHash
         }
-        "BLoaderConsoleHost.exe" = [ordered]@{
-            size = (Get-Item $host).Length
-            sha256 = $hostHash
-            purpose = "Windows Terminal named-pipe console host"
-        }
     }
     console = [ordered]@{
-        preferred_backend = "Windows Terminal"
-        host = "BLoaderConsoleHost.exe"
+        terminal_owner = "BMCBL"
         transport = "process-scoped named pipe"
         shell = $false
         rundll32 = $false
+        extra_host_executable = $false
         fallback = "visible classic console"
     }
     xuser_bridge = [ordered]@{
@@ -106,5 +93,4 @@ $zipHash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
 Write-Host "Package: $archive"
 Write-Host "Package SHA256: $zipHash"
 Write-Host "DLL SHA256: $dllHash"
-Write-Host "Console host SHA256: $hostHash"
 Write-Host "Source commit: $sourceCommit"
