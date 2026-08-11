@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use core::ffi::c_void;
+use minhook::MinHook;
 use sha2::{Digest as _, Sha256};
-use std::{ptr, sync::OnceLock};
+use std::{
+    mem, ptr,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU32, AtomicUsize, Ordering},
+    },
+};
 
 use super::super::{bridge_info, bridge_warn};
 
@@ -32,6 +39,18 @@ struct RuntimeFunction {
     unwind_info_address: u32,
 }
 
+#[repr(C)]
+struct MemoryBasicInformation {
+    base_address: *mut c_void,
+    allocation_base: *mut c_void,
+    allocation_protect: u32,
+    partition_id: u16,
+    region_size: usize,
+    state: u32,
+    protect: u32,
+    type_: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FunctionBounds {
     begin: usize,
@@ -39,9 +58,26 @@ struct FunctionBounds {
     unwind: usize,
 }
 
+type BuilderProbeFn = unsafe extern "system" fn(
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+) -> usize;
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleW(module_name: *const u16) -> *mut c_void;
+    fn GetCurrentThreadId() -> u32;
+    fn VirtualQuery(
+        address: *const c_void,
+        buffer: *mut MemoryBasicInformation,
+        length: usize,
+    ) -> usize;
     fn RtlLookupFunctionEntry(
         control_pc: u64,
         image_base: *mut u64,
@@ -50,6 +86,11 @@ unsafe extern "system" {
 }
 
 static DISCOVERY: OnceLock<Result<DiscoverySummary, String>> = OnceLock::new();
+static ORIGINAL_PRE_XSTS_BUILDER: AtomicUsize = AtomicUsize::new(0);
+static PRE_XSTS_PROBE_CALLS: AtomicU32 = AtomicU32::new(0);
+static PROBE_MODULE_BASE: AtomicUsize = AtomicUsize::new(0);
+static PROBE_MODULE_SIZE: AtomicUsize = AtomicUsize::new(0);
+const MAX_PROBE_LOG_CALLS: u32 = 16;
 
 pub fn ensure_discovered() -> Result<DiscoverySummary, String> {
     DISCOVERY
@@ -74,6 +115,9 @@ unsafe fn discover() -> Result<DiscoverySummary, String> {
         .filter(|section| section.executable)
         .collect::<Vec<_>>();
     let module_hash = unsafe { mapped_sections_sha256_prefix(base, &sections) };
+
+    PROBE_MODULE_BASE.store(base, Ordering::Release);
+    PROBE_MODULE_SIZE.store(image_size, Ordering::Release);
 
     bridge_info(&format!(
         "开始定位 Microsoft Runtime pre-XSTS 聚合候选 | module=xgameruntime.dll | image_size=0x{image_size:X} | readable_sections={} | executable_sections={} | mapped_sections_sha256_prefix={module_hash} | secrets_logged=false",
@@ -102,7 +146,7 @@ unsafe fn discover() -> Result<DiscoverySummary, String> {
     log_marker(base, "xsts/authorize", &xsts_authorize);
     log_marker(base, "xsts.auth.xboxlive.com", &xsts_host);
 
-    let (function_candidates, high_confidence_candidates) = unsafe {
+    let (function_candidates, high_confidence_candidates, probe_candidate) = unsafe {
         log_user_tokens_function_candidates(
             base,
             image_size,
@@ -113,6 +157,10 @@ unsafe fn discover() -> Result<DiscoverySummary, String> {
             &xsts_host,
         )
     };
+
+    if let Some(candidate) = probe_candidate {
+        unsafe { install_builder_probe(base, image_size, candidate) };
+    }
 
     let summary = DiscoverySummary {
         user_tokens_markers: user_tokens.addresses.len(),
@@ -229,9 +277,11 @@ unsafe fn log_user_tokens_function_candidates(
     title_token: &MarkerLocations,
     xsts_authorize: &MarkerLocations,
     xsts_host: &MarkerLocations,
-) -> (usize, usize) {
+) -> (usize, usize, Option<FunctionBounds>) {
     let mut functions = Vec::<FunctionBounds>::new();
     let mut high_confidence = 0usize;
+    let mut first_candidate = None;
+    let mut first_high_confidence = None;
 
     for xref in &user_tokens.xrefs {
         let Some(bounds) = (unsafe { lookup_function_bounds(base, *xref) }) else {
@@ -245,6 +295,7 @@ unsafe fn log_user_tokens_function_candidates(
             continue;
         }
         functions.push(bounds);
+        first_candidate.get_or_insert(bounds);
 
         let device_refs = count_xrefs_in_function(device_token, bounds);
         let title_refs = count_xrefs_in_function(title_token, bounds);
@@ -256,6 +307,7 @@ unsafe fn log_user_tokens_function_candidates(
             + usize::from(host_refs != 0);
         if device_refs != 0 && title_refs != 0 {
             high_confidence = high_confidence.saturating_add(1);
+            first_high_confidence.get_or_insert(bounds);
         }
 
         let lea_register = unsafe { rip_lea_destination_register(*xref) }.unwrap_or("unknown");
@@ -290,7 +342,151 @@ unsafe fn log_user_tokens_function_candidates(
         ));
     }
 
-    (functions.len(), high_confidence)
+    (functions.len(), high_confidence, first_high_confidence.or(first_candidate))
+}
+
+unsafe fn install_builder_probe(base: usize, image_size: usize, bounds: FunctionBounds) {
+    if ORIGINAL_PRE_XSTS_BUILDER.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    if bounds.begin < base || bounds.end <= bounds.begin || bounds.end > base.saturating_add(image_size) {
+        bridge_warn("pre-XSTS builder 探针候选边界无效；跳过函数级探针安装");
+        return;
+    }
+
+    PROBE_MODULE_BASE.store(base, Ordering::Release);
+    PROBE_MODULE_SIZE.store(image_size, Ordering::Release);
+    let target = bounds.begin as *mut c_void;
+    let trampoline = match unsafe {
+        MinHook::create_hook(target, pre_xsts_builder_probe as *const () as *mut c_void)
+    } {
+        Ok(value) => value,
+        Err(error) => {
+            bridge_warn(&format!(
+                "pre-XSTS builder 调用探针安装失败；继续 fail-closed | function_begin_rva=0x{:X} | error={error:?}",
+                bounds.begin.saturating_sub(base),
+            ));
+            return;
+        }
+    };
+
+    match ORIGINAL_PRE_XSTS_BUILDER.compare_exchange(
+        0,
+        trampoline as usize,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            if let Err(error) = unsafe { MinHook::enable_all_hooks() } {
+                ORIGINAL_PRE_XSTS_BUILDER.store(0, Ordering::Release);
+                bridge_warn(&format!(
+                    "pre-XSTS builder 调用探针启用失败；继续 fail-closed | function_begin_rva=0x{:X} | trampoline=0x{:X} | error={error:?}",
+                    bounds.begin.saturating_sub(base),
+                    trampoline as usize,
+                ));
+                return;
+            }
+            bridge_info(&format!(
+                "pre-XSTS builder 调用探针已安装 | function_begin_rva=0x{:X} | function_end_rva=0x{:X} | function_size=0x{:X} | trampoline=0x{:X} | mode=transparent-forwarding | max_logged_calls={} | secrets_logged=false",
+                bounds.begin.saturating_sub(base),
+                bounds.end.saturating_sub(base),
+                bounds.end.saturating_sub(bounds.begin),
+                trampoline as usize,
+                MAX_PROBE_LOG_CALLS,
+            ));
+        }
+        Err(existing) => {
+            bridge_info(&format!(
+                "pre-XSTS builder 调用探针已由其他线程安装 | existing_trampoline=0x{existing:X}"
+            ));
+        }
+    }
+}
+
+unsafe extern "system" fn pre_xsts_builder_probe(
+    arg0: usize,
+    arg1: usize,
+    arg2: usize,
+    arg3: usize,
+    arg4: usize,
+    arg5: usize,
+    arg6: usize,
+    arg7: usize,
+) -> usize {
+    let call_index = PRE_XSTS_PROBE_CALLS.fetch_add(1, Ordering::AcqRel) + 1;
+    let should_log = call_index <= MAX_PROBE_LOG_CALLS;
+    if should_log {
+        let args = [arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7]
+            .iter()
+            .enumerate()
+            .map(|(index, value)| unsafe { format_probe_arg(index, *value) })
+            .collect::<Vec<_>>()
+            .join(",");
+        let thread_id = unsafe { GetCurrentThreadId() };
+        bridge_info(&format!(
+            "pre-XSTS builder probe hit | call_index={call_index} | thread_id={thread_id} | args=[{args}] | mode=transparent-forwarding | secrets_logged=false"
+        ));
+    }
+
+    let original_address = ORIGINAL_PRE_XSTS_BUILDER.load(Ordering::Acquire);
+    if original_address == 0 {
+        bridge_warn("pre-XSTS builder trampoline 丢失；返回 0 以避免执行未知路径");
+        return 0;
+    }
+    let original: BuilderProbeFn = unsafe { mem::transmute(original_address) };
+    let result = unsafe { original(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7) };
+
+    if should_log {
+        bridge_info(&format!(
+            "pre-XSTS builder probe return | call_index={call_index} | result=0x{result:X} | result_class={} | secrets_logged=false",
+            unsafe { classify_probe_value(result) },
+        ));
+    }
+    result
+}
+
+unsafe fn format_probe_arg(index: usize, value: usize) -> String {
+    format!("arg{index}=0x{value:X}:{}", unsafe {
+        classify_probe_value(value)
+    })
+}
+
+unsafe fn classify_probe_value(value: usize) -> String {
+    if value == 0 {
+        return "null".to_string();
+    }
+    if value < 0x10000 {
+        return "small-integer".to_string();
+    }
+
+    let base = PROBE_MODULE_BASE.load(Ordering::Acquire);
+    let size = PROBE_MODULE_SIZE.load(Ordering::Acquire);
+    let in_xgameruntime = base != 0 && size != 0 && value >= base && value < base.saturating_add(size);
+
+    let mut info: MemoryBasicInformation = unsafe { mem::zeroed() };
+    let queried = unsafe {
+        VirtualQuery(
+            value as *const c_void,
+            &mut info,
+            mem::size_of::<MemoryBasicInformation>(),
+        )
+    };
+    if queried == 0 {
+        return if in_xgameruntime {
+            "unmapped-but-in-xgameruntime-range".to_string()
+        } else {
+            "unmapped".to_string()
+        };
+    }
+
+    format!(
+        "mapped:state=0x{:X}:protect=0x{:X}:type=0x{:X}:region=0x{:X}:in_xgameruntime={}",
+        info.state,
+        info.protect,
+        info.type_,
+        info.region_size,
+        in_xgameruntime,
+    )
 }
 
 unsafe fn lookup_function_bounds(base: usize, control_pc: usize) -> Option<FunctionBounds> {
