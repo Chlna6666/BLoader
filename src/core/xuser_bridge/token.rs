@@ -5,7 +5,7 @@ use minhook::MinHook;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
-    mem, ptr,
+    mem,
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
@@ -69,6 +69,15 @@ unsafe extern "system" {
     fn SetLastError(error: u32);
 }
 
+macro_rules! hresult_try {
+    ($expression:expr) => {
+        match $expression {
+            Ok(value) => value,
+            Err(error) => return error,
+        }
+    };
+}
+
 pub(crate) fn initialize_native_token_bridge() -> Result<(), String> {
     TOKEN_BRIDGE_INIT
         .get_or_init(|| unsafe { install_native_token_bridge() })
@@ -83,31 +92,31 @@ unsafe fn install_native_token_bridge() -> Result<(), String> {
         hook_export(
             bcrypt,
             b"BCryptHashData\0",
-            bcrypt_hash_data_hook as *mut c_void,
+            bcrypt_hash_data_hook as *const () as *mut c_void,
             &ORIGINAL_BCRYPT_HASH_DATA,
         )?;
         hook_export(
             bcrypt,
             b"BCryptFinishHash\0",
-            bcrypt_finish_hash_hook as *mut c_void,
+            bcrypt_finish_hash_hook as *const () as *mut c_void,
             &ORIGINAL_BCRYPT_FINISH_HASH,
         )?;
         hook_export(
             bcrypt,
             b"BCryptDestroyHash\0",
-            bcrypt_destroy_hash_hook as *mut c_void,
+            bcrypt_destroy_hash_hook as *const () as *mut c_void,
             &ORIGINAL_BCRYPT_DESTROY_HASH,
         )?;
         hook_export(
             winhttp,
             b"WinHttpSendRequest\0",
-            winhttp_send_request_hook as *mut c_void,
+            winhttp_send_request_hook as *const () as *mut c_void,
             &ORIGINAL_WINHTTP_SEND_REQUEST,
         )?;
         hook_export(
             winhttp,
             b"WinHttpWriteData\0",
-            winhttp_write_data_hook as *mut c_void,
+            winhttp_write_data_hook as *const () as *mut c_void,
             &ORIGINAL_WINHTTP_WRITE_DATA,
         )?;
         MinHook::enable_all_hooks()
@@ -163,7 +172,7 @@ unsafe extern "system" fn bcrypt_hash_data_hook(
         return unsafe { original(hash, input, input_len, flags) };
     }
 
-    let source = unsafe { std::slice::from_raw_parts(input.cast_const(), input_len as usize) };
+    let source = unsafe { std::slice::from_raw_parts(input as *const u8, input_len as usize) };
     if let Some(rewrite) = rewrite_xsts_user_token(source) {
         let rewritten_len = match u32::try_from(rewrite.bytes.len()) {
             Ok(value) => value,
@@ -249,7 +258,7 @@ unsafe extern "system" fn winhttp_send_request_hook(
         };
     }
 
-    let source = unsafe { std::slice::from_raw_parts(optional.cast::<u8>(), optional_len as usize) };
+    let source = unsafe { std::slice::from_raw_parts(optional as *const u8, optional_len as usize) };
     let Some(rewrite) = rewrite_xsts_user_token(source) else {
         return unsafe {
             original(
@@ -302,7 +311,7 @@ unsafe extern "system" fn winhttp_write_data_hook(
     if buffer.is_null() || bytes_to_write == 0 {
         return unsafe { original(request, buffer, bytes_to_write, bytes_written) };
     }
-    let source = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), bytes_to_write as usize) };
+    let source = unsafe { std::slice::from_raw_parts(buffer as *const u8, bytes_to_write as usize) };
     let Some(rewrite) = rewrite_xsts_user_token(source) else {
         return unsafe { original(request, buffer, bytes_to_write, bytes_written) };
     };
@@ -326,7 +335,7 @@ unsafe extern "system" fn winhttp_write_data_hook(
     unsafe {
         original(
             request,
-            rewrite.bytes.as_ptr().cast(),
+            rewrite.bytes.as_ptr() as *const c_void,
             bytes_to_write,
             bytes_written,
         )
@@ -459,10 +468,12 @@ pub unsafe extern "system" fn get_token_and_signature_async(
         *const c_void,
         *mut XAsyncBlock,
     ) -> HResult;
-    let function: Function = unsafe { mem::transmute(native_token_slot(23)?) };
+    let slot = hresult_try!(native_token_slot(23));
+    let interface = hresult_try!(native_token_interface());
+    let function: Function = unsafe { mem::transmute(slot) };
     unsafe {
         function(
-            native_token_interface()?,
+            interface,
             user,
             options,
             method,
@@ -482,8 +493,10 @@ pub unsafe extern "system" fn get_token_and_signature_result_size(
     size: *mut usize,
 ) -> HResult {
     type Function = unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, *mut usize) -> HResult;
-    let function: Function = unsafe { mem::transmute(native_token_slot(24)?) };
-    unsafe { function(native_token_interface()?, async_block, size) }
+    let slot = hresult_try!(native_token_slot(24));
+    let interface = hresult_try!(native_token_interface());
+    let function: Function = unsafe { mem::transmute(slot) };
+    unsafe { function(interface, async_block, size) }
 }
 
 pub unsafe extern "system" fn get_token_and_signature_result(
@@ -502,17 +515,10 @@ pub unsafe extern "system" fn get_token_and_signature_result(
         *mut *mut TokenData,
         *mut usize,
     ) -> HResult;
-    let function: Function = unsafe { mem::transmute(native_token_slot(25)?) };
-    unsafe {
-        function(
-            native_token_interface()?,
-            async_block,
-            size,
-            buffer,
-            data,
-            used,
-        )
-    }
+    let slot = hresult_try!(native_token_slot(25));
+    let interface = hresult_try!(native_token_interface());
+    let function: Function = unsafe { mem::transmute(slot) };
+    unsafe { function(interface, async_block, size, buffer, data, used) }
 }
 
 pub unsafe extern "system" fn get_token_and_signature_utf16_async(
@@ -548,10 +554,12 @@ pub unsafe extern "system" fn get_token_and_signature_utf16_async(
         *const c_void,
         *mut XAsyncBlock,
     ) -> HResult;
-    let function: Function = unsafe { mem::transmute(native_token_slot(26)?) };
+    let slot = hresult_try!(native_token_slot(26));
+    let interface = hresult_try!(native_token_interface());
+    let function: Function = unsafe { mem::transmute(slot) };
     unsafe {
         function(
-            native_token_interface()?,
+            interface,
             user,
             options,
             method,
@@ -571,8 +579,10 @@ pub unsafe extern "system" fn get_token_and_signature_utf16_result_size(
     size: *mut usize,
 ) -> HResult {
     type Function = unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, *mut usize) -> HResult;
-    let function: Function = unsafe { mem::transmute(native_token_slot(27)?) };
-    unsafe { function(native_token_interface()?, async_block, size) }
+    let slot = hresult_try!(native_token_slot(27));
+    let interface = hresult_try!(native_token_interface());
+    let function: Function = unsafe { mem::transmute(slot) };
+    unsafe { function(interface, async_block, size) }
 }
 
 pub unsafe extern "system" fn get_token_and_signature_utf16_result(
@@ -591,17 +601,10 @@ pub unsafe extern "system" fn get_token_and_signature_utf16_result(
         *mut *mut TokenUtf16Data,
         *mut usize,
     ) -> HResult;
-    let function: Function = unsafe { mem::transmute(native_token_slot(28)?) };
-    unsafe {
-        function(
-            native_token_interface()?,
-            async_block,
-            size,
-            buffer,
-            data,
-            used,
-        )
-    }
+    let slot = hresult_try!(native_token_slot(28));
+    let interface = hresult_try!(native_token_interface());
+    let function: Function = unsafe { mem::transmute(slot) };
+    unsafe { function(interface, async_block, size, buffer, data, used) }
 }
 
 fn wide(value: &str) -> Vec<u16> {
@@ -613,7 +616,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn xsts_user_token_rewrite_requires_device_and_title_context() {
+    fn finds_xsts_user_token_marker() {
         assert!(find_bytes(b"{\"UserTokens\":[]}", b"\"UserTokens\"").is_some());
         assert!(find_bytes(b"{}", b"\"UserTokens\"").is_none());
     }
