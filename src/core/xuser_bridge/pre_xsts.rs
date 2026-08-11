@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use core::ffi::c_void;
-use std::sync::OnceLock;
+use sha2::{Digest as _, Sha256};
+use std::{ptr, sync::OnceLock};
 
 use super::super::{bridge_debug, bridge_info, bridge_warn};
 
@@ -12,6 +13,8 @@ pub struct DiscoverySummary {
     pub title_token_markers: usize,
     pub xsts_markers: usize,
     pub user_tokens_xrefs: usize,
+    pub user_tokens_function_candidates: usize,
+    pub high_confidence_builder_candidates: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -21,9 +24,29 @@ struct Section {
     executable: bool,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RuntimeFunction {
+    begin_address: u32,
+    end_address: u32,
+    unwind_info_address: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FunctionBounds {
+    begin: usize,
+    end: usize,
+    unwind: usize,
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleW(module_name: *const u16) -> *mut c_void;
+    fn RtlLookupFunctionEntry(
+        control_pc: u64,
+        image_base: *mut u64,
+        history_table: *mut c_void,
+    ) -> *const RuntimeFunction;
 }
 
 static DISCOVERY: OnceLock<Result<DiscoverySummary, String>> = OnceLock::new();
@@ -75,12 +98,26 @@ unsafe fn discover() -> Result<DiscoverySummary, String> {
     log_marker(base, "xsts/authorize", &xsts_authorize);
     log_marker(base, "xsts.auth.xboxlive.com", &xsts_host);
 
+    let (function_candidates, high_confidence_candidates) = unsafe {
+        log_user_tokens_function_candidates(
+            base,
+            image_size,
+            &user_tokens,
+            &device_token,
+            &title_token,
+            &xsts_authorize,
+            &xsts_host,
+        )
+    };
+
     let summary = DiscoverySummary {
         user_tokens_markers: user_tokens.addresses.len(),
         device_token_markers: device_token.addresses.len(),
         title_token_markers: title_token.addresses.len(),
         xsts_markers: xsts_authorize.addresses.len() + xsts_host.addresses.len(),
         user_tokens_xrefs: user_tokens.xrefs.len(),
+        user_tokens_function_candidates: function_candidates,
+        high_confidence_builder_candidates: high_confidence_candidates,
     };
 
     if summary.user_tokens_markers == 0 {
@@ -91,11 +128,17 @@ unsafe fn discover() -> Result<DiscoverySummary, String> {
         bridge_warn(
             "Microsoft Runtime 已发现 UserTokens 标记但未找到直接 RIP-relative LEA 引用；需要继续沿间接引用/调用图定位 pre-XSTS builder",
         );
+    } else if summary.user_tokens_function_candidates == 0 {
+        bridge_warn(
+            "Microsoft Runtime 已发现 UserTokens 代码引用，但 Windows unwind function table 无法解析其函数边界；该引用可能位于 leaf/thunk 代码，需要改用调用方回溯定位",
+        );
     } else {
         bridge_info(&format!(
-            "Microsoft Runtime pre-XSTS 候选已发现 | user_tokens_markers={} | user_tokens_text_xrefs={} | next=resolve-builder-abi-before-hook",
+            "Microsoft Runtime pre-XSTS builder 函数边界已解析 | user_tokens_markers={} | user_tokens_text_xrefs={} | function_candidates={} | high_confidence_candidates={} | next=resolve-builder-call-abi",
             summary.user_tokens_markers,
             summary.user_tokens_xrefs,
+            summary.user_tokens_function_candidates,
+            summary.high_confidence_builder_candidates,
         ));
     }
 
@@ -172,6 +215,173 @@ fn log_marker(base: usize, name: &str, locations: &MarkerLocations) {
         locations.addresses.len(),
         locations.xrefs.len(),
     ));
+}
+
+unsafe fn log_user_tokens_function_candidates(
+    base: usize,
+    image_size: usize,
+    user_tokens: &MarkerLocations,
+    device_token: &MarkerLocations,
+    title_token: &MarkerLocations,
+    xsts_authorize: &MarkerLocations,
+    xsts_host: &MarkerLocations,
+) -> (usize, usize) {
+    let mut functions = Vec::<FunctionBounds>::new();
+    let mut high_confidence = 0usize;
+
+    for xref in &user_tokens.xrefs {
+        let Some(bounds) = (unsafe { lookup_function_bounds(base, *xref) }) else {
+            bridge_warn(&format!(
+                "pre-XSTS UserTokens xref 无对应 RUNTIME_FUNCTION | xref_rva=0x{:X} | classification=leaf-or-thunk",
+                xref.saturating_sub(base),
+            ));
+            continue;
+        };
+        if functions.contains(&bounds) {
+            continue;
+        }
+        functions.push(bounds);
+
+        let device_refs = count_xrefs_in_function(device_token, bounds);
+        let title_refs = count_xrefs_in_function(title_token, bounds);
+        let authorize_refs = count_xrefs_in_function(xsts_authorize, bounds);
+        let host_refs = count_xrefs_in_function(xsts_host, bounds);
+        let co_marker_classes = usize::from(device_refs != 0)
+            + usize::from(title_refs != 0)
+            + usize::from(authorize_refs != 0)
+            + usize::from(host_refs != 0);
+        if device_refs != 0 && title_refs != 0 {
+            high_confidence = high_confidence.saturating_add(1);
+        }
+
+        let lea_register = unsafe { rip_lea_destination_register(*xref) }.unwrap_or("unknown");
+        let direct_calls = unsafe {
+            direct_call_candidates_after_xref(base, image_size, *xref, bounds.end, 96)
+        };
+        let direct_call_summary = direct_calls
+            .iter()
+            .take(12)
+            .map(|(call, target)| {
+                format!(
+                    "0x{:X}->0x{:X}(+0x{:X})",
+                    call.saturating_sub(base),
+                    target.saturating_sub(base),
+                    call.saturating_sub(*xref),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let function_hash = unsafe { function_sha256_prefix(bounds) };
+
+        bridge_info(&format!(
+            "pre-XSTS UserTokens function candidate | xref_rva=0x{:X} | function_begin_rva=0x{:X} | function_end_rva=0x{:X} | function_size=0x{:X} | unwind_rva=0x{:X} | lea_destination={} | DeviceToken_xrefs_in_function={} | TitleToken_xrefs_in_function={} | xsts_authorize_xrefs_in_function={} | xsts_host_xrefs_in_function={} | co_marker_classes={} | direct_call_candidates_after_xref=[{}] | function_sha256_prefix={} | secrets_logged=false",
+            xref.saturating_sub(base),
+            bounds.begin.saturating_sub(base),
+            bounds.end.saturating_sub(base),
+            bounds.end.saturating_sub(bounds.begin),
+            bounds.unwind.saturating_sub(base),
+            lea_register,
+            device_refs,
+            title_refs,
+            authorize_refs,
+            host_refs,
+            co_marker_classes,
+            direct_call_summary,
+            function_hash,
+        ));
+    }
+
+    (functions.len(), high_confidence)
+}
+
+unsafe fn lookup_function_bounds(base: usize, control_pc: usize) -> Option<FunctionBounds> {
+    let mut image_base = 0u64;
+    let entry = unsafe {
+        RtlLookupFunctionEntry(control_pc as u64, &mut image_base, ptr::null_mut())
+    };
+    if entry.is_null() || image_base as usize != base {
+        return None;
+    }
+    let entry = unsafe { entry.read_unaligned() };
+    let begin = base.checked_add(entry.begin_address as usize)?;
+    let end = base.checked_add(entry.end_address as usize)?;
+    let unwind = base.checked_add(entry.unwind_info_address as usize)?;
+    (begin < end && control_pc >= begin && control_pc < end).then_some(FunctionBounds {
+        begin,
+        end,
+        unwind,
+    })
+}
+
+fn count_xrefs_in_function(locations: &MarkerLocations, bounds: FunctionBounds) -> usize {
+    locations
+        .xrefs
+        .iter()
+        .filter(|address| **address >= bounds.begin && **address < bounds.end)
+        .count()
+}
+
+unsafe fn rip_lea_destination_register(address: usize) -> Option<&'static str> {
+    let first = unsafe { read_u8(address) };
+    let (rex, opcode, modrm) = if (0x40..=0x4f).contains(&first) {
+        (
+            first,
+            unsafe { read_u8(address + 1) },
+            unsafe { read_u8(address + 2) },
+        )
+    } else {
+        (0, first, unsafe { read_u8(address + 1) })
+    };
+    if opcode != 0x8d || (modrm & 0xc7) != 0x05 {
+        return None;
+    }
+    let register = ((modrm >> 3) & 0x07) | (((rex >> 2) & 0x01) << 3);
+    const REGISTERS: [&str; 16] = [
+        "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10",
+        "r11", "r12", "r13", "r14", "r15",
+    ];
+    REGISTERS.get(register as usize).copied()
+}
+
+unsafe fn direct_call_candidates_after_xref(
+    base: usize,
+    image_size: usize,
+    xref: usize,
+    function_end: usize,
+    max_bytes: usize,
+) -> Vec<(usize, usize)> {
+    let end = xref.saturating_add(max_bytes).min(function_end);
+    if end <= xref || end - xref < 5 {
+        return Vec::new();
+    }
+    let code = unsafe { core::slice::from_raw_parts(xref as *const u8, end - xref) };
+    let image_end = base.saturating_add(image_size);
+    let mut calls = Vec::new();
+    for index in 0..=code.len() - 5 {
+        if code[index] != 0xe8 {
+            continue;
+        }
+        let displacement = i32::from_le_bytes(code[index + 1..index + 5].try_into().unwrap()) as isize;
+        let call = xref + index;
+        let target = (call + 5).wrapping_add_signed(displacement);
+        if target >= base && target < image_end {
+            calls.push((call, target));
+        }
+    }
+    calls
+}
+
+unsafe fn function_sha256_prefix(bounds: FunctionBounds) -> String {
+    let size = bounds.end.saturating_sub(bounds.begin).min(1024 * 1024);
+    if size == 0 {
+        return "none".to_string();
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(bounds.begin as *const u8, size) };
+    let digest = Sha256::digest(bytes);
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
@@ -276,6 +486,10 @@ unsafe fn parse_pe_sections(base: usize) -> Result<(usize, Vec<Section>), String
     Ok((image_size, sections))
 }
 
+unsafe fn read_u8(address: usize) -> u8 {
+    unsafe { (address as *const u8).read_unaligned() }
+}
+
 unsafe fn read_u16(address: usize) -> u16 {
     unsafe { (address as *const u16).read_unaligned() }
 }
@@ -307,5 +521,29 @@ mod tests {
         code.extend_from_slice(&displacement.to_le_bytes());
         code.extend_from_slice(&[0x90, 0x90]);
         assert_eq!(find_rip_relative_lea_refs(&code, code_address, target), vec![0x1000]);
+    }
+
+    #[test]
+    fn direct_call_scanner_resolves_rel32_target() {
+        let base = 0x1000usize;
+        let xref = 0x1100usize;
+        let target = 0x1200usize;
+        let displacement = (target as isize - (xref + 5) as isize) as i32;
+        let mut code = vec![0xe8];
+        code.extend_from_slice(&displacement.to_le_bytes());
+        let calls = code
+            .windows(5)
+            .enumerate()
+            .filter_map(|(index, value)| {
+                if value[0] != 0xe8 {
+                    return None;
+                }
+                let displacement = i32::from_le_bytes(value[1..5].try_into().unwrap()) as isize;
+                let call = xref + index;
+                Some((call, (call + 5).wrapping_add_signed(displacement)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls, vec![(xref, target)]);
+        assert!(target >= base);
     }
 }
