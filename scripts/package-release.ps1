@@ -68,12 +68,13 @@ $manifest = [ordered]@{
         }
     }
     console = [ordered]@{
-        terminal_owner = "BMCBL"
-        transport = "process-scoped named pipe"
+        default_backend = "classic-direct"
+        terminal_spawn = $false
+        named_pipe_handshake = $false
         shell = $false
         rundll32 = $false
         extra_host_executable = $false
-        fallback = "visible classic console"
+        startup_handshake_ms = 0
     }
     xuser_bridge = [ordered]@{
         platform = "Win32 GDK only"
