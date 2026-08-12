@@ -92,6 +92,13 @@ static PROBE_MODULE_BASE: AtomicUsize = AtomicUsize::new(0);
 static PROBE_MODULE_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 const MAX_PROBE_LOG_CALLS: u32 = 16;
+const MAX_CALL_TARGET_PROBES: usize = 8;
+static ORIGINAL_PRE_XSTS_CALL_TARGETS: [AtomicUsize; MAX_CALL_TARGET_PROBES] =
+    [const { AtomicUsize::new(0) }; MAX_CALL_TARGET_PROBES];
+static PRE_XSTS_CALL_TARGET_RVAS: [AtomicUsize; MAX_CALL_TARGET_PROBES] =
+    [const { AtomicUsize::new(0) }; MAX_CALL_TARGET_PROBES];
+static PRE_XSTS_CALL_TARGET_PROBE_CALLS: [AtomicU32; MAX_CALL_TARGET_PROBES] =
+    [const { AtomicU32::new(0) }; MAX_CALL_TARGET_PROBES];
 
 pub fn ensure_discovered() -> Result<DiscoverySummary, String> {
     DISCOVERY
@@ -342,6 +349,166 @@ unsafe fn log_user_tokens_function_candidates(
     }
 
     (functions.len(), high_confidence, first_high_confidence.or(first_candidate))
+}
+
+
+unsafe fn install_call_target_probes(base: usize, image_size: usize, calls: &[(usize, usize)]) {
+    let mut installed = 0usize;
+    let mut seen_targets = Vec::<usize>::new();
+    for (source_call, target) in calls.iter().copied() {
+        if seen_targets.contains(&target) {
+            continue;
+        }
+        seen_targets.push(target);
+        if installed >= MAX_CALL_TARGET_PROBES {
+            break;
+        }
+        if target < base || target >= base.saturating_add(image_size) {
+            continue;
+        }
+        let slot = installed;
+        if ORIGINAL_PRE_XSTS_CALL_TARGETS[slot].load(Ordering::Acquire) != 0 {
+            installed = installed.saturating_add(1);
+            continue;
+        }
+        let Some(detour) = call_target_detour(slot) else {
+            break;
+        };
+        let trampoline = match unsafe { MinHook::create_hook(target as *mut c_void, detour) } {
+            Ok(value) => value,
+            Err(error) => {
+                bridge_warn(&format!(
+                    "pre-XSTS call target 探针安装失败；继续观察其他候选 | slot={slot} | source_call_rva=0x{:X} | target_rva=0x{:X} | error={error:?} | secrets_logged=false",
+                    source_call.saturating_sub(base),
+                    target.saturating_sub(base),
+                ));
+                continue;
+            }
+        };
+        match ORIGINAL_PRE_XSTS_CALL_TARGETS[slot].compare_exchange(
+            0,
+            trampoline as usize,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                PRE_XSTS_CALL_TARGET_RVAS[slot].store(target.saturating_sub(base), Ordering::Release);
+                if let Err(error) = unsafe { MinHook::enable_all_hooks() } {
+                    ORIGINAL_PRE_XSTS_CALL_TARGETS[slot].store(0, Ordering::Release);
+                    bridge_warn(&format!(
+                        "pre-XSTS call target 探针启用失败；继续观察其他候选 | slot={slot} | source_call_rva=0x{:X} | target_rva=0x{:X} | trampoline=0x{:X} | error={error:?} | secrets_logged=false",
+                        source_call.saturating_sub(base),
+                        target.saturating_sub(base),
+                        trampoline as usize,
+                    ));
+                    continue;
+                }
+                bridge_info(&format!(
+                    "pre-XSTS call target 探针已安装 | slot={slot} | source_call_rva=0x{:X} | target_rva=0x{:X} | trampoline=0x{:X} | mode=transparent-forwarding | max_logged_calls={} | secrets_logged=false",
+                    source_call.saturating_sub(base),
+                    target.saturating_sub(base),
+                    trampoline as usize,
+                    MAX_PROBE_LOG_CALLS,
+                ));
+                installed = installed.saturating_add(1);
+            }
+            Err(existing) => {
+                bridge_info(&format!(
+                    "pre-XSTS call target 探针已由其他线程安装 | slot={slot} | existing_trampoline=0x{existing:X} | target_rva=0x{:X} | secrets_logged=false",
+                    target.saturating_sub(base),
+                ));
+            }
+        }
+    }
+    if installed == 0 && !calls.is_empty() {
+        bridge_warn(
+            "pre-XSTS call target 探针未安装任何候选；将继续只使用 marker/function 边界诊断 | secrets_logged=false",
+        );
+    }
+}
+
+fn call_target_detour(slot: usize) -> Option<*mut c_void> {
+    Some(match slot {
+        0 => pre_xsts_call_target_probe_0 as *const () as *mut c_void,
+        1 => pre_xsts_call_target_probe_1 as *const () as *mut c_void,
+        2 => pre_xsts_call_target_probe_2 as *const () as *mut c_void,
+        3 => pre_xsts_call_target_probe_3 as *const () as *mut c_void,
+        4 => pre_xsts_call_target_probe_4 as *const () as *mut c_void,
+        5 => pre_xsts_call_target_probe_5 as *const () as *mut c_void,
+        6 => pre_xsts_call_target_probe_6 as *const () as *mut c_void,
+        7 => pre_xsts_call_target_probe_7 as *const () as *mut c_void,
+        _ => return None,
+    })
+}
+
+macro_rules! define_call_target_probe {
+    ($name:ident, $slot:expr) => {
+        unsafe extern "system" fn $name(
+            a0: usize,
+            a1: usize,
+            a2: usize,
+            a3: usize,
+            a4: usize,
+            a5: usize,
+            a6: usize,
+            a7: usize,
+        ) -> usize {
+            unsafe { pre_xsts_call_target_probe($slot, a0, a1, a2, a3, a4, a5, a6, a7) }
+        }
+    };
+}
+define_call_target_probe!(pre_xsts_call_target_probe_0, 0);
+define_call_target_probe!(pre_xsts_call_target_probe_1, 1);
+define_call_target_probe!(pre_xsts_call_target_probe_2, 2);
+define_call_target_probe!(pre_xsts_call_target_probe_3, 3);
+define_call_target_probe!(pre_xsts_call_target_probe_4, 4);
+define_call_target_probe!(pre_xsts_call_target_probe_5, 5);
+define_call_target_probe!(pre_xsts_call_target_probe_6, 6);
+define_call_target_probe!(pre_xsts_call_target_probe_7, 7);
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn pre_xsts_call_target_probe(
+    slot: usize,
+    arg0: usize,
+    arg1: usize,
+    arg2: usize,
+    arg3: usize,
+    arg4: usize,
+    arg5: usize,
+    arg6: usize,
+    arg7: usize,
+) -> usize {
+    let call_index = PRE_XSTS_CALL_TARGET_PROBE_CALLS[slot].fetch_add(1, Ordering::AcqRel) + 1;
+    let target_rva = PRE_XSTS_CALL_TARGET_RVAS[slot].load(Ordering::Acquire);
+    let should_log = call_index <= MAX_PROBE_LOG_CALLS;
+    if should_log {
+        let args = [arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7]
+            .iter()
+            .enumerate()
+            .map(|(index, value)| unsafe { format_probe_arg(index, *value) })
+            .collect::<Vec<_>>()
+            .join(",");
+        let thread_id = unsafe { GetCurrentThreadId() };
+        bridge_info(&format!(
+            "pre-XSTS call target probe hit | slot={slot} | target_rva=0x{target_rva:X} | call_index={call_index} | thread_id={thread_id} | args=[{args}] | mode=transparent-forwarding | secrets_logged=false"
+        ));
+    }
+    let original_address = ORIGINAL_PRE_XSTS_CALL_TARGETS[slot].load(Ordering::Acquire);
+    if original_address == 0 {
+        bridge_warn(&format!(
+            "pre-XSTS call target trampoline 丢失；返回 0 以避免执行未知路径 | slot={slot} | target_rva=0x{target_rva:X}"
+        ));
+        return 0;
+    }
+    let original: BuilderProbeFn = unsafe { mem::transmute(original_address) };
+    let result = unsafe { original(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7) };
+    if should_log {
+        bridge_info(&format!(
+            "pre-XSTS call target probe return | slot={slot} | target_rva=0x{target_rva:X} | call_index={call_index} | result=0x{result:X} | result_class={} | secrets_logged=false",
+            unsafe { classify_probe_value(result) },
+        ));
+    }
+    result
 }
 
 unsafe fn install_builder_probe(base: usize, image_size: usize, bounds: FunctionBounds) {
