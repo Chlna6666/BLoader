@@ -14,6 +14,7 @@ const DEFAULT_RELOAD_HOTKEY_VK: u32 = 0x78;
 #[cfg(feature = "panel-ui")]
 const DEFAULT_OVERLAY_BLUR_STRENGTH: f32 = 1.0;
 const DEFAULT_REDIRECTION_ROOT: &str = "Minecraft Bedrock";
+const DEFAULT_LOG_ARCHIVE_DAYS: u32 = 7;
 const REMOVED_CONFIG_KEYS: &[&str] = &[
     "xgameruntime_redirection",
     "editor_mode",
@@ -108,6 +109,9 @@ pub struct Config {
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
+    #[serde(default = "default_log_archive_days")]
+    pub log_archive_days: u32,
+
     #[serde(default = "default_locale")]
     pub default_locale: String,
 
@@ -142,6 +146,10 @@ fn default_ignore_ports() -> Vec<u16> {
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_log_archive_days() -> u32 {
+    DEFAULT_LOG_ARCHIVE_DAYS
 }
 
 fn default_locale() -> String {
@@ -222,6 +230,7 @@ impl Default for Config {
             #[cfg(feature = "panel-ui")]
             enable_bedrock_ui_reload_probe: false,
             log_level: default_log_level(),
+            log_archive_days: default_log_archive_days(),
             default_locale: default_locale(),
             #[cfg(feature = "panel-ui")]
             enable_dx11: false,
@@ -389,14 +398,16 @@ impl Config {
     }
 
     pub fn apply_update(config: &Config) {
+        logging::set_archive_retention_days(config.log_archive_days);
         crate::core::network_hook::update_config(config);
         logging::info_message(&format!(
-            "Config applied | locale={} | mods={} | redirection={} | network={} | listen={}",
+            "Config applied | locale={} | mods={} | redirection={} | network={} | listen={} | archive_days={}",
             config.default_locale,
             config.mods.len(),
             config.enable_redirection,
             config.enable_network_hooks,
-            config.network_listen_port
+            config.network_listen_port,
+            config.log_archive_days
         ));
     }
 
@@ -471,6 +482,7 @@ mod tests {
             config.vanilla_skin_pack_redirect.as_deref(),
             Some(r"C:\BMCBL\skin_packs\custom")
         );
+        assert_eq!(config.log_archive_days, DEFAULT_LOG_ARCHIVE_DAYS);
         #[cfg(feature = "panel-ui")]
         assert!(!config.enable_dx11);
         assert_eq!(config.file_redirections.len(), 1);
@@ -482,10 +494,12 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.redirection_root, DEFAULT_REDIRECTION_ROOT);
         assert!(config.vanilla_skin_pack_redirect.is_none());
+        assert_eq!(config.log_archive_days, DEFAULT_LOG_ARCHIVE_DAYS);
 
         let parsed: Config = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(parsed.redirection_root, DEFAULT_REDIRECTION_ROOT);
         assert!(parsed.vanilla_skin_pack_redirect.is_none());
+        assert_eq!(parsed.log_archive_days, DEFAULT_LOG_ARCHIVE_DAYS);
     }
 
     #[test]
@@ -495,6 +509,7 @@ mod tests {
           "enable_redirection": false,
           "disable_mod_loading": false,
           "vanilla_skin_pack_redirect": null,
+          "log_archive_days": 14,
           "file_redirections": [],
           "redirection_root": "Minecraft Bedrock",
           "mods": []
@@ -505,6 +520,7 @@ mod tests {
         assert!(!config.enable_redirection);
         assert!(!config.disable_mod_loading);
         assert!(config.vanilla_skin_pack_redirect.is_none());
+        assert_eq!(config.log_archive_days, 14);
         assert_eq!(config.redirection_root, "Minecraft Bedrock");
     }
 
@@ -551,6 +567,10 @@ mod tests {
         assert_eq!(
             object.get("launcher_owned_value"),
             Some(&serde_json::json!("keep-me"))
+        );
+        assert_eq!(
+            object.get("log_archive_days"),
+            Some(&serde_json::json!(DEFAULT_LOG_ARCHIVE_DAYS))
         );
     }
 }
