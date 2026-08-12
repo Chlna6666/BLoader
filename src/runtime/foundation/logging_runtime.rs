@@ -41,6 +41,7 @@ pub fn init(configured_level: &str) {
     EFFECTIVE_LEVEL.store(level_rank, Ordering::Release);
     inner::set_console_level(effective_level);
 
+    cleanup_legacy_diagnostic_artifacts();
     let pruned = prune_archive_logs().unwrap_or(0);
     inner::init(effective_level);
     LOGGING_CONFIGURED.store(true, Ordering::Release);
@@ -130,6 +131,22 @@ fn level_rank(value: &str) -> u8 {
 
 fn normalize_archive_days(days: u32) -> u32 {
     days.clamp(1, MAX_ARCHIVE_RETENTION_DAYS)
+}
+
+fn cleanup_legacy_diagnostic_artifacts() {
+    if !crate::runtime::foundation::file_io_policy::writes_allowed() {
+        return;
+    }
+
+    for path in [
+        PathBuf::from("logs").join("mod-registry.json"),
+        PathBuf::from("logs").join("native-load-status.json"),
+        PathBuf::from("logs").join("native-load-status.json.tmp"),
+        PathBuf::from("logs").join("preloader-status.json"),
+    ] {
+        let _ = fs::remove_file(path);
+    }
+    let _ = fs::remove_dir_all(PathBuf::from("logs").join("captured-stdio"));
 }
 
 fn prune_archive_logs() -> std::io::Result<usize> {
