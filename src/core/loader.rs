@@ -786,69 +786,18 @@ pub fn publish_native_preload_reports() -> NativePreloadSummary {
         }
     }
 
-    let status_path = write_native_status_file(summary, &reports);
-
     logging::scoped_info_message(
         "native-loader",
         &format!(
-            "SUMMARY | discovered={} attempted={} verified={} failed={} required_failed={} status_file={}",
+            "SUMMARY | discovered={} attempted={} verified={} failed={} required_failed={}",
             summary.discovered,
             summary.attempted,
             summary.verified,
             summary.failed,
             summary.required_failed,
-            if file_io_policy::writes_allowed() {
-                status_path.display().to_string()
-            } else {
-                "<disabled:legacy-uwp-no-file-write>".to_string()
-            },
         ),
     );
     summary
-}
-
-fn write_native_status_file(summary: NativePreloadSummary, reports: &[NativeLoadReport]) -> PathBuf {
-    let status_path = PathBuf::from("logs").join("native-load-status.json");
-    if !file_io_policy::writes_allowed() {
-        return status_path;
-    }
-
-    let _ = fs::create_dir_all("logs");
-    let status_document = serde_json::json!({
-        "summary": summary,
-        "reports": reports,
-    });
-    match serde_json::to_vec_pretty(&status_document) {
-        Ok(data) => {
-            let temp_path = status_path.with_extension("json.tmp");
-            match fs::write(&temp_path, data) {
-                Ok(()) => {
-                    let _ = fs::remove_file(&status_path);
-                    if let Err(error) = fs::rename(&temp_path, &status_path) {
-                        logging::scoped_error_message(
-                            "native-loader",
-                            &format!(
-                                "failed to publish status file {}: {error}",
-                                status_path.display()
-                            ),
-                        );
-                    }
-                }
-                Err(error) => logging::scoped_error_message(
-                    "native-loader",
-                    &format!(
-                        "failed to write native load status temp file {}: {error}",
-                        temp_path.display()
-                    ),
-                ),
-            }
-        }
-        Err(error) => logging::scoped_error_message(
-            "native-loader",
-            &format!("failed to serialize native load status: {error}"),
-        ),
-    }
-    status_path
 }
 
 pub fn required_native_failure_message() -> Option<String> {
@@ -877,7 +826,7 @@ pub fn required_native_failure_message() -> Option<String> {
     }
     if file_io_policy::writes_allowed() {
         lines.push(String::new());
-        lines.push("See logs\\latest.log and logs\\native-load-status.json for details.".to_string());
+        lines.push("See logs\\latest.log for details.".to_string());
     }
     Some(lines.join("\n"))
 }
@@ -909,10 +858,6 @@ pub fn native_success_notification_message() -> Option<String> {
             report.resolved_path.as_deref().unwrap_or(&report.expected_path),
             report.module_handle.as_deref().unwrap_or("handle unavailable")
         ));
-    }
-    if file_io_policy::writes_allowed() {
-        lines.push(String::new());
-        lines.push("Detailed status: logs\\native-load-status.json".to_string());
     }
     Some(lines.join("\n"))
 }
@@ -1443,7 +1388,7 @@ unsafe fn load_library(preload: &PreloadMod, phase: &str, silent_success: bool) 
             report.expected_path,
             report.resolved_path.as_deref().unwrap_or("not loaded"),
             if file_io_policy::writes_allowed() {
-                "\n\nSee logs\\latest.log and logs\\native-load-status.json."
+                "\n\nSee logs\\latest.log."
             } else {
                 ""
             },
@@ -1451,16 +1396,11 @@ unsafe fn load_library(preload: &PreloadMod, phase: &str, silent_success: bool) 
     } else if success && report.notify_success {
         visible_title = Some("BLoader Native Module Loaded");
         visible_message = Some(format!(
-            "Native module '{}' was loaded and verified successfully.\n\nPhase: {}\nPath: {}\nHandle: {}{}",
+            "Native module '{}' was loaded and verified successfully.\n\nPhase: {}\nPath: {}\nHandle: {}",
             report.name,
             report.phase,
             report.resolved_path.as_deref().unwrap_or(&report.expected_path),
             report.module_handle.as_deref().unwrap_or("unavailable"),
-            if file_io_policy::writes_allowed() {
-                "\n\nDetailed status: logs\\native-load-status.json"
-            } else {
-                ""
-            },
         ));
     } else {
         visible_title = None;
@@ -1469,15 +1409,6 @@ unsafe fn load_library(preload: &PreloadMod, phase: &str, silent_success: bool) 
 
     apply_native_diagnostics(preload, &report);
     record_native_report(report);
-    let reports = NATIVE_LOAD_REPORTS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clone();
-    let _ = write_native_status_file(
-        NATIVE_PRELOAD_SUMMARY.get().copied().unwrap_or_default(),
-        &reports,
-    );
 
     if let (Some(title), Some(message)) = (visible_title, visible_message) {
         let title = title.to_string();
