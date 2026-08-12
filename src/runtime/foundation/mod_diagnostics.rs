@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -9,7 +9,7 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 
-use crate::runtime::foundation::{file_io_policy, logging};
+use crate::runtime::foundation::logging;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ModIdentity {
@@ -144,17 +144,19 @@ pub fn mark_loading(identity: &ModIdentity, phase: &str) {
 }
 
 pub fn mark_loaded(identity: &ModIdentity, module: usize, phase: &str) -> ModIdentity {
-    let handle = format!("0x{module:X}");
-    let updated = update_identity(identity, Some(handle), "loaded");
+    let updated = update_identity(identity, Some(format!("0x{module:X}")), "loaded");
     record_lifecycle(&updated, "load_success", phase);
-    let _ = write_registry_snapshot();
     updated
 }
 
 pub fn mark_failed(identity: &ModIdentity, phase: &str, detail: &str) {
     update_identity(identity, None, "failed");
     record_lifecycle(identity, "load_failed", &format!("{phase}: {detail}"));
-    let _ = write_registry_snapshot();
+}
+
+pub fn mark_crashed(identity: &ModIdentity, phase: &str, detail: &str) {
+    let updated = update_identity(identity, None, "crashed");
+    record_lifecycle(&updated, "crash", &format!("{phase}: {detail}"));
 }
 
 fn update_identity(identity: &ModIdentity, module_handle: Option<String>, state: &str) -> ModIdentity {
@@ -228,12 +230,6 @@ pub fn active_scope_for_thread(thread_id: u32) -> Option<ActiveScopeSnapshot> {
             phase: scope.phase.clone(),
             thread_id: scope.thread_id,
         })
-}
-
-pub fn mark_crashed(identity: &ModIdentity, phase: &str, detail: &str) {
-    let updated = update_identity(identity, None, "crashed");
-    record_lifecycle(&updated, "crash", &format!("{phase}: {detail}"));
-    let _ = write_registry_snapshot();
 }
 
 pub fn all_mods() -> Vec<ModIdentity> {
@@ -445,8 +441,6 @@ pub fn record_lifecycle(identity: &ModIdentity, phase: &str, detail: &str) {
         detail,
     );
 
-    // Keep the machine-useful lifecycle record in DEBUG/TRACE sinks, then emit
-    // only a short Java-server-style status line for events users need live.
     match phase {
         "scope_enter" | "scope_exit" => logging::scoped_trace_message(&scope, &diagnostic),
         _ => logging::scoped_debug_message(&scope, &diagnostic),
@@ -470,36 +464,11 @@ pub fn record_lifecycle(identity: &ModIdentity, phase: &str, detail: &str) {
     }
 }
 
+/// Runtime diagnostics are intentionally memory-only. Crash reports query the
+/// registry and recent-event ring directly; no standalone mod-registry.json is
+/// written into the user's log directory.
 pub fn write_registry_snapshot() -> std::io::Result<()> {
-    if !file_io_policy::writes_allowed() {
-        return Ok(());
-    }
-
-    #[derive(Serialize)]
-    struct Snapshot {
-        generated_at: String,
-        mods: Vec<ModIdentity>,
-        recent_events: Vec<LifecycleEvent>,
-    }
-
-    let snapshot = Snapshot {
-        generated_at: Local::now().to_rfc3339(),
-        mods: mods()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone(),
-        recent_events: events()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .iter()
-            .cloned()
-            .collect(),
-    };
-    let path = PathBuf::from("logs").join("mod-registry.json");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, serde_json::to_vec_pretty(&snapshot)?)
+    Ok(())
 }
 
 fn bracket_prefix(line: &str) -> Option<&str> {

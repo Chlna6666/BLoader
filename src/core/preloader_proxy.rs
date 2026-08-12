@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -7,7 +7,7 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows::core::PCWSTR;
 
-use crate::runtime::foundation::{crash_report, file_io_policy, logging, mod_diagnostics};
+use crate::runtime::foundation::{crash_report, logging, mod_diagnostics};
 
 const PRELOAD_TYPE: &str = "preload";
 const PRELOADER_DLL: &str = "PreLoader.dll";
@@ -63,23 +63,7 @@ struct ManifestBundle {
     manifest: Manifest,
 }
 
-#[derive(Serialize)]
-struct ProxyStatus<'a> {
-    state: &'a str,
-    discovered: usize,
-    candidate: Option<String>,
-    resolved: Option<String>,
-    detail: &'a str,
-    elapsed_ms: u128,
-}
-
 pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
-    // The preloader proxy is the first ordinary Rust code reached immediately
-    // before the potentially slow synchronous PreLoader/LeviLamina chain. Show
-    // the single BLoader console window here so direct Minecraft.Windows.exe
-    // launches do not wait 10+ seconds for OEP release before any console is
-    // visible. The early path deliberately does not bind process STD handles or
-    // touch CRT state; those operations remain post-OEP.
     if crate::core::console::early_console_requested() {
         crate::core::console::init_console_window_early();
     }
@@ -89,14 +73,6 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
     candidates.sort_by(|a, b| a.path.cmp(&b.path));
 
     if candidates.is_empty() {
-        publish_status(ProxyStatus {
-            state: "not_found",
-            discovered: 0,
-            candidate: None,
-            resolved: None,
-            detail: "no type=preload package with entry PreLoader.dll was found",
-            elapsed_ms: started.elapsed().as_millis(),
-        });
         logging::write_bootstrap_marker("preloader.early.not_found");
         return PreloaderProxySummary {
             discovered: 0,
@@ -151,7 +127,6 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
         let resolved = canonical_or_original(&crate::utils::get_module_path(module.0 as usize));
         if paths_equivalent(&expected, &resolved) {
             mod_diagnostics::mark_loaded(&identity, module.0 as usize, "preloader_preexisting");
-            let detail = "PreLoader was already loaded from the requested package; proxy ownership accepted";
             logging::write_bootstrap_marker(&format!(
                 "preloader.priority.preexisting module=0x{:X} path={}",
                 module.0 as usize,
@@ -165,14 +140,6 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
                     resolved.display()
                 ),
             );
-            publish_status(ProxyStatus {
-                state: "loaded",
-                discovered,
-                candidate: Some(expected.display().to_string()),
-                resolved: Some(resolved.display().to_string()),
-                detail,
-                elapsed_ms: started.elapsed().as_millis(),
-            });
             return PreloaderProxySummary {
                 discovered,
                 state: PreloaderProxyState::Loaded,
@@ -187,14 +154,6 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
         mod_diagnostics::mark_failed(&identity, "preloader_collision", &detail);
         logging::scoped_error_message("preloader", &detail);
         logging::write_bootstrap_marker(&format!("preloader.priority.collision {detail}"));
-        publish_status(ProxyStatus {
-            state: "failed",
-            discovered,
-            candidate: Some(expected.display().to_string()),
-            resolved: Some(resolved.display().to_string()),
-            detail: &detail,
-            elapsed_ms: started.elapsed().as_millis(),
-        });
         return PreloaderProxySummary {
             discovered,
             state: PreloaderProxyState::Failed,
@@ -207,12 +166,6 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
         expected.display()
     ));
 
-    // PreLoader owns a complex synchronous native bootstrap chain. Redirecting
-    // the process/CRT stdout and stderr around its LoadLibrary changes the host
-    // environment seen by PreLoader/LeviLamina and can trigger a C++ exception
-    // during initialization. Keep this earliest load path side-effect free.
-    // Early structured output is recovered later from the external log relay;
-    // regular BLoader-loaded native Mods still use native_stdio capture.
     let load_result = {
         let _scope = mod_diagnostics::enter_scope(&identity, "LoadLibrary:preloader_priority_early");
         let wide = wide_null(expected.as_os_str());
@@ -234,14 +187,6 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
                 logging::write_bootstrap_marker(&format!(
                     "preloader.priority.path_mismatch {detail}"
                 ));
-                publish_status(ProxyStatus {
-                    state: "failed",
-                    discovered,
-                    candidate: Some(expected.display().to_string()),
-                    resolved: Some(resolved.display().to_string()),
-                    detail: &detail,
-                    elapsed_ms: started.elapsed().as_millis(),
-                });
                 return PreloaderProxySummary {
                     discovered,
                     state: PreloaderProxyState::Failed,
@@ -249,7 +194,6 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
             }
 
             mod_diagnostics::mark_loaded(&identity, module.0 as usize, "preloader_priority_early");
-            let detail = "PreLoader loaded successfully during earliest bootstrap-thread phase; remaining preload modules are delegated to PreLoader";
             logging::scoped_info_message(
                 "preloader",
                 &format!(
@@ -264,14 +208,6 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
                 resolved.display(),
                 started.elapsed().as_millis()
             ));
-            publish_status(ProxyStatus {
-                state: "loaded",
-                discovered,
-                candidate: Some(expected.display().to_string()),
-                resolved: Some(resolved.display().to_string()),
-                detail,
-                elapsed_ms: started.elapsed().as_millis(),
-            });
             PreloaderProxySummary {
                 discovered,
                 state: PreloaderProxyState::Loaded,
@@ -297,14 +233,6 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
                 expected.display(),
                 detail
             ));
-            publish_status(ProxyStatus {
-                state: "failed",
-                discovered,
-                candidate: Some(expected.display().to_string()),
-                resolved: None,
-                detail: &detail,
-                elapsed_ms: started.elapsed().as_millis(),
-            });
             PreloaderProxySummary {
                 discovered,
                 state: PreloaderProxyState::Failed,
@@ -386,16 +314,4 @@ fn normalize_path(path: &Path) -> String {
 
 fn wide_null(value: &std::ffi::OsStr) -> Vec<u16> {
     value.encode_wide().chain(Some(0)).collect()
-}
-
-fn publish_status(status: ProxyStatus<'_>) {
-    if !file_io_policy::writes_allowed() {
-        return;
-    }
-
-    let path = PathBuf::from("logs").join("preloader-status.json");
-    let _ = fs::create_dir_all("logs");
-    if let Ok(data) = serde_json::to_vec_pretty(&status) {
-        let _ = fs::write(path, data);
-    }
 }

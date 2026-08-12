@@ -6,9 +6,7 @@ pub mod file_io_policy;
 pub mod i18n;
 #[path = "logging_runtime.rs"]
 pub mod logging;
-#[path = "mod_diagnostics_runtime.rs"]
 pub mod mod_diagnostics;
-#[path = "native_stdio_nodisk.rs"]
 pub mod native_stdio;
 pub mod runtime_environment;
 pub mod startup_diagnostics;

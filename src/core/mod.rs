@@ -3,7 +3,6 @@ pub mod file_redirection;
 pub mod loader;
 pub mod network_hook;
 pub mod pre_main_gate;
-#[path = "preloader_proxy_runtime.rs"]
 pub mod preloader_proxy;
 pub mod runtime_ready;
 #[path = "xuser_bridge/mod.rs"]
