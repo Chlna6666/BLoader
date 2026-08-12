@@ -588,9 +588,9 @@ unsafe fn prepare_serialized_xsts_call(
         let Some(body) = (unsafe { read_serialized_json(original_args[json_arg]) }) else {
             continue;
         };
-        if !contains_bytes(&body, br#"\"UserTokens\""#)
-            || !contains_bytes(&body, br#"\"DeviceToken\""#)
-            || !contains_bytes(&body, br#"\"TitleToken\""#)
+        if !contains_bytes(&body, br#""UserTokens""#)
+            || !contains_bytes(&body, br#""DeviceToken""#)
+            || !contains_bytes(&body, br#""TitleToken""#)
         {
             continue;
         }
@@ -709,7 +709,7 @@ unsafe fn read_serialized_json(address: usize) -> Option<Zeroizing<Vec<u8>>> {
 }
 
 fn replace_user_tokens_array(body: &[u8], custom_utoken: &str) -> Option<Vec<u8>> {
-    let key = br#"\"UserTokens\""#;
+    let key = br#""UserTokens""#;
     let key_pos = find_bytes(body, key)?;
     let colon = body[key_pos + key.len()..]
         .iter()
