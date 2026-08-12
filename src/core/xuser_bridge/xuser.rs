@@ -15,7 +15,7 @@ use super::{
         XAsyncProviderData, XUserGamertagVtable, XUserHandle, XUserLocalId,
         XUserVtable, XUSER_STATE_SIGNED_IN,
     },
-    bridge_info, bridge_warn, session, token, xasync,
+    bridge_warn, session, token, xasync,
 };
 use lifecycle::{
     E_GAMEUSER_SIGNED_OUT, E_GAMEUSER_USER_NOT_FOUND, XTaskQueueRegistrationToken,
@@ -150,11 +150,8 @@ unsafe extern "system" fn close_handle(_interface: *mut c_void, user: XUserHandl
         bridge_warn("XUserCloseHandle 收到未知用户句柄；已忽略");
         return;
     }
-    match lifecycle::release_user_handle() {
-        Some(remaining) => bridge_info(&format!(
-            "XUserCloseHandle 已处理 | remaining_handles={remaining}"
-        )),
-        None => bridge_warn("XUserCloseHandle 检测到句柄引用计数下溢；已忽略重复关闭"),
+    if lifecycle::release_user_handle().is_none() {
+        bridge_warn("XUserCloseHandle 检测到句柄引用计数下溢；已忽略重复关闭");
     }
 }
 
