@@ -32,6 +32,7 @@ const XUSER_TOKEN_FORCE_REFRESH: u32 = 0x01;
 
 static ROUTE_LOGGED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static DIAGNOSTIC_PROBES_STARTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static AUTH_CAPABILITY_NATIVE_USER: OnceLock<Mutex<Option<(usize, u64)>>> = OnceLock::new();
 
 macro_rules! hresult_try {
     ($expression:expr) => {
@@ -84,6 +85,7 @@ struct NativeTokenProbeContext {
     url: CString,
     original_options: u32,
     diagnostic_options: u32,
+    close_native_user_on_complete: bool,
 }
 
 /// A Microsoft Runtime user handle that has already been verified to represent
@@ -101,6 +103,47 @@ impl SameIdentityNativeCapability {
     fn handle(self) -> XUserHandle {
         self.user
     }
+}
+
+#[derive(Clone, Copy)]
+enum MicrosoftAuthCapability {
+    SameIdentity(SameIdentityNativeCapability),
+    PreXstsInjected { user: XUserHandle, native_xuid: u64 },
+}
+
+impl MicrosoftAuthCapability {
+    fn handle(self) -> XUserHandle {
+        match self {
+            Self::SameIdentity(capability) => capability.handle(),
+            Self::PreXstsInjected { user, native_xuid } => {
+                debug_assert_ne!(native_xuid, 0);
+                user
+            }
+        }
+    }
+}
+
+fn cached_auth_capability_user() -> Option<(XUserHandle, u64)> {
+    let guard = AUTH_CAPABILITY_NATIVE_USER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.map(|(user, xuid)| (user as XUserHandle, xuid))
+}
+
+fn remember_auth_capability_user(user: XUserHandle, xuid: u64) -> (XUserHandle, u64) {
+    let mut guard = AUTH_CAPABILITY_NATIVE_USER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((existing, existing_xuid)) = *guard {
+        if existing != user as usize {
+            close_native_user(user);
+        }
+        return (existing as XUserHandle, existing_xuid);
+    }
+    *guard = Some((user as usize, xuid));
+    (user, xuid)
 }
 
 fn native_add_result(async_block: *mut XAsyncBlock, user: *mut XUserHandle) -> HResult {
@@ -259,6 +302,7 @@ unsafe extern "system" fn native_add_probe_complete(async_block: *mut XAsyncBloc
         "pre-XSTS capability probe native 用户已建立 | rp={relying_party} | native_xuid={native_xuid} | native_identity_relation={relation} | purpose=trigger-microsoft-auth-capability-only | identity_owner=bloader-virtual-xuser | native_user_is_backing_identity=false | diagnostic_force_refresh=true | result_discarded=true | secrets_logged=false"
     ));
 
+    let (native_user, native_xuid) = remember_auth_capability_user(native_user, native_xuid);
     start_native_token_diagnostic_probe(
         relying_party,
         url,
@@ -266,6 +310,7 @@ unsafe extern "system" fn native_add_probe_complete(async_block: *mut XAsyncBloc
         diagnostic_options,
         native_user,
         native_xuid,
+        false,
     );
 }
 
@@ -276,9 +321,12 @@ fn start_native_token_diagnostic_probe(
     diagnostic_options: u32,
     native_user: XUserHandle,
     native_xuid: u64,
+    close_native_user_on_complete: bool,
 ) {
     let (Ok(interface), Ok(slot)) = (native_token_interface(), native_token_slot(23)) else {
-        close_native_user(native_user);
+        if close_native_user_on_complete {
+            close_native_user(native_user);
+        }
         bridge_warn(&format!(
             "pre-XSTS capability probe native token 请求无法启动；Token slot 不可用 | rp={relying_party} | native_xuid={native_xuid} | native_user_is_backing_identity=false | action=diagnostic-skip"
         ));
@@ -286,7 +334,9 @@ fn start_native_token_diagnostic_probe(
     };
 
     let Ok(url) = CString::new(url) else {
-        close_native_user(native_user);
+        if close_native_user_on_complete {
+            close_native_user(native_user);
+        }
         bridge_warn(&format!(
             "pre-XSTS capability probe URL 包含非法 NUL；跳过 native token 请求 | rp={relying_party} | native_xuid={native_xuid} | native_user_is_backing_identity=false | action=diagnostic-skip"
         ));
@@ -302,6 +352,7 @@ fn start_native_token_diagnostic_probe(
         url,
         original_options,
         diagnostic_options,
+        close_native_user_on_complete,
     });
     let method_ptr = context.method.as_ptr();
     let url_ptr = context.url.as_ptr();
@@ -348,9 +399,11 @@ fn start_native_token_diagnostic_probe(
             drop(Box::from_raw(context_ptr));
             drop(Box::from_raw(block_ptr));
         }
-        close_native_user(native_user);
+        if close_native_user_on_complete {
+            close_native_user(native_user);
+        }
         bridge_warn(&format!(
-            "pre-XSTS capability probe native token 请求启动失败；已关闭诊断 native 句柄 | rp={relying_party_for_log} | native_xuid={native_xuid} | result=0x{:08X} | native_user_is_backing_identity=false | native_final_xsts_reuse=false | original_options=0x{original_options:08X} | diagnostic_options=0x{diagnostic_options:08X} | diagnostic_force_refresh=true | result_returned_to_minecraft=false | secrets_logged=false",
+            "pre-XSTS capability probe native token 请求启动失败；诊断请求未进入 Runtime | rp={relying_party_for_log} | native_xuid={native_xuid} | result=0x{:08X} | native_user_is_backing_identity=false | native_final_xsts_reuse=false | original_options=0x{original_options:08X} | diagnostic_options=0x{diagnostic_options:08X} | diagnostic_force_refresh=true | result_returned_to_minecraft=false | secrets_logged=false",
             result as u32
         ));
         return;
@@ -389,7 +442,9 @@ unsafe extern "system" fn native_token_probe_complete(async_block: *mut XAsyncBl
         context.diagnostic_options,
     ));
 
-    close_native_user(context.native_user);
+    if context.close_native_user_on_complete {
+        close_native_user(context.native_user);
+    }
 }
 
 fn native_token_result_size(async_block: *mut XAsyncBlock, size: *mut usize) -> HResult {
@@ -417,7 +472,7 @@ fn microsoft_auth_capability_for_request(
     relying_party: &str,
     url: &str,
     options: u32,
-) -> Result<SameIdentityNativeCapability, HResult> {
+) -> Result<MicrosoftAuthCapability, HResult> {
     let runtime = session().ok_or(E_FAIL)?;
     if runtime.custom_user_token().is_none() {
         bridge_warn(&format!(
@@ -435,16 +490,38 @@ fn microsoft_auth_capability_for_request(
                 runtime.xuid,
             ));
         });
-        return Ok(SameIdentityNativeCapability { user: native_user });
+        return Ok(MicrosoftAuthCapability::SameIdentity(
+            SameIdentityNativeCapability { user: native_user },
+        ));
     }
 
-    let native_identity_relation = match runtime.native_system_xuid_hint {
-        Some(native_xuid) if native_xuid == runtime.xuid => "same-hint-no-verified-capability",
-        Some(_) => "different",
-        None => "none",
-    };
+    let cached_capability = cached_auth_capability_user();
+    let native_identity_relation = cached_capability.map_or_else(
+        || match runtime.native_system_xuid_hint {
+            Some(native_xuid) if native_xuid == runtime.xuid => "same-hint-no-verified-capability",
+            Some(_) => "different",
+            None => "none",
+        },
+        |(_, native_xuid)| native_relation(native_xuid),
+    );
 
     let discovery = pre_xsts::ensure_discovered();
+    if pre_xsts::custom_user_injection_ready()
+        && let Some((native_user, native_xuid)) = cached_capability
+    {
+        let key = format!("pre-xsts-ready:{relying_party}");
+        log_once(key, || {
+            bridge_info(&format!(
+                "pre-XSTS UToken 注入 ABI 已解析；启用跨身份 Microsoft Runtime 认证能力路径 | rp={relying_party} | custom_xuid={} | native_xuid={native_xuid} | native_identity_relation={} | route=virtual-user-pre-xsts-injected | identity_owner=bloader-virtual-xuser | native_user_is_backing_identity=false | DToken=official | UToken=bmcbl-custom | TToken=official | XSTS=official-after-user-substitution | signature=official | secrets_logged=false",
+                runtime.xuid,
+                native_relation(native_xuid),
+            ));
+        });
+        return Ok(MicrosoftAuthCapability::PreXstsInjected {
+            user: native_user,
+            native_xuid,
+        });
+    }
     if discovery
         .as_ref()
         .is_ok_and(|summary| summary.high_confidence_builder_candidates != 0)
@@ -504,11 +581,15 @@ fn url_host(url: &str) -> Option<String> {
         .find_map(|(index, character)| matches!(character, '/' | '?' | '#').then_some(index))
         .unwrap_or(authority.len());
     let authority = &authority[..end];
-    let host_port = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
     let host = if let Some(value) = host_port.strip_prefix('[') {
         value.split_once(']')?.0
     } else {
-        host_port.split_once(':').map_or(host_port, |(host, _)| host)
+        host_port
+            .split_once(':')
+            .map_or(host_port, |(host, _)| host)
     };
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
@@ -562,8 +643,11 @@ pub unsafe extern "system" fn get_token_and_signature_async(
     }
     let url_text = hresult_try!(unsafe { ansi_url(url) });
     let relying_party = relying_party_for_url(&url_text);
-    let capability =
-        hresult_try!(microsoft_auth_capability_for_request(&relying_party, &url_text, options));
+    let capability = hresult_try!(microsoft_auth_capability_for_request(
+        &relying_party,
+        &url_text,
+        options
+    ));
     let native_user = capability.handle();
 
     type Function = unsafe extern "system" fn(
@@ -648,8 +732,11 @@ pub unsafe extern "system" fn get_token_and_signature_utf16_async(
     }
     let url_text = hresult_try!(unsafe { utf16_url(url) });
     let relying_party = relying_party_for_url(&url_text);
-    let capability =
-        hresult_try!(microsoft_auth_capability_for_request(&relying_party, &url_text, options));
+    let capability = hresult_try!(microsoft_auth_capability_for_request(
+        &relying_party,
+        &url_text,
+        options
+    ));
     let native_user = capability.handle();
 
     type Function = unsafe extern "system" fn(

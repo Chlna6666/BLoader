@@ -6,12 +6,13 @@ use sha2::{Digest as _, Sha256};
 use std::{
     mem, ptr,
     sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
         OnceLock,
+        atomic::{AtomicU32, AtomicUsize, Ordering},
     },
 };
 
-use super::super::{bridge_info, bridge_warn};
+use super::super::{bridge_info, bridge_warn, session};
+use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DiscoverySummary {
@@ -58,21 +59,21 @@ struct FunctionBounds {
     unwind: usize,
 }
 
-type BuilderProbeFn = unsafe extern "system" fn(
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-) -> usize;
+type BuilderProbeFn =
+    unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleW(module_name: *const u16) -> *mut c_void;
     fn GetCurrentThreadId() -> u32;
+    fn GetCurrentProcess() -> *mut c_void;
+    fn ReadProcessMemory(
+        process: *mut c_void,
+        base_address: *const c_void,
+        buffer: *mut c_void,
+        size: usize,
+        bytes_read: *mut usize,
+    ) -> i32;
     fn VirtualQuery(
         address: *const c_void,
         buffer: *mut MemoryBasicInformation,
@@ -100,12 +101,25 @@ static PRE_XSTS_CALL_TARGET_RVAS: [AtomicUsize; MAX_CALL_TARGET_PROBES] =
 static PRE_XSTS_CALL_TARGET_PROBE_CALLS: [AtomicU32; MAX_CALL_TARGET_PROBES] =
     [const { AtomicU32::new(0) }; MAX_CALL_TARGET_PROBES];
 
+const ABI_UNRESOLVED: usize = usize::MAX;
+const MAX_SERIALIZED_XSTS_BYTES: usize = 64 * 1024;
+static SERIALIZED_XSTS_ABI_SLOT: AtomicUsize = AtomicUsize::new(ABI_UNRESOLVED);
+static SERIALIZED_XSTS_ABI_JSON_ARG: AtomicUsize = AtomicUsize::new(ABI_UNRESOLVED);
+static SERIALIZED_XSTS_ABI_LEN_ARG: AtomicUsize = AtomicUsize::new(ABI_UNRESOLVED);
+
 pub fn ensure_discovered() -> Result<DiscoverySummary, String> {
     DISCOVERY
         .get_or_init(|| unsafe { discover() })
         .as_ref()
         .copied()
         .map_err(Clone::clone)
+}
+
+/// True only after a real Microsoft Runtime call has exposed a serialized
+/// pre-XSTS JSON document and BLoader has successfully substituted B's
+/// `UserTokens` in a transparent helper invocation that returned normally.
+pub fn custom_user_injection_ready() -> bool {
+    SERIALIZED_XSTS_ABI_SLOT.load(Ordering::Acquire) != ABI_UNRESOLVED
 }
 
 unsafe fn discover() -> Result<DiscoverySummary, String> {
@@ -137,14 +151,8 @@ unsafe fn discover() -> Result<DiscoverySummary, String> {
     let device_token = unsafe { locate_marker(base, &sections, &executable, b"DeviceToken") };
     let title_token = unsafe { locate_marker(base, &sections, &executable, b"TitleToken") };
     let xsts_authorize = unsafe { locate_marker(base, &sections, &executable, b"xsts/authorize") };
-    let xsts_host = unsafe {
-        locate_marker(
-            base,
-            &sections,
-            &executable,
-            b"xsts.auth.xboxlive.com",
-        )
-    };
+    let xsts_host =
+        unsafe { locate_marker(base, &sections, &executable, b"xsts.auth.xboxlive.com") };
 
     log_marker(base, "UserTokens", &user_tokens);
     log_marker(base, "DeviceToken", &device_token);
@@ -221,9 +229,8 @@ unsafe fn locate_marker(
         .collect::<Vec<_>>();
 
     for section in sections {
-        let bytes = unsafe {
-            core::slice::from_raw_parts((base + section.rva) as *const u8, section.size)
-        };
+        let bytes =
+            unsafe { core::slice::from_raw_parts((base + section.rva) as *const u8, section.size) };
         for offset in find_all(bytes, marker) {
             addresses.push(base + section.rva + offset);
         }
@@ -317,14 +324,31 @@ unsafe fn log_user_tokens_function_candidates(
         }
 
         let lea_register = unsafe { rip_lea_destination_register(*xref) }.unwrap_or("unknown");
-        let direct_calls_after_xref = unsafe {
-            direct_call_candidates(base, image_size, *xref, bounds.end, 160)
-        };
+        let direct_calls_after_xref =
+            unsafe { direct_call_candidates(base, image_size, *xref, bounds.end, 160) };
         let direct_calls_in_function = unsafe {
-            direct_call_candidates(base, image_size, bounds.begin, bounds.end, bounds.end - bounds.begin)
+            direct_call_candidates(
+                base,
+                image_size,
+                bounds.begin,
+                bounds.end,
+                bounds.end - bounds.begin,
+            )
         };
+        // 0.2.71 defined call-target probes but never actually installed them.
+        // Probe calls closest to the UserTokens xref first, then fill remaining
+        // slots with unique helpers from the enclosing builder.
+        let mut probe_calls = direct_calls_after_xref.clone();
+        for candidate in &direct_calls_in_function {
+            if !probe_calls.iter().any(|(_, target)| *target == candidate.1) {
+                probe_calls.push(*candidate);
+            }
+        }
+        unsafe { install_call_target_probes(base, image_size, &probe_calls) };
+
         let after_xref_summary = format_direct_calls(base, *xref, &direct_calls_after_xref);
-        let function_call_summary = format_direct_calls(base, bounds.begin, &direct_calls_in_function);
+        let function_call_summary =
+            format_direct_calls(base, bounds.begin, &direct_calls_in_function);
         let function_hash = unsafe { function_sha256_prefix(bounds) };
         let xref_window_hash = unsafe { window_sha256_prefix(*xref, 96, bounds.end) };
 
@@ -348,9 +372,12 @@ unsafe fn log_user_tokens_function_candidates(
         ));
     }
 
-    (functions.len(), high_confidence, first_high_confidence.or(first_candidate))
+    (
+        functions.len(),
+        high_confidence,
+        first_high_confidence.or(first_candidate),
+    )
 }
-
 
 unsafe fn install_call_target_probes(base: usize, image_size: usize, calls: &[(usize, usize)]) {
     let mut installed = 0usize;
@@ -392,7 +419,8 @@ unsafe fn install_call_target_probes(base: usize, image_size: usize, calls: &[(u
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                PRE_XSTS_CALL_TARGET_RVAS[slot].store(target.saturating_sub(base), Ordering::Release);
+                PRE_XSTS_CALL_TARGET_RVAS[slot]
+                    .store(target.saturating_sub(base), Ordering::Release);
                 if let Err(error) = unsafe { MinHook::enable_all_hooks() } {
                     ORIGINAL_PRE_XSTS_CALL_TARGETS[slot].store(0, Ordering::Release);
                     bridge_warn(&format!(
@@ -501,7 +529,26 @@ unsafe fn pre_xsts_call_target_probe(
         return 0;
     }
     let original: BuilderProbeFn = unsafe { mem::transmute(original_address) };
-    let result = unsafe { original(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7) };
+    let original_args = [arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7];
+    let prepared = unsafe { prepare_serialized_xsts_call(slot, original_args) };
+    let call_args = prepared
+        .as_ref()
+        .map_or(original_args, |prepared| prepared.args);
+    let result = unsafe {
+        original(
+            call_args[0],
+            call_args[1],
+            call_args[2],
+            call_args[3],
+            call_args[4],
+            call_args[5],
+            call_args[6],
+            call_args[7],
+        )
+    };
+    if let Some(prepared) = prepared.as_ref() {
+        learn_serialized_xsts_abi(slot, prepared.json_arg, prepared.len_arg);
+    }
     if should_log {
         bridge_info(&format!(
             "pre-XSTS call target probe return | slot={slot} | target_rva=0x{target_rva:X} | call_index={call_index} | result=0x{result:X} | result_class={} | secrets_logged=false",
@@ -511,11 +558,317 @@ unsafe fn pre_xsts_call_target_probe(
     result
 }
 
+struct PreparedSerializedXstsCall {
+    args: [usize; 8],
+    _body: Zeroizing<Vec<u8>>,
+    json_arg: usize,
+    len_arg: Option<usize>,
+}
+
+unsafe fn prepare_serialized_xsts_call(
+    slot: usize,
+    original_args: [usize; 8],
+) -> Option<PreparedSerializedXstsCall> {
+    let runtime = session()?;
+    let custom_utoken = runtime.custom_user_token()?;
+
+    let learned_slot = SERIALIZED_XSTS_ABI_SLOT.load(Ordering::Acquire);
+    if learned_slot != ABI_UNRESOLVED && learned_slot != slot {
+        return None;
+    }
+
+    let learned_arg = SERIALIZED_XSTS_ABI_JSON_ARG.load(Ordering::Acquire);
+    let candidates: Vec<usize> = if learned_slot == slot && learned_arg < original_args.len() {
+        vec![learned_arg]
+    } else {
+        (0..original_args.len()).collect()
+    };
+
+    for json_arg in candidates {
+        let Some(body) = (unsafe { read_serialized_json(original_args[json_arg]) }) else {
+            continue;
+        };
+        if !contains_bytes(&body, br#"\"UserTokens\""#)
+            || !contains_bytes(&body, br#"\"DeviceToken\""#)
+            || !contains_bytes(&body, br#"\"TitleToken\""#)
+        {
+            continue;
+        }
+
+        let original_len = body.len();
+        let Some(mut replaced) = replace_user_tokens_array(&body, custom_utoken) else {
+            continue;
+        };
+        let new_len = replaced.len();
+        replaced.push(0);
+        let replaced = Zeroizing::new(replaced);
+
+        let mut args = original_args;
+        args[json_arg] = replaced.as_ptr() as usize;
+
+        let learned_len_arg = SERIALIZED_XSTS_ABI_LEN_ARG.load(Ordering::Acquire);
+        let len_arg = if learned_slot == slot && learned_len_arg < args.len() {
+            let old = original_args[learned_len_arg];
+            args[learned_len_arg] = if old == original_len.saturating_add(1) {
+                new_len.saturating_add(1)
+            } else {
+                new_len
+            };
+            Some(learned_len_arg)
+        } else {
+            find_unique_length_arg(&original_args, json_arg, original_len).map(|index| {
+                let old = original_args[index];
+                args[index] = if old == original_len.saturating_add(1) {
+                    new_len.saturating_add(1)
+                } else {
+                    new_len
+                };
+                index
+            })
+        };
+
+        return Some(PreparedSerializedXstsCall {
+            args,
+            _body: replaced,
+            json_arg,
+            len_arg,
+        });
+    }
+    None
+}
+
+fn learn_serialized_xsts_abi(slot: usize, json_arg: usize, len_arg: Option<usize>) {
+    if SERIALIZED_XSTS_ABI_SLOT
+        .compare_exchange(ABI_UNRESOLVED, slot, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        SERIALIZED_XSTS_ABI_JSON_ARG.store(json_arg, Ordering::Release);
+        SERIALIZED_XSTS_ABI_LEN_ARG.store(len_arg.unwrap_or(ABI_UNRESOLVED), Ordering::Release);
+        bridge_info(&format!(
+            "pre-XSTS serialized ABI 已自举解析 | slot={slot} | json_arg={json_arg} | len_arg={} | UserTokens_source=bmcbl-custom-utoken | DeviceToken=preserved-official | TitleToken=preserved-official | native_identity_passthrough=false | secrets_logged=false",
+            len_arg.map_or_else(|| "nul-terminated".to_string(), |value| value.to_string()),
+        ));
+    }
+}
+
+unsafe fn read_serialized_json(address: usize) -> Option<Zeroizing<Vec<u8>>> {
+    if address < 0x10000 {
+        return None;
+    }
+    let mut info: MemoryBasicInformation = unsafe { mem::zeroed() };
+    if unsafe {
+        VirtualQuery(
+            address as *const c_void,
+            &mut info,
+            mem::size_of::<MemoryBasicInformation>(),
+        )
+    } == 0
+        || info.state != 0x1000
+        || (info.protect & 0x100) != 0
+        || !matches!(info.protect & 0xff, 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80)
+    {
+        return None;
+    }
+
+    let region_start = info.base_address as usize;
+    let region_end = region_start.checked_add(info.region_size)?;
+    if address < region_start || address >= region_end {
+        return None;
+    }
+    let available = region_end
+        .saturating_sub(address)
+        .min(MAX_SERIALIZED_XSTS_BYTES);
+    if available < 2 {
+        return None;
+    }
+
+    let mut buffer = Zeroizing::new(vec![0u8; available]);
+    let mut bytes_read = 0usize;
+    if unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            address as *const c_void,
+            buffer.as_mut_ptr().cast(),
+            available,
+            &mut bytes_read,
+        )
+    } == 0
+        || bytes_read == 0
+    {
+        return None;
+    }
+    buffer.truncate(bytes_read);
+    if let Some(nul) = buffer.iter().position(|byte| *byte == 0) {
+        buffer.truncate(nul);
+    }
+    let first = buffer.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    if buffer.get(first).copied() != Some(b'{') {
+        return None;
+    }
+    Some(buffer)
+}
+
+fn replace_user_tokens_array(body: &[u8], custom_utoken: &str) -> Option<Vec<u8>> {
+    let key = br#"\"UserTokens\""#;
+    let key_pos = find_bytes(body, key)?;
+    let colon = body[key_pos + key.len()..]
+        .iter()
+        .position(|byte| *byte == b':')?
+        + key_pos
+        + key.len();
+    let open = body[colon + 1..].iter().position(|byte| *byte == b'[')? + colon + 1;
+    let close = find_json_array_end(body, open)?;
+
+    let encoded = Zeroizing::new(serde_json::to_string(custom_utoken).ok()?);
+    let mut output = Vec::with_capacity(
+        body.len()
+            .saturating_sub(close.saturating_sub(open + 1))
+            .saturating_add(encoded.len()),
+    );
+    output.extend_from_slice(&body[..open + 1]);
+    output.extend_from_slice(encoded.as_bytes());
+    output.extend_from_slice(&body[close..]);
+    Some(output)
+}
+
+fn find_json_array_end(body: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, byte) in body.get(open..)?.iter().copied().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' => depth = depth.saturating_add(1),
+            b']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_unique_length_arg(args: &[usize; 8], json_arg: usize, length: usize) -> Option<usize> {
+    let matches = args
+        .iter()
+        .enumerate()
+        .filter(|(index, value)| {
+            *index != json_arg && (**value == length || **value == length.saturating_add(1))
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    (matches.len() == 1).then_some(matches[0])
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    find_bytes(haystack, needle).is_some()
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+unsafe fn probe_marker_hint(value: usize) -> Option<String> {
+    let direct = unsafe { read_probe_prefix(value, 2048) }?;
+    if let Some(marker) = marker_name(&direct) {
+        return Some(format!("direct:{marker}"));
+    }
+    let pointer_bytes = direct.get(..mem::size_of::<usize>() * 8)?;
+    for (index, chunk) in pointer_bytes
+        .chunks_exact(mem::size_of::<usize>())
+        .enumerate()
+    {
+        let pointer = usize::from_ne_bytes(chunk.try_into().ok()?);
+        if let Some(bytes) = unsafe { read_probe_prefix(pointer, 1024) }
+            && let Some(marker) = marker_name(&bytes)
+        {
+            return Some(format!(
+                "indirect+0x{:X}:{marker}",
+                index * mem::size_of::<usize>()
+            ));
+        }
+    }
+    None
+}
+
+unsafe fn read_probe_prefix(address: usize, max: usize) -> Option<Vec<u8>> {
+    if address < 0x10000 {
+        return None;
+    }
+    let mut info: MemoryBasicInformation = unsafe { mem::zeroed() };
+    if unsafe {
+        VirtualQuery(
+            address as *const c_void,
+            &mut info,
+            mem::size_of::<MemoryBasicInformation>(),
+        )
+    } == 0
+        || info.state != 0x1000
+        || (info.protect & 0x100) != 0
+        || !matches!(info.protect & 0xff, 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80)
+    {
+        return None;
+    }
+    let region_end = (info.base_address as usize).checked_add(info.region_size)?;
+    let size = region_end.saturating_sub(address).min(max);
+    if size == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u8; size];
+    let mut bytes_read = 0usize;
+    if unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            address as *const c_void,
+            buffer.as_mut_ptr().cast(),
+            size,
+            &mut bytes_read,
+        )
+    } == 0
+        || bytes_read == 0
+    {
+        return None;
+    }
+    buffer.truncate(bytes_read);
+    Some(buffer)
+}
+
+fn marker_name(bytes: &[u8]) -> Option<&'static str> {
+    [
+        ("UserTokens", b"UserTokens".as_slice()),
+        ("DeviceToken", b"DeviceToken".as_slice()),
+        ("TitleToken", b"TitleToken".as_slice()),
+    ]
+    .into_iter()
+    .find_map(|(name, marker)| contains_bytes(bytes, marker).then_some(name))
+}
+
 unsafe fn install_builder_probe(base: usize, image_size: usize, bounds: FunctionBounds) {
     if ORIGINAL_PRE_XSTS_BUILDER.load(Ordering::Acquire) != 0 {
         return;
     }
-    if bounds.begin < base || bounds.end <= bounds.begin || bounds.end > base.saturating_add(image_size) {
+    if bounds.begin < base
+        || bounds.end <= bounds.begin
+        || bounds.end > base.saturating_add(image_size)
+    {
         bridge_warn("pre-XSTS builder 探针候选边界无效；跳过函数级探针安装");
         return;
     }
@@ -612,9 +965,12 @@ unsafe extern "system" fn pre_xsts_builder_probe(
 }
 
 unsafe fn format_probe_arg(index: usize, value: usize) -> String {
-    format!("arg{index}=0x{value:X}:{}", unsafe {
-        classify_probe_value(value)
-    })
+    let class = unsafe { classify_probe_value(value) };
+    let marker = unsafe { probe_marker_hint(value) };
+    match marker {
+        Some(marker) => format!("arg{index}=0x{value:X}:{class}:marker_hint={marker}"),
+        None => format!("arg{index}=0x{value:X}:{class}"),
+    }
 }
 
 unsafe fn classify_probe_value(value: usize) -> String {
@@ -627,7 +983,8 @@ unsafe fn classify_probe_value(value: usize) -> String {
 
     let base = PROBE_MODULE_BASE.load(Ordering::Acquire);
     let size = PROBE_MODULE_SIZE.load(Ordering::Acquire);
-    let in_xgameruntime = base != 0 && size != 0 && value >= base && value < base.saturating_add(size);
+    let in_xgameruntime =
+        base != 0 && size != 0 && value >= base && value < base.saturating_add(size);
 
     let mut info: MemoryBasicInformation = unsafe { mem::zeroed() };
     let queried = unsafe {
@@ -653,7 +1010,8 @@ unsafe fn classify_probe_value(value: usize) -> String {
 
 unsafe fn lookup_function_bounds(base: usize, control_pc: usize) -> Option<FunctionBounds> {
     let mut image_base = 0u64;
-    let entry = unsafe { RtlLookupFunctionEntry(control_pc as u64, &mut image_base, ptr::null_mut()) };
+    let entry =
+        unsafe { RtlLookupFunctionEntry(control_pc as u64, &mut image_base, ptr::null_mut()) };
     if entry.is_null() || image_base as usize != base {
         return None;
     }
@@ -679,7 +1037,9 @@ fn count_xrefs_in_function(locations: &MarkerLocations, bounds: FunctionBounds) 
 unsafe fn rip_lea_destination_register(address: usize) -> Option<&'static str> {
     let first = unsafe { read_u8(address) };
     let (rex, opcode, modrm) = if (0x40..=0x4f).contains(&first) {
-        (first, unsafe { read_u8(address + 1) }, unsafe { read_u8(address + 2) })
+        (first, unsafe { read_u8(address + 1) }, unsafe {
+            read_u8(address + 2)
+        })
     } else {
         (0, first, unsafe { read_u8(address + 1) })
     };
@@ -688,8 +1048,8 @@ unsafe fn rip_lea_destination_register(address: usize) -> Option<&'static str> {
     }
     let register = ((modrm >> 3) & 0x07) | (((rex >> 2) & 0x01) << 3);
     const REGISTERS: [&str; 16] = [
-        "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10",
-        "r11", "r12", "r13", "r14", "r15",
+        "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12",
+        "r13", "r14", "r15",
     ];
     REGISTERS.get(register as usize).copied()
 }
@@ -712,7 +1072,8 @@ unsafe fn direct_call_candidates(
         if code[index] != 0xe8 {
             continue;
         }
-        let displacement = i32::from_le_bytes(code[index + 1..index + 5].try_into().unwrap()) as isize;
+        let displacement =
+            i32::from_le_bytes(code[index + 1..index + 5].try_into().unwrap()) as isize;
         let call = start + index;
         let target = (call + 5).wrapping_add_signed(displacement);
         if target >= base && target < image_end {
@@ -761,7 +1122,8 @@ unsafe fn mapped_sections_sha256_prefix(base: usize, sections: &[Section]) -> St
     for section in sections {
         hasher.update((section.rva as u64).to_le_bytes());
         hasher.update((section.size as u64).to_le_bytes());
-        let bytes = unsafe { core::slice::from_raw_parts((base + section.rva) as *const u8, section.size) };
+        let bytes =
+            unsafe { core::slice::from_raw_parts((base + section.rva) as *const u8, section.size) };
         hasher.update(bytes);
     }
     let digest = hasher.finalize();
@@ -904,7 +1266,10 @@ mod tests {
 
     #[test]
     fn finds_all_marker_occurrences() {
-        assert_eq!(find_all(b"xxUserTokensyyUserTokens", b"UserTokens"), vec![2, 14]);
+        assert_eq!(
+            find_all(b"xxUserTokensyyUserTokens", b"UserTokens"),
+            vec![2, 14]
+        );
     }
 
     #[test]
@@ -916,7 +1281,10 @@ mod tests {
         let mut code = vec![0x48, 0x8d, 0x0d];
         code.extend_from_slice(&displacement.to_le_bytes());
         code.extend_from_slice(&[0x90, 0x90]);
-        assert_eq!(find_rip_relative_lea_refs(&code, code_address, target), vec![0x1000]);
+        assert_eq!(
+            find_rip_relative_lea_refs(&code, code_address, target),
+            vec![0x1000]
+        );
     }
 
     #[test]
@@ -929,7 +1297,8 @@ mod tests {
         let displacement = (target as isize - (call + 5) as isize) as i32;
         code[1..5].copy_from_slice(&displacement.to_le_bytes());
 
-        let calls = unsafe { direct_call_candidates(base, 0x1000, call, call + code.len(), code.len()) };
+        let calls =
+            unsafe { direct_call_candidates(base, 0x1000, call, call + code.len(), code.len()) };
         assert_eq!(calls, vec![(call, target)]);
     }
 }
