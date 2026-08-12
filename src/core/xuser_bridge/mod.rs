@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Only Microsoft xgameruntime.dll!QueryApiImpl is intercepted. Every other
 // XGameRuntime export and every non-XUser runtime class stays in the official
@@ -33,7 +33,6 @@ use crate::runtime::foundation::logging;
 
 const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
 const XUSER_BRIDGE_PROTOCOL: u32 = 1;
-const MAX_CONSOLE_REPLAY_LOGS: usize = 512;
 
 static SESSION: OnceLock<Session> = OnceLock::new();
 static ORIGINAL_QUERY_API: OnceLock<usize> = OnceLock::new();
@@ -43,27 +42,14 @@ static PENDING_LOGS: OnceLock<Mutex<Vec<PendingLog>>> = OnceLock::new();
 
 #[derive(Clone, Copy)]
 enum BridgeLogLevel {
-    Debug,
     Info,
     Warn,
     Error,
 }
 
-impl BridgeLogLevel {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Debug => "debug",
-            Self::Info => "info",
-            Self::Warn => "warn",
-            Self::Error => "error",
-        }
-    }
-}
-
 struct PendingLog {
     level: BridgeLogLevel,
     message: String,
-    published_to_persistent_sinks: bool,
 }
 
 #[derive(Debug)]
@@ -94,7 +80,6 @@ pub fn initialize_before_mods() {
         return;
     }
 
-    bridge_debug("开始探测进程专属 BMCBL XUser named pipe；不存在时保持微软官方 XUser 原样");
     let candidate = match ipc::receive_session() {
         Ok(Some(session)) => session,
         Ok(None) => {
@@ -109,33 +94,12 @@ pub fn initialize_before_mods() {
         }
     };
 
-    // Gamertag and XUID are public Xbox identity metadata. Secret bearer tokens,
-    // UHS values and the signing private key are never written to diagnostics.
+    // Gamertag is public profile data and is useful for confirming that BMCBL
+    // delivered the intended account. Remove control characters and bound the
+    // length before it reaches any text log to prevent log injection.
     let gamertag = sanitize_gamertag(&candidate.gamertag);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let token_routes = candidate
-        .tokens
-        .iter()
-        .map(|token| {
-            format!(
-                "{}:{}s",
-                token.relying_party,
-                token.expires_at.saturating_sub(now)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
     bridge_info(&format!(
-        "已从 BMCBL 安全一次性管道接收并验证 Xbox 会话 | xbox_gamertag={gamertag} | xbox_xuid={} | token_count={} | privilege_count={} | secrets_logged=false | next=load-official-runtime-and-hook",
-        candidate.xuid,
-        candidate.tokens.len(),
-        candidate.privileges.len(),
-    ));
-    bridge_debug(&format!(
-        "XUser token 路由已装载 | routes=[{token_routes}] | token_body=redacted | uhs=redacted | signing_key=redacted"
+        "已从 BMCBL 安全一次性管道接收并验证 Xbox 会话 | xbox_gamertag={gamertag} | next=load-official-runtime-and-hook"
     ));
 
     match install_hook(candidate) {
@@ -152,57 +116,38 @@ pub fn initialize_before_mods() {
     }
 }
 
-/// Publishes pre-main XUser diagnostics to persistent logging when tracing first
-/// becomes available, but keeps a console replay copy until the delayed runtime
-/// console exists. Calling this again after `set_console_handle` replays only to
-/// the console, so latest/archive logs are not duplicated.
+/// Replays XUser bridge diagnostics generated before the normal tracing and
+/// console pipeline became available. This makes loader-lock-time decisions
+/// visible in `latest.log` and the debug console instead of only in the
+/// bootstrap marker file.
 pub fn publish_pending_logs() {
     let Some(queue) = PENDING_LOGS.get() else {
         return;
     };
-    let console_ready = logging::console_is_ready();
-    let logging_ready = logging::is_ready();
-    if !logging_ready && !console_ready {
-        return;
-    }
-
-    let mut guard = match queue.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+    let pending = {
+        let mut guard = match queue.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        mem::take(&mut *guard)
     };
-    if guard.is_empty() {
+
+    if pending.is_empty() {
         return;
     }
 
-    if console_ready {
-        for entry in guard.iter_mut() {
-            if entry.published_to_persistent_sinks {
-                logging::replay_console_message(
-                    entry.level.as_str(),
-                    "xuser-bridge",
-                    &entry.message,
-                );
-            } else {
-                emit_persistent(entry.level, &entry.message);
-                entry.published_to_persistent_sinks = true;
-            }
-        }
-        let count = guard.len();
-        guard.clear();
-        logging::replay_console_message(
-            "info",
-            "xuser-bridge",
-            &format!(
-                "early XUser diagnostics replay complete | entries={count} | source=pre-main"
-            ),
-        );
-        return;
-    }
-
-    for entry in guard.iter_mut() {
-        if !entry.published_to_persistent_sinks {
-            emit_persistent(entry.level, &entry.message);
-            entry.published_to_persistent_sinks = true;
+    logging::scoped_info_message(
+        "xuser-bridge",
+        &format!(
+            "正在回放 {} 条早期 XUser Bridge 诊断；以下状态生成于 BLoader DllMain 阶段",
+            pending.len()
+        ),
+    );
+    for entry in pending {
+        match entry.level {
+            BridgeLogLevel::Info => logging::scoped_info_message("xuser-bridge", &entry.message),
+            BridgeLogLevel::Warn => logging::scoped_warn_message("xuser-bridge", &entry.message),
+            BridgeLogLevel::Error => logging::scoped_error_message("xuser-bridge", &entry.message),
         }
     }
 }
@@ -211,6 +156,10 @@ fn install_hook(session: Session) -> Result<HookInstallReport, String> {
     let module_name = wide("xgameruntime.dll");
     let mut module = unsafe { GetModuleHandleW(module_name.as_ptr()) };
     let runtime_source = if module.is_null() {
+        // This path is reached only after a process-scoped BMCBL session has
+        // been authenticated. Loading exclusively from System32 ensures the
+        // official runtime is present before the executable can resolve or call
+        // QueryApiImpl. No-session launches never execute this load.
         bridge_info(
             "已认证 BMCBL 会话，但系统原生 xgameruntime.dll 尚未映射；正在从 System32 同步加载官方 Runtime",
         );
@@ -246,9 +195,10 @@ fn install_hook(session: Session) -> Result<HookInstallReport, String> {
         target as usize
     ));
 
-    let trampoline =
-        unsafe { MinHook::create_hook(target, query_api_hook as *const () as *mut c_void) }
-            .map_err(|status| format!("MinHook create failed: {status:?}"))?;
+    let trampoline = unsafe {
+        MinHook::create_hook(target, query_api_hook as *const () as *mut c_void)
+    }
+    .map_err(|status| format!("MinHook create failed: {status:?}"))?;
     ORIGINAL_QUERY_API
         .set(trampoline as usize)
         .map_err(|_| "official QueryApiImpl trampoline was already installed".to_string())?;
@@ -276,7 +226,6 @@ pub(crate) unsafe fn call_original_query(
     out: *mut *mut c_void,
 ) -> HResult {
     let Some(address) = ORIGINAL_QUERY_API.get().copied() else {
-        bridge_error("QueryApiImpl trampoline 不可用；无法回退到微软官方 Runtime");
         return abi::E_FAIL;
     };
     let function: QueryApiImplFn = unsafe { mem::transmute(address) };
@@ -293,7 +242,6 @@ unsafe extern "system" fn query_api_hook(
     }
 
     if runtime_class_id.is_null() || interface_id.is_null() || out.is_null() {
-        bridge_warn("QueryApiImpl 收到空指针参数；返回 E_POINTER");
         return E_POINTER;
     }
     unsafe {
@@ -308,13 +256,10 @@ unsafe extern "system" fn query_api_hook(
             bridge_info(&format!(
                 "QueryApiImpl 已请求 CLSID_XUserImpl；返回 BLoader 内置 Rust XUser | xbox_gamertag={gamertag}"
             ));
-        } else {
-            bridge_debug("QueryApiImpl route=embedded-XUser");
         }
         return unsafe { xuser::query_interface(interface_id, out) };
     }
 
-    bridge_debug("QueryApiImpl route=official-runtime | class=non-XUser");
     unsafe { call_original_query(runtime_class_id, interface_id, out) }
 }
 
@@ -365,7 +310,11 @@ fn system_runtime_path() -> Result<PathBuf, String> {
 fn same_windows_path(left: &Path, right: &Path) -> bool {
     left.to_string_lossy()
         .trim_start_matches(r"\\?\")
-        .eq_ignore_ascii_case(right.to_string_lossy().trim_start_matches(r"\\?\"))
+        .eq_ignore_ascii_case(
+            right
+                .to_string_lossy()
+                .trim_start_matches(r"\\?\"),
+        )
 }
 
 fn sanitize_gamertag(value: &str) -> String {
@@ -382,61 +331,43 @@ fn sanitize_gamertag(value: &str) -> String {
     }
 }
 
-fn queue_pending(level: BridgeLogLevel, message: &str, published: bool) {
+fn queue_pending(level: BridgeLogLevel, message: &str) {
     let queue = PENDING_LOGS.get_or_init(|| Mutex::new(Vec::new()));
     let mut guard = match queue.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if guard.len() >= MAX_CONSOLE_REPLAY_LOGS {
-        guard.remove(0);
-    }
     guard.push(PendingLog {
         level,
         message: message.to_string(),
-        published_to_persistent_sinks: published,
     });
 }
 
-fn emit_persistent(level: BridgeLogLevel, message: &str) {
-    match level {
-        BridgeLogLevel::Debug => logging::scoped_debug_message("xuser-bridge", message),
-        BridgeLogLevel::Info => logging::scoped_info_message("xuser-bridge", message),
-        BridgeLogLevel::Warn => logging::scoped_warn_message("xuser-bridge", message),
-        BridgeLogLevel::Error => logging::scoped_error_message("xuser-bridge", message),
-    }
-}
-
-fn bridge_log(level: BridgeLogLevel, message: &str) {
+fn bridge_info(message: &str) {
+    logging::write_bootstrap_marker(&format!("xuser-bridge.info {message}"));
     if logging::is_ready() {
-        emit_persistent(level, message);
-        if !logging::console_is_ready() {
-            queue_pending(level, message, true);
-        }
-        return;
+        logging::scoped_info_message("xuser-bridge", message);
+    } else {
+        queue_pending(BridgeLogLevel::Info, message);
     }
-
-    logging::write_bootstrap_marker(&format!(
-        "xuser-bridge.{} {message}",
-        level.as_str()
-    ));
-    queue_pending(level, message, false);
 }
 
-pub(crate) fn bridge_debug(message: &str) {
-    bridge_log(BridgeLogLevel::Debug, message);
+fn bridge_warn(message: &str) {
+    logging::write_bootstrap_marker(&format!("xuser-bridge.warn {message}"));
+    if logging::is_ready() {
+        logging::scoped_warn_message("xuser-bridge", message);
+    } else {
+        queue_pending(BridgeLogLevel::Warn, message);
+    }
 }
 
-pub(crate) fn bridge_info(message: &str) {
-    bridge_log(BridgeLogLevel::Info, message);
-}
-
-pub(crate) fn bridge_warn(message: &str) {
-    bridge_log(BridgeLogLevel::Warn, message);
-}
-
-pub(crate) fn bridge_error(message: &str) {
-    bridge_log(BridgeLogLevel::Error, message);
+fn bridge_error(message: &str) {
+    logging::write_bootstrap_marker(&format!("xuser-bridge.error {message}"));
+    if logging::is_ready() {
+        logging::scoped_error_message("xuser-bridge", message);
+    } else {
+        queue_pending(BridgeLogLevel::Error, message);
+    }
 }
 
 fn wide(value: &str) -> Vec<u16> {
@@ -451,10 +382,7 @@ mod tests {
 
     #[test]
     fn gamertag_log_value_removes_control_characters() {
-        assert_eq!(
-            sanitize_gamertag(" Civil\r\nRelic\t4341 "),
-            "CivilRelic4341"
-        );
+        assert_eq!(sanitize_gamertag(" Civil\r\nRelic\t4341 "), "CivilRelic4341");
     }
 
     #[test]

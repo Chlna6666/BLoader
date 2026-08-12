@@ -1,35 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use core::ffi::{c_char, c_void};
+use std::{mem, ptr, sync::OnceLock};
+
 #[path = "xuser_lifecycle.rs"]
 mod lifecycle;
 
-use core::ffi::{c_char, c_void};
-use std::{
-    collections::HashSet,
-    mem, ptr,
-    sync::{
-        Mutex, OnceLock,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
-
 use super::{
     abi::{
-        E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_NOT_SUFFICIENT_BUFFER, E_POINTER,
-        Guid, HResult, IID_IUNKNOWN, IID_IXUSER_ADD_WITH_UI, IID_IXUSER_BASE,
-        IID_IXUSER_GAMERTAG, IID_IXUSER_MSA, IID_IXUSER_PLATFORM, IID_IXUSER_SIGN_OUT,
-        IID_IXUSER_STORE, S_OK, XAsyncBlock, XAsyncOp, XAsyncProviderData,
-        XUserGamertagVtable, XUserHandle, XUserLocalId, XUserVtable, XUSER_AGE_GROUP_UNKNOWN,
+        E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_NOT_SUFFICIENT_BUFFER,
+        E_POINTER, Guid, HResult, IID_IUNKNOWN, IID_IXUSER_ADD_WITH_UI,
+        IID_IXUSER_BASE, IID_IXUSER_GAMERTAG, IID_IXUSER_MSA, IID_IXUSER_PLATFORM,
+        IID_IXUSER_SIGN_OUT, IID_IXUSER_STORE, S_OK, XAsyncBlock, XAsyncOp,
+        XAsyncProviderData, XUserGamertagVtable, XUserHandle, XUserLocalId,
+        XUserVtable, XUSER_STATE_SIGNED_IN,
     },
-    bridge_debug, bridge_info, bridge_warn, call_original_query, session, token, xasync,
+    bridge_info, bridge_warn, session, token, xasync,
 };
-
-use lifecycle::{XTaskQueueRegistrationToken, XUserChangeEventCallback};
-
-const E_GAMEUSER_USER_NOT_FOUND: HResult = 0x8924_5104_u32 as i32;
-const XUSER_ADD_DEFAULT_USER_SILENTLY: u32 = 0x01;
-const XUSER_ADD_NAME: &[u8] = b"XUserAddAsync.BMCBL\0";
-static XUSER_ADD_IDENTITY: u8 = 0x42;
+use lifecycle::{
+    E_GAMEUSER_SIGNED_OUT, E_GAMEUSER_USER_NOT_FOUND, XTaskQueueRegistrationToken,
+    XUserChangeEventCallback, XUSER_STATE_SIGNING_OUT,
+};
 
 #[repr(C)]
 struct XUserGamertagInterface {
@@ -45,16 +36,11 @@ struct XUserObject {
 unsafe impl Send for XUserObject {}
 unsafe impl Sync for XUserObject {}
 
-struct XUserAddContext {
-    handle: usize,
-}
-
 static USER_VTABLE: OnceLock<XUserVtable> = OnceLock::new();
 static GAMERTAG_VTABLE: OnceLock<XUserGamertagVtable> = OnceLock::new();
 static USER_OBJECT: OnceLock<XUserObject> = OnceLock::new();
-static NATIVE_BASE_INTERFACE: AtomicUsize = AtomicUsize::new(0);
-static MATCHING_NATIVE_USER: AtomicUsize = AtomicUsize::new(0);
-static NATIVE_ADD_ASYNCS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+static XUSER_ADD_IDENTITY: u8 = 0;
+const XUSER_ADD_NAME: &[u8] = b"XUserAddAsync\0";
 
 fn user_object() -> Option<&'static XUserObject> {
     session()?;
@@ -66,18 +52,8 @@ fn user_object() -> Option<&'static XUserObject> {
     }))
 }
 
-impl XUserObject {
-    fn handle(&self) -> XUserHandle {
-        self as *const Self as XUserHandle
-    }
-
-    fn is_handle(&self, handle: XUserHandle) -> bool {
-        !handle.is_null() && handle == self.handle()
-    }
-}
-
 pub fn provider_interface() -> Option<*mut c_void> {
-    Some(user_object()?.handle())
+    Some(user_object()? as *const XUserObject as *mut c_void)
 }
 
 fn gamertag_interface() -> Option<*mut c_void> {
@@ -85,126 +61,20 @@ fn gamertag_interface() -> Option<*mut c_void> {
     Some(&object.gamertag as *const XUserGamertagInterface as *mut c_void)
 }
 
-/// Returns the untouched Microsoft XUser provider only as an optional Runtime
-/// capability source. BLoader's public XUser handle never aliases this pointer.
-pub(crate) fn native_base_interface() -> Option<*mut c_void> {
-    let cached = NATIVE_BASE_INTERFACE.load(Ordering::Acquire);
-    if cached != 0 {
-        return Some(cached as *mut c_void);
-    }
-
-    let mut out = ptr::null_mut();
-    let status = unsafe {
-        call_original_query(
-            &super::abi::CLSID_XUSER_IMPL,
-            &IID_IXUSER_BASE,
-            &mut out,
-        )
-    };
-    if status < 0 || out.is_null() {
-        bridge_warn(&format!(
-            "微软官方 XUser provider 不可用；BMCBL 自定义 XUser 仍保持可用 | result=0x{:08X}",
-            status as u32
-        ));
-        return None;
-    }
-    let value = out as usize;
-    match NATIVE_BASE_INTERFACE.compare_exchange(0, value, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => {
-            bridge_info(&format!(
-                "微软官方 XUser provider 已作为可选 Runtime 能力源绑定 | interface=0x{value:X} | custom_handle=independent | native_user_required=false"
-            ));
-            Some(out)
-        }
-        Err(existing) => Some(existing as *mut c_void),
-    }
-}
-
-pub(crate) fn native_base_slot(index: usize) -> Option<usize> {
-    if index >= 50 {
-        return None;
-    }
-    let interface = native_base_interface()?;
-    let vtable = unsafe { *(interface as *const *const usize) };
-    if vtable.is_null() {
-        return None;
-    }
-    let slot = unsafe { *vtable.add(index) };
-    (slot != 0).then_some(slot)
-}
-
-/// Returns the hidden Microsoft handle established by the gated same-account
-/// XUserAddAsync path. Different-account and no-system-account sessions never
-/// populate this slot.
-pub(crate) fn native_user_for_custom_identity() -> Option<XUserHandle> {
-    let value = MATCHING_NATIVE_USER.load(Ordering::Acquire);
-    (value != 0).then_some(value as XUserHandle)
-}
-
-fn remember_native_add(async_block: *mut XAsyncBlock) {
-    if async_block.is_null() {
-        return;
-    }
-    NATIVE_ADD_ASYNCS
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(async_block as usize);
-}
-
-fn take_native_add(async_block: *mut XAsyncBlock) -> bool {
-    if async_block.is_null() {
-        return false;
-    }
-    NATIVE_ADD_ASYNCS
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(&(async_block as usize))
-}
-
-fn native_user_id(user: XUserHandle) -> Result<u64, HResult> {
-    if user.is_null() {
-        return Err(E_INVALIDARG);
-    }
-    let interface = native_base_interface().ok_or(E_FAIL)?;
-    let slot = native_base_slot(11).ok_or(E_FAIL)?;
-    type Function = unsafe extern "system" fn(*mut c_void, XUserHandle, *mut u64) -> HResult;
-    let function: Function = unsafe { mem::transmute(slot) };
-    let mut xuid = 0u64;
-    let status = unsafe { function(interface, user, &mut xuid) };
-    if status < 0 || xuid == 0 {
-        return Err(if status < 0 { status } else { E_FAIL });
-    }
-    Ok(xuid)
-}
-
-fn close_native_user(user: XUserHandle) {
-    if user.is_null() {
-        return;
-    }
-    let Some(interface) = native_base_interface() else {
-        return;
-    };
-    let Some(slot) = native_base_slot(4) else {
-        return;
-    };
-    type Function = unsafe extern "system" fn(*mut c_void, XUserHandle);
-    let function: Function = unsafe { mem::transmute(slot) };
-    unsafe { function(interface, user) };
-}
-
 pub fn valid_user(user: XUserHandle) -> bool {
-    user_object().is_some_and(|object| object.is_handle(user)) && lifecycle::active_handle_exists()
+    provider_interface().is_some_and(|provider| user == provider)
 }
 
 pub unsafe fn query_interface(iid: *const Guid, out: *mut *mut c_void) -> HResult {
     if iid.is_null() || out.is_null() {
         return E_POINTER;
     }
-    unsafe { out.write(ptr::null_mut()) };
+    unsafe {
+        out.write(ptr::null_mut());
+    }
 
     let iid = unsafe { &*iid };
+
     if [
         IID_IUNKNOWN,
         IID_IXUSER_BASE,
@@ -217,14 +87,18 @@ pub unsafe fn query_interface(iid: *const Guid, out: *mut *mut c_void) -> HResul
     .contains(iid)
     {
         if let Some(interface) = provider_interface() {
-            unsafe { out.write(interface) };
+            unsafe {
+                out.write(interface);
+            }
             return S_OK;
         }
     }
 
     if *iid == IID_IXUSER_GAMERTAG {
         if let Some(interface) = gamertag_interface() {
-            unsafe { out.write(interface) };
+            unsafe {
+                out.write(interface);
+            }
             return S_OK;
         }
     }
@@ -255,23 +129,32 @@ unsafe extern "system" fn duplicate_handle(
     if duplicated.is_null() {
         return E_POINTER;
     }
-    let Some(object) = user_object() else {
+    let Some(provider) = provider_interface() else {
         return E_FAIL;
     };
-    if !object.is_handle(user) {
+    if user != provider {
         return E_INVALIDARG;
     }
     let status = lifecycle::duplicate_active_handle();
     if status < 0 {
         return status;
     }
-    unsafe { duplicated.write(object.handle()) };
+    unsafe {
+        duplicated.write(provider);
+    }
     S_OK
 }
 
 unsafe extern "system" fn close_handle(_interface: *mut c_void, user: XUserHandle) {
-    if user_object().is_some_and(|object| object.is_handle(user)) {
-        let _ = lifecycle::release_user_handle();
+    if !valid_user(user) {
+        bridge_warn("XUserCloseHandle 收到未知用户句柄；已忽略");
+        return;
+    }
+    match lifecycle::release_user_handle() {
+        Some(remaining) => bridge_info(&format!(
+            "XUserCloseHandle 已处理 | remaining_handles={remaining}"
+        )),
+        None => bridge_warn("XUserCloseHandle 检测到句柄引用计数下溢；已忽略重复关闭"),
     }
 }
 
@@ -283,16 +166,22 @@ unsafe extern "system" fn compare(
     i32::from(user1 != user2)
 }
 
-unsafe extern "system" fn get_max_users(_interface: *mut c_void, max_users: *mut u32) -> HResult {
+unsafe extern "system" fn get_max_users(
+    _interface: *mut c_void,
+    max_users: *mut u32,
+) -> HResult {
     if max_users.is_null() {
         return E_POINTER;
     }
-    unsafe { max_users.write(1) };
+    unsafe {
+        max_users.write(1);
+    }
     S_OK
 }
 
-fn xuser_add_identity() -> *const c_void {
-    (&XUSER_ADD_IDENTITY as *const u8).cast()
+struct XUserAddContext {
+    handle: usize,
+    claimed: bool,
 }
 
 unsafe extern "system" fn xuser_add_provider(
@@ -316,8 +205,8 @@ unsafe extern "system" fn xuser_add_provider(
                     provider_data.async_block,
                     S_OK,
                     mem::size_of::<XUserHandle>(),
-                )
-            };
+                );
+            }
             S_OK
         }
         XAsyncOp::GetResult => {
@@ -326,45 +215,30 @@ unsafe extern "system" fn xuser_add_provider(
             {
                 return E_NOT_SUFFICIENT_BUFFER;
             }
-            let handle = unsafe { (*context).handle as XUserHandle };
-            unsafe { provider_data.buffer.cast::<XUserHandle>().write(handle) };
+            let context = unsafe { &mut *context };
+            if !context.claimed {
+                let status = lifecycle::acquire_added_handle();
+                if status < 0 {
+                    return status;
+                }
+                context.claimed = true;
+            }
+            unsafe {
+                provider_data
+                    .buffer
+                    .cast::<XUserHandle>()
+                    .write(context.handle as XUserHandle);
+            }
             S_OK
         }
         XAsyncOp::Cancel => S_OK,
         XAsyncOp::Cleanup => {
-            unsafe { drop(Box::from_raw(context)) };
+            unsafe {
+                drop(Box::from_raw(context));
+            }
             S_OK
         }
     }
-}
-
-unsafe fn begin_synthetic_add(async_block: *mut XAsyncBlock) -> HResult {
-    let Some(handle) = provider_interface() else {
-        return E_FAIL;
-    };
-    let status = lifecycle::acquire_added_handle();
-    if status < 0 {
-        return status;
-    }
-
-    let context = Box::into_raw(Box::new(XUserAddContext {
-        handle: handle as usize,
-    }));
-    let result = unsafe {
-        xasync::begin(
-            async_block,
-            context.cast(),
-            xuser_add_identity(),
-            XUSER_ADD_NAME.as_ptr().cast(),
-            xuser_add_provider,
-        )
-    };
-    if result < 0 {
-        unsafe { drop(Box::from_raw(context)) };
-        let _ = lifecycle::release_user_handle();
-        return result;
-    }
-    result
 }
 
 unsafe extern "system" fn add_async(
@@ -375,47 +249,29 @@ unsafe extern "system" fn add_async(
     if async_block.is_null() {
         return E_POINTER;
     }
-
-    let native_already_ready = MATCHING_NATIVE_USER.load(Ordering::Acquire) != 0;
-    let same_account_hint = session().is_some_and(|runtime| runtime.native_same_account_hint());
-    if same_account_hint && !native_already_ready {
-        if let (Some(interface), Some(slot)) = (native_base_interface(), native_base_slot(7)) {
-            type Function = unsafe extern "system" fn(*mut c_void, u32, *mut XAsyncBlock) -> HResult;
-            let function: Function = unsafe { mem::transmute(slot) };
-            let result = unsafe {
-                function(
-                    interface,
-                    XUSER_ADD_DEFAULT_USER_SILENTLY,
-                    async_block,
-                )
-            };
-            if result >= 0 {
-                remember_native_add(async_block);
-                bridge_info(&format!(
-                    "BMCBL 与 Windows 系统 XUID 提示一致；正在建立隐藏 native XUser 能力句柄 | xuid={} | native_add=AddDefaultUserSilently | public_handle=synthetic | ui=disabled",
-                    session().map(|runtime| runtime.xuid).unwrap_or_default()
-                ));
-                return result;
-            }
-            bridge_warn(&format!(
-                "同账号 native XUserAddAsync 无法启动；继续建立 synthetic XUser | result=0x{:08X} | token_route=pre-xsts-or-fail-closed",
-                result as u32
-            ));
-        }
+    if lifecycle::state() == XUSER_STATE_SIGNING_OUT {
+        return E_GAMEUSER_SIGNED_OUT;
     }
-
-    let result = unsafe { begin_synthetic_add(async_block) };
-    if result >= 0 {
-        bridge_debug(&format!(
-            "XUserAddAsync route=bmcbl-synthetic-user | native_user_required=false | native_system_relation={} | system_login_ui=not-invoked",
-            session().map_or("none", |runtime| {
-                match runtime.native_system_xuid_hint {
-                    Some(native) if native == runtime.xuid => "same-no-native-capability",
-                    Some(_) => "different",
-                    None => "none",
-                }
-            })
-        ));
+    let Some(handle) = provider_interface() else {
+        return E_FAIL;
+    };
+    let context = Box::into_raw(Box::new(XUserAddContext {
+        handle: handle as usize,
+        claimed: false,
+    }));
+    let result = unsafe {
+        xasync::begin(
+            async_block,
+            context.cast(),
+            (&XUSER_ADD_IDENTITY as *const u8).cast(),
+            XUSER_ADD_NAME.as_ptr().cast(),
+            xuser_add_provider,
+        )
+    };
+    if result < 0 {
+        unsafe {
+            drop(Box::from_raw(context));
+        }
     }
     result
 }
@@ -428,104 +284,15 @@ unsafe extern "system" fn add_result(
     if async_block.is_null() || user.is_null() {
         return E_POINTER;
     }
-
-    if take_native_add(async_block) {
-        let Some(interface) = native_base_interface() else {
-            return E_FAIL;
-        };
-        let Some(slot) = native_base_slot(8) else {
-            return E_FAIL;
-        };
-        type Function = unsafe extern "system" fn(
-            *mut c_void,
-            *mut XAsyncBlock,
-            *mut XUserHandle,
-        ) -> HResult;
-        let function: Function = unsafe { mem::transmute(slot) };
-        let mut native_user = ptr::null_mut();
-        let native_result = unsafe { function(interface, async_block, &mut native_user) };
-        if native_result >= 0 && !native_user.is_null() {
-            match native_user_id(native_user) {
-                Ok(native_xuid) if session().is_some_and(|runtime| native_xuid == runtime.xuid) => {
-                    let existing = MATCHING_NATIVE_USER.compare_exchange(
-                        0,
-                        native_user as usize,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    );
-                    if let Err(existing) = existing {
-                        if existing != native_user as usize {
-                            close_native_user(native_user);
-                        }
-                    }
-                    let status = lifecycle::acquire_added_handle();
-                    if status < 0 {
-                        return status;
-                    }
-                    let Some(handle) = provider_interface() else {
-                        let _ = lifecycle::release_user_handle();
-                        return E_FAIL;
-                    };
-                    unsafe { user.write(handle) };
-                    bridge_info(&format!(
-                        "隐藏 native XUser 能力句柄已验证并绑定；Minecraft 仍接收 synthetic XUser | xuid={native_xuid} | native_handle=hidden | public_handle=synthetic | token_route=same-account-native-capability"
-                    ));
-                    return S_OK;
-                }
-                Ok(native_xuid) => {
-                    close_native_user(native_user);
-                    bridge_warn(&format!(
-                        "native XUserAddResult 返回了错误账号；拒绝绑定该能力句柄 | native_xuid={native_xuid} | custom_xuid={} | action=synthetic-only",
-                        session().map(|runtime| runtime.xuid).unwrap_or_default()
-                    ));
-                }
-                Err(status) => {
-                    close_native_user(native_user);
-                    bridge_warn(&format!(
-                        "native XUserAddResult 身份无法验证；拒绝绑定该能力句柄 | result=0x{:08X} | action=synthetic-only",
-                        status as u32
-                    ));
-                }
-            }
-        } else {
-            bridge_warn(&format!(
-                "同账号 native XUserAddResult 未建立可验证能力用户；返回 synthetic XUser 防止触发系统 UI | result=0x{:08X} | token_route=pre-xsts-or-fail-closed",
-                native_result as u32
-            ));
-        }
-
-        // The local hint can be stale. Never turn a failed silent native add into
-        // an interactive add. Keep the BMCBL user alive and let the token layer
-        // use pre-XSTS injection discovery/fail-closed instead.
-        let status = lifecycle::acquire_added_handle();
-        if status < 0 {
-            return status;
-        }
-        let Some(handle) = provider_interface() else {
-            let _ = lifecycle::release_user_handle();
-            return E_FAIL;
-        };
-        unsafe { user.write(handle) };
-        return S_OK;
-    }
-
-    let result = unsafe {
+    unsafe {
         xasync::get_result(
             async_block,
-            xuser_add_identity(),
+            (&XUSER_ADD_IDENTITY as *const u8).cast(),
             mem::size_of::<XUserHandle>(),
             user.cast(),
             ptr::null_mut(),
         )
-    };
-    if result >= 0 && !unsafe { *user }.is_null() {
-        bridge_info(&format!(
-            "BMCBL synthetic XUser 已建立 | xuid={} | gamertag={} | native_user_required=false | system_account_optional=true",
-            session().map(|value| value.xuid).unwrap_or_default(),
-            session().map(|value| value.gamertag.as_str()).unwrap_or("<unknown>")
-        ));
     }
-    result
 }
 
 unsafe extern "system" fn get_local_id(
@@ -539,7 +306,9 @@ unsafe extern "system" fn get_local_id(
     if !valid_user(user) {
         return E_INVALIDARG;
     }
-    unsafe { local_id.write(session().unwrap().local_id) };
+    unsafe {
+        local_id.write(session().unwrap().local_id);
+    }
     S_OK
 }
 
@@ -551,9 +320,6 @@ unsafe extern "system" fn find_user_by_local_id(
     if user.is_null() {
         return E_POINTER;
     }
-    let Some(object) = user_object() else {
-        return E_FAIL;
-    };
     if local_id != session().unwrap().local_id || !lifecycle::active_handle_exists() {
         return E_GAMEUSER_USER_NOT_FOUND;
     }
@@ -561,7 +327,9 @@ unsafe extern "system" fn find_user_by_local_id(
     if status < 0 {
         return status;
     }
-    unsafe { user.write(object.handle()) };
+    unsafe {
+        user.write(provider_interface().unwrap());
+    }
     S_OK
 }
 
@@ -576,7 +344,9 @@ unsafe extern "system" fn get_id(
     if !valid_user(user) {
         return E_INVALIDARG;
     }
-    unsafe { user_id.write(session().unwrap().xuid) };
+    unsafe {
+        user_id.write(session().unwrap().xuid);
+    }
     S_OK
 }
 
@@ -588,9 +358,6 @@ unsafe extern "system" fn find_user_by_id(
     if user.is_null() {
         return E_POINTER;
     }
-    let Some(object) = user_object() else {
-        return E_FAIL;
-    };
     if user_id != session().unwrap().xuid || !lifecycle::active_handle_exists() {
         return E_GAMEUSER_USER_NOT_FOUND;
     }
@@ -598,7 +365,9 @@ unsafe extern "system" fn find_user_by_id(
     if status < 0 {
         return status;
     }
-    unsafe { user.write(object.handle()) };
+    unsafe {
+        user.write(provider_interface().unwrap());
+    }
     S_OK
 }
 
@@ -613,7 +382,9 @@ unsafe extern "system" fn get_is_guest(
     if !valid_user(user) {
         return E_INVALIDARG;
     }
-    unsafe { is_guest.write(0) };
+    unsafe {
+        is_guest.write(0);
+    }
     S_OK
 }
 
@@ -625,13 +396,12 @@ unsafe extern "system" fn get_state(
     if state.is_null() {
         return E_POINTER;
     }
-    let Some(object) = user_object() else {
-        return E_FAIL;
-    };
-    if !object.is_handle(user) {
+    if !valid_user(user) {
         return E_INVALIDARG;
     }
-    unsafe { state.write(lifecycle::state()) };
+    unsafe {
+        state.write(lifecycle::state());
+    }
     S_OK
 }
 
@@ -646,27 +416,16 @@ unsafe extern "system" fn get_age_group(
     if !valid_user(user) {
         return E_INVALIDARG;
     }
-    let configured = session().unwrap().age_group;
-    if configured != XUSER_AGE_GROUP_UNKNOWN {
-        unsafe { age_group.write(configured) };
-        return S_OK;
+    unsafe {
+        age_group.write(session().unwrap().age_group);
     }
-
-    if let Some(native) = native_user_for_custom_identity()
-        && let (Some(interface), Some(slot)) = (native_base_interface(), native_base_slot(19))
-    {
-        type Function = unsafe extern "system" fn(*mut c_void, XUserHandle, *mut u32) -> HResult;
-        let function: Function = unsafe { mem::transmute(slot) };
-        return unsafe { function(interface, native, age_group) };
-    }
-    unsafe { age_group.write(XUSER_AGE_GROUP_UNKNOWN) };
     S_OK
 }
 
 unsafe extern "system" fn check_privilege(
     _interface: *mut c_void,
     user: XUserHandle,
-    options: u32,
+    _options: u32,
     privilege: i32,
     has_privilege: *mut u8,
     deny_reason: *mut u32,
@@ -677,32 +436,16 @@ unsafe extern "system" fn check_privilege(
     if !valid_user(user) {
         return E_INVALIDARG;
     }
-    if !session().unwrap().privileges.is_empty() {
-        let allowed = privilege >= 0 && session().unwrap().privileges.contains(&(privilege as u32));
-        unsafe {
-            has_privilege.write(u8::from(allowed));
-            deny_reason.write(0);
-        }
-        return S_OK;
+    if lifecycle::state() != XUSER_STATE_SIGNED_IN {
+        return E_GAMEUSER_SIGNED_OUT;
     }
-
-    if let Some(native) = native_user_for_custom_identity()
-        && let (Some(interface), Some(slot)) = (native_base_interface(), native_base_slot(20))
-    {
-        type Function = unsafe extern "system" fn(
-            *mut c_void,
-            XUserHandle,
-            u32,
-            i32,
-            *mut u8,
-            *mut u32,
-        ) -> HResult;
-        let function: Function = unsafe { mem::transmute(slot) };
-        return unsafe { function(interface, native, options, privilege, has_privilege, deny_reason) };
-    }
-
+    let allowed = privilege >= 0
+        && session()
+            .unwrap()
+            .privileges
+            .contains(&(privilege as u32));
     unsafe {
-        has_privilege.write(0);
+        has_privilege.write(u8::from(allowed));
         deny_reason.write(0);
     }
     S_OK
@@ -715,7 +458,9 @@ unsafe extern "system" fn register_for_change_event(
     callback: Option<XUserChangeEventCallback>,
     registration_token: *mut XTaskQueueRegistrationToken,
 ) -> HResult {
-    unsafe { lifecycle::register_for_change_event(context, callback, registration_token) }
+    unsafe {
+        lifecycle::register_for_change_event(context, callback, registration_token)
+    }
 }
 
 unsafe extern "system" fn unregister_for_change_event(
@@ -737,7 +482,9 @@ unsafe extern "system" fn close_sign_out_deferral_handle(
     _interface: *mut c_void,
     deferral: *mut c_void,
 ) {
-    unsafe { lifecycle::close_sign_out_deferral_handle(deferral) }
+    unsafe {
+        lifecycle::close_sign_out_deferral_handle(deferral);
+    }
 }
 
 unsafe extern "system" fn get_gamertag(
@@ -761,7 +508,9 @@ unsafe extern "system" fn get_gamertag(
     };
     let required = value.len() + 1;
     if !used.is_null() {
-        unsafe { used.write(required) };
+        unsafe {
+            used.write(required);
+        }
     }
     if size < required {
         return E_NOT_SUFFICIENT_BUFFER;

@@ -1,20 +1,18 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use core::ffi::c_void;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::{
-    mem, ptr,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{mem, ptr, time::{SystemTime, UNIX_EPOCH}};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{
     abi::{
-        XUSER_AGE_GROUP_ADULT, XUSER_AGE_GROUP_CHILD, XUSER_AGE_GROUP_TEEN,
-        XUSER_AGE_GROUP_UNKNOWN, XUserLocalId,
+        XUserLocalId, XUSER_AGE_GROUP_ADULT, XUSER_AGE_GROUP_CHILD,
+        XUSER_AGE_GROUP_TEEN, XUSER_AGE_GROUP_UNKNOWN,
     },
-    bridge_debug, bridge_info,
+    crypto::SigningKey,
 };
 
 const PIPE_MAGIC: &[u8; 8] = b"BMCBLXU1";
@@ -22,12 +20,17 @@ const PIPE_VERSION: u32 = 1;
 const PIPE_HEADER_SIZE: usize = 80;
 const MAX_PAYLOAD_SIZE: usize = 256 * 1024;
 const MIN_TOKEN_REMAINING_SECONDS: u64 = 30;
-const AUTH_MODE: &str = "official-runtime-user-token-v4";
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const OPEN_EXISTING: u32 = 3;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+
+const XBOX_LIVE_RP: &str = "http://xboxlive.com";
+const PLAYFAB_RP: &str = "https://b980a380.minecraft.playfabapi.com/";
+const MULTIPLAYER_RP: &str = "https://multiplayer.minecraft.net/";
+const REALMS_RP: &str = "https://pocket.realms.minecraft.net/";
+const LICENSING_RP: &str = "http://licensing.xboxlive.com";
 
 #[repr(C)]
 struct ProcessEntry32W {
@@ -89,15 +92,11 @@ impl Drop for OwnedHandle {
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
-pub struct UserToken {
-    pub token: String,
-    #[zeroize(skip)]
-    pub expires_at: u64,
-}
-
-/// Secret-free route summary used only by startup diagnostics.
 pub struct TokenRecord {
+    pub token: String,
+    pub user_hash: String,
     pub relying_party: String,
+    #[zeroize(skip)]
     pub expires_at: u64,
 }
 
@@ -108,41 +107,60 @@ pub struct Session {
     pub age_group: u32,
     pub privileges: Vec<u32>,
     pub tokens: Vec<TokenRecord>,
-    pub user_token: UserToken,
-    /// Non-secret BMCBL observation of the Windows Xbox identity. This value
-    /// only gates whether native AddDefaultUserSilently may be attempted; any
-    /// returned native handle is independently verified by GetId before use.
-    pub native_system_xuid_hint: Option<u64>,
+    pub signing_key: SigningKey,
 }
 
 unsafe impl Send for Session {}
 unsafe impl Sync for Session {}
 
 impl Session {
-    pub fn custom_user_token(&self) -> Option<&str> {
-        (self.user_token.expires_at > now_epoch().saturating_add(MIN_TOKEN_REMAINING_SECONDS))
-            .then_some(self.user_token.token.as_str())
-    }
-
-    pub fn native_same_account_hint(&self) -> bool {
-        self.native_system_xuid_hint == Some(self.xuid)
+    pub fn token_for_relying_party(&self, relying_party: &str) -> Option<&TokenRecord> {
+        self.tokens
+            .iter()
+            .find(|token| token.relying_party == relying_party)
     }
 }
 
 #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 struct WireDocument {
-    #[serde(default)]
-    auth_mode: Option<String>,
+    ecc_private_blob_b64: String,
     xbl_xuid: String,
     xbl_gamertag: String,
     #[serde(default)]
     xbl_age_group: Option<String>,
     #[serde(default)]
     xbl_privileges: Option<String>,
-    user_token: String,
-    user_token_expiry_epoch: String,
+
+    xbl_token: String,
+    xbl_uhs: String,
+    xbl_token_expiry_epoch: String,
+
+    sisu_token: String,
+    sisu_uhs: String,
     #[serde(default)]
-    native_system_xuid_hint: Option<String>,
+    sisu_rp: Option<String>,
+    sisu_expiry_epoch: String,
+
+    mp_token: String,
+    mp_uhs: String,
+    #[serde(default)]
+    mp_rp: Option<String>,
+    mp_expiry_epoch: String,
+
+    realms_token: String,
+    realms_uhs: String,
+    #[serde(default)]
+    realms_rp: Option<String>,
+    realms_expiry_epoch: String,
+
+    #[serde(default)]
+    lic_token: Option<String>,
+    #[serde(default)]
+    lic_uhs: Option<String>,
+    #[serde(default)]
+    lic_rp: Option<String>,
+    #[serde(default)]
+    lic_expiry_epoch: Option<String>,
 }
 
 /// Opens exactly one BMCBL pipe named for the current Minecraft PID. If the
@@ -153,23 +171,14 @@ pub fn receive_session() -> Result<Option<Session>, String> {
         Some(payload) => payload,
         None => return Ok(None),
     };
-    bridge_debug(&format!(
-        "BMCBL XUser pipe payload 已完整接收 | payload_bytes={} | next=parse-and-zeroize",
-        payload.len()
-    ));
     let result = parse_session(&payload).map(Some);
     payload.zeroize();
-    bridge_debug("BMCBL XUser pipe 原始 payload 已 zeroize");
     result
 }
 
 fn receive_payload() -> Result<Option<Vec<u8>>, String> {
     let current_pid = unsafe { GetCurrentProcessId() };
-    let pipe_name_text = format!(r"\\.\pipe\BMCBL.XUser.{current_pid}");
-    bridge_debug(&format!(
-        "BMCBL XUser pipe 探测 | minecraft_pid={current_pid} | pipe={pipe_name_text}"
-    ));
-    let pipe_name = wide(&pipe_name_text);
+    let pipe_name = wide(&format!(r"\\.\pipe\BMCBL.XUser.{current_pid}"));
     let handle = unsafe {
         CreateFileW(
             pipe_name.as_ptr(),
@@ -182,12 +191,8 @@ fn receive_payload() -> Result<Option<Vec<u8>>, String> {
         )
     };
     let Some(pipe) = OwnedHandle::new(handle) else {
-        bridge_debug("BMCBL XUser pipe 不存在 | action=official-xuser-passthrough");
         return Ok(None);
     };
-    bridge_info(&format!(
-        "BMCBL XUser pipe 已连接 | minecraft_pid={current_pid} | transport=named-pipe | access=read-once"
-    ));
 
     let mut server_pid = 0u32;
     if unsafe { GetNamedPipeServerProcessId(pipe.0, &mut server_pid) } == 0 {
@@ -195,13 +200,8 @@ fn receive_payload() -> Result<Option<Vec<u8>>, String> {
     }
     let parent_pid = parent_process_id(current_pid)
         .ok_or_else(|| "unable to identify Minecraft parent PID".to_string())?;
-    bridge_debug(&format!(
-        "BMCBL XUser pipe peer 验证 | server_pid={server_pid} | minecraft_parent_pid={parent_pid}"
-    ));
     if server_pid != parent_pid {
-        return Err(format!(
-            "pipe server is not the Minecraft parent process | server_pid={server_pid} parent_pid={parent_pid}"
-        ));
+        return Err("pipe server is not the Minecraft parent process".to_string());
     }
 
     let mut header = [0u8; PIPE_HEADER_SIZE];
@@ -218,9 +218,6 @@ fn receive_payload() -> Result<Option<Vec<u8>>, String> {
     let payload_len = read_u32(&header, 40) as usize;
     let expected_digest: [u8; 32] = header[48..80].try_into().unwrap();
 
-    bridge_debug(&format!(
-        "BMCBL XUser transport header | protocol={version} | target_pid={target_pid} | launcher_pid={launcher_pid} | issued_at={issued_at} | expires_at={expires_at} | payload_bytes={payload_len} | digest=sha256-redacted"
-    ));
     if version != PIPE_VERSION
         || target_pid != current_pid
         || launcher_pid != server_pid
@@ -235,14 +232,8 @@ fn receive_payload() -> Result<Option<Vec<u8>>, String> {
         || expires_at <= now
         || expires_at.saturating_sub(issued_at) > 120
     {
-        return Err(format!(
-            "XUser transport window expired | now={now} issued_at={issued_at} expires_at={expires_at}"
-        ));
+        return Err("XUser transport window expired".to_string());
     }
-    bridge_debug(&format!(
-        "BMCBL XUser transport window accepted | remaining={}s | max_window=120s",
-        expires_at.saturating_sub(now)
-    ));
 
     let mut payload = vec![0u8; payload_len];
     if let Err(error) = read_exact(pipe.0, &mut payload) {
@@ -254,55 +245,25 @@ fn receive_payload() -> Result<Option<Vec<u8>>, String> {
         payload.zeroize();
         return Err("XUser payload digest mismatch".to_string());
     }
-    bridge_info(&format!(
-        "BMCBL XUser transport verified | peer_pid={server_pid} | payload_bytes={payload_len} | digest=SHA-256-ok | secrets_logged=false"
-    ));
     Ok(Some(payload))
 }
 
 fn parse_session(payload: &[u8]) -> Result<Session, String> {
-    let document: WireDocument = serde_json::from_slice(payload).map_err(|error| {
-        let kind = match error.classify() {
-            serde_json::error::Category::Data => "utoken-v4-schema-mismatch",
-            serde_json::error::Category::Syntax => "json-syntax-invalid",
-            serde_json::error::Category::Eof => "json-truncated",
-            serde_json::error::Category::Io => "json-io-error",
-        };
-        format!(
-            "BMCBL XUser payload decode failed | kind={kind} | line={} | column={} | expected_auth_mode={AUTH_MODE}",
-            error.line(),
-            error.column(),
-        )
-    })?;
-    if document.auth_mode.as_deref() != Some(AUTH_MODE) {
-        return Err(format!(
-            "BMCBL XUser payload protocol mismatch | expected_auth_mode={AUTH_MODE} | received_auth_mode={}",
-            document.auth_mode.as_deref().unwrap_or("<missing>")
-        ));
-    }
+    let document: WireDocument = serde_json::from_slice(payload)
+        .map_err(|_| "pre-authentication payload is not valid JSON".to_string())?;
+
+    let mut private_blob = STANDARD
+        .decode(&document.ecc_private_blob_b64)
+        .map_err(|_| "invalid P-256 private key encoding".to_string())?;
+    let signing_key = SigningKey::import_private_blob(mem::take(&mut private_blob))?;
+    private_blob.zeroize();
 
     let xuid = parse_nonzero_decimal(&document.xbl_xuid)
         .ok_or_else(|| "invalid XUID".to_string())?;
+    let local_id = parse_nonzero_decimal(&document.xbl_uhs).unwrap_or(xuid);
     if document.xbl_gamertag.trim().is_empty() {
         return Err("empty gamertag".to_string());
     }
-    let expires_at = document
-        .user_token_expiry_epoch
-        .parse::<u64>()
-        .map_err(|_| "invalid UToken expiry".to_string())?;
-    let now = now_epoch();
-    if document.user_token.is_empty()
-        || expires_at <= now.saturating_add(MIN_TOKEN_REMAINING_SECONDS)
-    {
-        return Err("invalid or expired Xbox UToken".to_string());
-    }
-    let native_system_xuid_hint = match document.native_system_xuid_hint.as_deref() {
-        Some(value) if !value.is_empty() => Some(
-            parse_nonzero_decimal(value)
-                .ok_or_else(|| "invalid native system XUID hint".to_string())?,
-        ),
-        _ => None,
-    };
 
     let age_group = match document
         .xbl_age_group
@@ -326,34 +287,89 @@ fn parse_session(payload: &[u8]) -> Result<Session, String> {
     privileges.sort_unstable();
     privileges.dedup();
 
-    let native_relation = match native_system_xuid_hint {
-        Some(native) if native == xuid => "same",
-        Some(_) => "different",
-        None => "none",
-    };
-    bridge_debug(&format!(
-        "BMCBL XUser UToken-only v4 session parsed | xbox_xuid={xuid} | gamertag_chars={} | privilege_count={} | user_token_remaining={}s | native_system_identity={native_relation} | MSA=not-transferred | DToken=official-runtime | TToken=official-runtime | final_xsts=official-runtime | signature=official-runtime | secrets_logged=false",
-        document.xbl_gamertag.chars().count(),
-        privileges.len(),
-        expires_at.saturating_sub(now),
-    ));
+    let mut tokens = vec![
+        token(
+            &document.xbl_token,
+            &document.xbl_uhs,
+            XBOX_LIVE_RP,
+            &document.xbl_token_expiry_epoch,
+        )?,
+        token(
+            &document.sisu_token,
+            &document.sisu_uhs,
+            checked_rp(document.sisu_rp.as_deref(), PLAYFAB_RP)?,
+            &document.sisu_expiry_epoch,
+        )?,
+        token(
+            &document.mp_token,
+            &document.mp_uhs,
+            checked_rp(document.mp_rp.as_deref(), MULTIPLAYER_RP)?,
+            &document.mp_expiry_epoch,
+        )?,
+        token(
+            &document.realms_token,
+            &document.realms_uhs,
+            checked_rp(document.realms_rp.as_deref(), REALMS_RP)?,
+            &document.realms_expiry_epoch,
+        )?,
+    ];
+
+    match (
+        document.lic_token.as_deref(),
+        document.lic_uhs.as_deref(),
+        document.lic_expiry_epoch.as_deref(),
+    ) {
+        (None, None, None) => {}
+        (Some(value), Some(hash), Some(expiry)) => tokens.push(token(
+            value,
+            hash,
+            checked_rp(document.lic_rp.as_deref(), LICENSING_RP)?,
+            expiry,
+        )?),
+        _ => return Err("incomplete licensing token".to_string()),
+    }
 
     Ok(Session {
         xuid,
-        local_id: XUserLocalId { value: xuid },
+        local_id: XUserLocalId { value: local_id },
         gamertag: document.xbl_gamertag.clone(),
         age_group,
         privileges,
-        tokens: vec![TokenRecord {
-            relying_party: "xasu-user-token".to_string(),
-            expires_at,
-        }],
-        user_token: UserToken {
-            token: document.user_token.clone(),
-            expires_at,
-        },
-        native_system_xuid_hint,
+        tokens,
+        signing_key,
     })
+}
+
+fn token(
+    value: &str,
+    user_hash: &str,
+    relying_party: &str,
+    expiry: &str,
+) -> Result<TokenRecord, String> {
+    let expires_at = expiry
+        .parse::<u64>()
+        .map_err(|_| "invalid token expiry".to_string())?;
+    if value.is_empty()
+        || parse_nonzero_decimal(user_hash).is_none()
+        || relying_party.is_empty()
+        || expires_at <= now_epoch().saturating_add(MIN_TOKEN_REMAINING_SECONDS)
+    {
+        return Err("invalid or expired Xbox token".to_string());
+    }
+    Ok(TokenRecord {
+        token: value.to_string(),
+        user_hash: user_hash.to_string(),
+        relying_party: relying_party.to_string(),
+        expires_at,
+    })
+}
+
+fn checked_rp<'a>(provided: Option<&'a str>, expected: &'a str) -> Result<&'a str, String> {
+    match provided {
+        Some(value) if value != expected => Err("unexpected Xbox relying party".to_string()),
+        Some(value) => Ok(value),
+        None => Ok(expected),
+    }
 }
 
 fn parse_nonzero_decimal(value: &str) -> Option<u64> {
@@ -434,25 +450,8 @@ mod tests {
     }
 
     #[test]
-    fn utoken_v4_wire_document_accepts_system_hint() {
-        let payload = serde_json::json!({
-            "auth_mode": AUTH_MODE,
-            "xbl_xuid": "2535413569375435",
-            "xbl_gamertag": "BMCBLTest",
-            "xbl_age_group": "Adult",
-            "xbl_privileges": "185 254",
-            "user_token": "test-user-token",
-            "user_token_expiry_epoch": "4102444800",
-            "native_system_xuid_hint": "2535413569375435"
-        });
-        let encoded = serde_json::to_vec(&payload).unwrap();
-        let document: WireDocument = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(document.auth_mode.as_deref(), Some(AUTH_MODE));
-        assert_eq!(document.xbl_gamertag, "BMCBLTest");
-        assert_eq!(document.user_token, "test-user-token");
-        assert_eq!(
-            document.native_system_xuid_hint.as_deref(),
-            Some("2535413569375435")
-        );
+    fn relying_parties_cannot_be_replaced() {
+        assert!(checked_rp(Some(MULTIPLAYER_RP), MULTIPLAYER_RP).is_ok());
+        assert!(checked_rp(Some(XBOX_LIVE_RP), MULTIPLAYER_RP).is_err());
     }
 }

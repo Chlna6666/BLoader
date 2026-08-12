@@ -1,25 +1,34 @@
-// SPDX-License-Identifier: GPL-3.0-only
-
-#[path = "pre_xsts.rs"]
-mod pre_xsts;
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 use core::ffi::{c_char, c_void};
-use std::{
-    collections::HashSet,
-    ffi::{CStr, CString},
-    mem, ptr,
-    sync::{Mutex, OnceLock},
-};
+use std::{ffi::CStr, mem, ptr};
+use zeroize::{Zeroize, Zeroizing};
 
 use super::{
     abi::{
-        E_FAIL, E_INVALIDARG, HResult, TokenData, TokenHeader, TokenUtf16Data, TokenUtf16Header,
-        XAsyncBlock, XUserHandle,
+        E_FAIL, E_INVALIDARG, E_NOT_SUFFICIENT_BUFFER, E_POINTER, HResult, S_OK,
+        TokenData, TokenHeader, TokenUtf16Data, TokenUtf16Header, XAsyncBlock,
+        XAsyncOp, XAsyncProviderData, XUserHandle,
     },
-    bridge_info, bridge_warn, session, xuser,
+    session,
+    xasync,
+    xuser,
 };
 
-const MAX_URL_BYTES: usize = 32 * 1024;
+const TOKEN_OPTIONS_MASK: u32 = 0x03;
+const MAX_METHOD_LENGTH: usize = 32;
+const MAX_URL_LENGTH: usize = 32 * 1024;
+const MAX_HEADER_COUNT: usize = 128;
+const MAX_HEADER_NAME_LENGTH: usize = 256;
+const MAX_HEADER_VALUE_LENGTH: usize = 32 * 1024;
+const MAX_REQUEST_BODY_SIZE: usize = 64 * 1024 * 1024;
+const MAX_UTF16_INPUT_UNITS: usize = 32 * 1024;
+const DEFAULT_XBOX_MAX_BODY_BYTES: usize = 8 * 1024;
+const FULL_BODY_MAX_BYTES: usize = u32::MAX as usize;
+const TOKEN_NAME_ANSI: &[u8] = b"XUserGetTokenAndSignatureAsync\0";
+const TOKEN_NAME_UTF16: &[u8] = b"XUserGetTokenAndSignatureUtf16Async\0";
+static TOKEN_IDENTITY_ANSI: u8 = 0x41;
+static TOKEN_IDENTITY_UTF16: u8 = 0x57;
 
 const XBOX_LIVE_RP: &str = "http://xboxlive.com";
 const PLAYFAB_RP: &str = "https://b980a380.minecraft.playfabapi.com/";
@@ -27,603 +36,346 @@ const MULTIPLAYER_RP: &str = "https://multiplayer.minecraft.net/";
 const REALMS_RP: &str = "https://pocket.realms.minecraft.net/";
 const LICENSING_RP: &str = "http://licensing.xboxlive.com";
 
-const XUSER_ADD_DEFAULT_USER_SILENTLY: u32 = 0x01;
-const XUSER_TOKEN_FORCE_REFRESH: u32 = 0x01;
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RequestHeader {
+    name: String,
+    value: String,
+}
 
-static ROUTE_LOGGED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-static DIAGNOSTIC_PROBES_STARTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-static AUTH_CAPABILITY_NATIVE_USER: OnceLock<Mutex<Option<(usize, u64)>>> = OnceLock::new();
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SigningPolicy {
+    max_body_bytes: usize,
+    extra_header_names: Vec<String>,
+}
 
-macro_rules! hresult_try {
-    ($expression:expr) => {
-        match $expression {
-            Ok(value) => value,
-            Err(error) => return error,
+impl SigningPolicy {
+    fn xbox_default() -> Self {
+        Self {
+            max_body_bytes: DEFAULT_XBOX_MAX_BODY_BYTES,
+            extra_header_names: Vec::new(),
         }
-    };
-}
-
-fn log_once(key: String, message: impl FnOnce()) {
-    let inserted = ROUTE_LOGGED
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(key);
-    if inserted {
-        message();
     }
-}
 
-fn native_token_interface() -> Result<*mut c_void, HResult> {
-    xuser::native_base_interface().ok_or(E_FAIL)
-}
-
-fn native_token_slot(index: usize) -> Result<usize, HResult> {
-    xuser::native_base_slot(index).ok_or(E_FAIL)
-}
-
-fn diagnostic_probe_once(relying_party: &str) -> bool {
-    DIAGNOSTIC_PROBES_STARTED
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(relying_party.to_string())
-}
-
-struct NativeAddProbeContext {
-    relying_party: String,
-    url: String,
-    original_options: u32,
-    diagnostic_options: u32,
-}
-
-struct NativeTokenProbeContext {
-    relying_party: String,
-    native_user: XUserHandle,
-    native_xuid: u64,
-    method: CString,
-    url: CString,
-    original_options: u32,
-    diagnostic_options: u32,
-    close_native_user_on_complete: bool,
-}
-
-/// A Microsoft Runtime user handle that has already been verified to represent
-/// exactly the same Xbox identity as the BMCBL virtual XUser.
-///
-/// Keeping this wrapper private is intentional: the normal token forwarding
-/// path cannot accept an arbitrary native user (for example Windows account A)
-/// and therefore cannot accidentally return A's final XSTS for virtual user B.
-#[derive(Clone, Copy)]
-struct SameIdentityNativeCapability {
-    user: XUserHandle,
-}
-
-impl SameIdentityNativeCapability {
-    fn handle(self) -> XUserHandle {
-        self.user
+    fn xbox_full_body() -> Self {
+        Self {
+            max_body_bytes: FULL_BODY_MAX_BYTES,
+            extra_header_names: Vec::new(),
+        }
     }
-}
 
-#[derive(Clone, Copy)]
-enum MicrosoftAuthCapability {
-    SameIdentity(SameIdentityNativeCapability),
-    PreXstsInjected { user: XUserHandle, native_xuid: u64 },
-}
-
-impl MicrosoftAuthCapability {
-    fn handle(self) -> XUserHandle {
-        match self {
-            Self::SameIdentity(capability) => capability.handle(),
-            Self::PreXstsInjected { user, native_xuid } => {
-                debug_assert_ne!(native_xuid, 0);
-                user
+    fn caller_headers(headers: &[RequestHeader]) -> Self {
+        let mut names = Vec::new();
+        for header in headers {
+            if is_transport_or_auth_header(&header.name)
+                || names
+                    .iter()
+                    .any(|name: &String| name.eq_ignore_ascii_case(&header.name))
+            {
+                continue;
             }
+            names.push(header.name.clone());
+        }
+        Self {
+            max_body_bytes: FULL_BODY_MAX_BYTES,
+            extra_header_names: names,
         }
     }
 }
 
-fn cached_auth_capability_user() -> Option<(XUserHandle, u64)> {
-    let guard = AUTH_CAPABILITY_NATIVE_USER
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.map(|(user, xuid)| (user as XUserHandle, xuid))
+struct TokenContext {
+    utf16: bool,
+    method: String,
+    request_target: String,
+    policy_header_values: Vec<String>,
+    max_body_bytes: usize,
+    body: Vec<u8>,
+    authorization: Vec<u8>,
+    authorization_utf16: Vec<u16>,
+    signature: Vec<u8>,
+    signature_utf16: Vec<u16>,
+    prepared: bool,
 }
 
-fn remember_auth_capability_user(user: XUserHandle, xuid: u64) -> (XUserHandle, u64) {
-    let mut guard = AUTH_CAPABILITY_NATIVE_USER
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some((existing, existing_xuid)) = *guard {
-        if existing != user as usize {
-            close_native_user(user);
+impl TokenContext {
+    fn new(
+        user: XUserHandle,
+        method: &str,
+        url: &str,
+        headers: Vec<RequestHeader>,
+        body: &[u8],
+        utf16: bool,
+    ) -> Result<Self, HResult> {
+        if !xuser::valid_user(user) {
+            return Err(E_INVALIDARG);
         }
-        return (existing as XUserHandle, existing_xuid);
-    }
-    *guard = Some((user as usize, xuid));
-    (user, xuid)
-}
-
-fn native_add_result(async_block: *mut XAsyncBlock, user: *mut XUserHandle) -> HResult {
-    let Ok(interface) = native_token_interface() else {
-        return E_FAIL;
-    };
-    let Ok(slot) = native_token_slot(8) else {
-        return E_FAIL;
-    };
-    type Function =
-        unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, *mut XUserHandle) -> HResult;
-    let function: Function = unsafe { mem::transmute(slot) };
-    unsafe { function(interface, async_block, user) }
-}
-
-fn native_user_id(user: XUserHandle) -> Result<u64, HResult> {
-    if user.is_null() {
-        return Err(E_INVALIDARG);
-    }
-    let interface = native_token_interface()?;
-    let slot = native_token_slot(11)?;
-    type Function = unsafe extern "system" fn(*mut c_void, XUserHandle, *mut u64) -> HResult;
-    let function: Function = unsafe { mem::transmute(slot) };
-    let mut xuid = 0u64;
-    let status = unsafe { function(interface, user, &mut xuid) };
-    if status < 0 || xuid == 0 {
-        return Err(if status < 0 { status } else { E_FAIL });
-    }
-    Ok(xuid)
-}
-
-fn close_native_user(user: XUserHandle) {
-    if user.is_null() {
-        return;
-    }
-    let (Ok(interface), Ok(slot)) = (native_token_interface(), native_token_slot(4)) else {
-        return;
-    };
-    type Function = unsafe extern "system" fn(*mut c_void, XUserHandle);
-    let function: Function = unsafe { mem::transmute(slot) };
-    unsafe { function(interface, user) };
-}
-
-fn native_relation(native_xuid: u64) -> &'static str {
-    match session() {
-        Some(runtime) if native_xuid == runtime.xuid => "same",
-        Some(_) => "different",
-        None => "unknown",
-    }
-}
-
-/// Triggers Microsoft Runtime's own token machinery only to observe the
-/// pre-XSTS DeviceToken/TitleToken/UserTokens aggregation path.
-///
-/// A native Windows user returned here is a disposable capability-bootstrap
-/// handle. It is never installed as the backing identity for BLoader's public
-/// synthetic XUser and its final token result is never returned to Minecraft.
-fn start_pre_xsts_diagnostic_probe(relying_party: &str, url: &str, options: u32) {
-    if !diagnostic_probe_once(relying_party) {
-        bridge_info(&format!(
-            "pre-XSTS capability probe 已存在；跳过重复启动 | rp={relying_party} | reason=diagnostic-already-started | native_user_is_backing_identity=false | result_discarded=true | secrets_logged=false"
-        ));
-        return;
-    }
-
-    let diagnostic_options = options | XUSER_TOKEN_FORCE_REFRESH;
-
-    let (Ok(interface), Ok(slot)) = (native_token_interface(), native_token_slot(7)) else {
-        bridge_warn(&format!(
-            "pre-XSTS capability probe 无法启动 native Add；Microsoft Runtime XUserAddAsync 不可用 | rp={relying_party} | system_account_optional=true | result=no-native-provider | action=diagnostic-skip"
-        ));
-        return;
-    };
-
-    let context = Box::new(NativeAddProbeContext {
-        relying_party: relying_party.to_string(),
-        url: url.to_string(),
-        original_options: options,
-        diagnostic_options,
-    });
-    let context_ptr = Box::into_raw(context);
-
-    let block = Box::new(XAsyncBlock {
-        queue: ptr::null_mut(),
-        context: context_ptr.cast(),
-        callback: Some(native_add_probe_complete),
-        internal: [0; 4],
-    });
-    let block_ptr = Box::into_raw(block);
-
-    type Function = unsafe extern "system" fn(*mut c_void, u32, *mut XAsyncBlock) -> HResult;
-    let function: Function = unsafe { mem::transmute(slot) };
-    let result = unsafe { function(interface, XUSER_ADD_DEFAULT_USER_SILENTLY, block_ptr) };
-    if result < 0 {
-        unsafe {
-            drop(Box::from_raw(context_ptr));
-            drop(Box::from_raw(block_ptr));
+        let relying_party = relying_party_for_url(url);
+        let runtime = session().ok_or(E_FAIL)?;
+        let token = runtime
+            .token_for_relying_party(relying_party)
+            .ok_or(E_FAIL)?;
+        if token.expires_at <= now_epoch().saturating_add(30) {
+            return Err(E_FAIL);
         }
-        bridge_warn(&format!(
-            "pre-XSTS capability probe native Add 启动失败；不会触发系统登录 UI | rp={relying_party} | result=0x{:08X} | system_account_optional=true | action=diagnostic-skip",
-            result as u32
+        let request_target = request_target_from_url(url).ok_or(E_INVALIDARG)?;
+        let policy = signing_policy_for_url(url, &headers);
+        let policy_header_values =
+            select_policy_header_values(&headers, &policy.extra_header_names);
+
+        let authorization_text = Zeroizing::new(format!(
+            "XBL3.0 x={};{}",
+            token.user_hash, token.token
         ));
-        return;
+        let mut authorization = authorization_text.as_bytes().to_vec();
+        authorization.push(0);
+        let mut authorization_utf16 = authorization_text.encode_utf16().collect::<Vec<_>>();
+        authorization_utf16.push(0);
+
+        Ok(Self {
+            utf16,
+            method: method.to_ascii_uppercase(),
+            request_target,
+            policy_header_values,
+            max_body_bytes: policy.max_body_bytes,
+            body: body.to_vec(),
+            authorization,
+            authorization_utf16,
+            signature: Vec::new(),
+            signature_utf16: Vec::new(),
+            prepared: false,
+        })
     }
 
-    bridge_info(&format!(
-        "pre-XSTS capability probe native Add 已启动 | rp={relying_party} | mode=silent-diagnostic | identity_owner=bloader-virtual-xuser | microsoft_runtime_role=auth-capability-only | native_user_is_backing_identity=false | system_login_ui=not-invoked | original_options=0x{options:08X} | diagnostic_options=0x{diagnostic_options:08X} | diagnostic_force_refresh=true | result_discarded=true | secrets_logged=false"
-    ));
+    fn prepare(&mut self) -> Result<(), HResult> {
+        if self.prepared {
+            return Ok(());
+        }
+        let authorization = self
+            .authorization
+            .strip_suffix(&[0])
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .ok_or(E_INVALIDARG)?;
+        let policy_header_values = self
+            .policy_header_values
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let body_to_sign = &self.body[..self.body.len().min(self.max_body_bytes)];
+
+        let signature_text = Zeroizing::new(
+            session()
+                .ok_or(E_FAIL)?
+                .signing_key
+                .sign_request(
+                    &self.method,
+                    &self.request_target,
+                    authorization,
+                    &policy_header_values,
+                    body_to_sign,
+                )?,
+        );
+        self.body.zeroize();
+        self.body.clear();
+        self.policy_header_values.zeroize();
+        self.policy_header_values.clear();
+
+        self.signature = signature_text.as_bytes().to_vec();
+        self.signature.push(0);
+        self.signature_utf16 = signature_text.encode_utf16().collect();
+        self.signature_utf16.push(0);
+        self.prepared = true;
+        Ok(())
+    }
+
+    fn required_size(&self) -> Option<usize> {
+        if !self.prepared {
+            return None;
+        }
+        if self.utf16 {
+            self.authorization_utf16
+                .len()
+                .checked_add(self.signature_utf16.len())?
+                .checked_mul(mem::size_of::<u16>())?
+                .checked_add(mem::size_of::<TokenUtf16Data>())
+        } else {
+            self.authorization
+                .len()
+                .checked_add(self.signature.len())?
+                .checked_add(mem::size_of::<TokenData>())
+        }
+    }
 }
 
-unsafe extern "system" fn native_add_probe_complete(async_block: *mut XAsyncBlock) {
-    if async_block.is_null() {
-        return;
+impl Drop for TokenContext {
+    fn drop(&mut self) {
+        self.body.zeroize();
+        self.policy_header_values.zeroize();
+        self.authorization.zeroize();
+        self.authorization_utf16.zeroize();
+        self.signature.zeroize();
+        self.signature_utf16.zeroize();
     }
-
-    let context_ptr = unsafe { (*async_block).context }.cast::<NativeAddProbeContext>();
-    if context_ptr.is_null() {
-        unsafe { drop(Box::from_raw(async_block)) };
-        return;
-    }
-
-    let context = unsafe { Box::from_raw(context_ptr) };
-    let NativeAddProbeContext {
-        relying_party,
-        url,
-        original_options,
-        diagnostic_options,
-    } = *context;
-
-    let mut native_user = ptr::null_mut();
-    let result = native_add_result(async_block, &mut native_user);
-    unsafe { drop(Box::from_raw(async_block)) };
-
-    if result < 0 || native_user.is_null() {
-        bridge_warn(&format!(
-            "pre-XSTS capability probe native Add 未返回用户；无系统账号或 Runtime 拒绝 silent Add | rp={relying_party} | result=0x{:08X} | system_account_optional=true | action=diagnostic-skip",
-            result as u32
-        ));
-        return;
-    }
-
-    let native_xuid = match native_user_id(native_user) {
-        Ok(value) => value,
-        Err(status) => {
-            close_native_user(native_user);
-            bridge_warn(&format!(
-                "pre-XSTS capability probe native 用户身份无法读取；已关闭诊断句柄 | rp={relying_party} | result=0x{:08X} | native_user_is_backing_identity=false | action=diagnostic-skip",
-                status as u32
-            ));
-            return;
-        }
-    };
-    let relation = native_relation(native_xuid);
-
-    bridge_info(&format!(
-        "pre-XSTS capability probe native 用户已建立 | rp={relying_party} | native_xuid={native_xuid} | native_identity_relation={relation} | purpose=trigger-microsoft-auth-capability-only | identity_owner=bloader-virtual-xuser | native_user_is_backing_identity=false | diagnostic_force_refresh=true | result_discarded=true | secrets_logged=false"
-    ));
-
-    let (native_user, native_xuid) = remember_auth_capability_user(native_user, native_xuid);
-    start_native_token_diagnostic_probe(
-        relying_party,
-        url,
-        original_options,
-        diagnostic_options,
-        native_user,
-        native_xuid,
-        false,
-    );
 }
 
-fn start_native_token_diagnostic_probe(
-    relying_party: String,
-    url: String,
-    original_options: u32,
-    diagnostic_options: u32,
-    native_user: XUserHandle,
-    native_xuid: u64,
-    close_native_user_on_complete: bool,
-) {
-    let (Ok(interface), Ok(slot)) = (native_token_interface(), native_token_slot(23)) else {
-        if close_native_user_on_complete {
-            close_native_user(native_user);
+fn token_identity(utf16: bool) -> *const c_void {
+    if utf16 {
+        (&TOKEN_IDENTITY_UTF16 as *const u8).cast()
+    } else {
+        (&TOKEN_IDENTITY_ANSI as *const u8).cast()
+    }
+}
+
+fn token_name(utf16: bool) -> *const c_char {
+    if utf16 {
+        TOKEN_NAME_UTF16.as_ptr().cast()
+    } else {
+        TOKEN_NAME_ANSI.as_ptr().cast()
+    }
+}
+
+unsafe extern "system" fn token_provider(
+    operation: XAsyncOp,
+    provider_data: *const XAsyncProviderData,
+) -> HResult {
+    if provider_data.is_null() {
+        return E_POINTER;
+    }
+    let provider_data = unsafe { &*provider_data };
+    let context = provider_data.context.cast::<TokenContext>();
+    if context.is_null() {
+        return E_POINTER;
+    }
+
+    match operation {
+        XAsyncOp::Begin => unsafe { xasync::schedule(provider_data.async_block, 0) },
+        XAsyncOp::DoWork => {
+            let context = unsafe { &mut *context };
+            let completion = context
+                .prepare()
+                .and_then(|()| context.required_size().ok_or(E_FAIL));
+            match completion {
+                Ok(required_size) => unsafe {
+                    xasync::complete(provider_data.async_block, S_OK, required_size)
+                },
+                Err(error) => unsafe { xasync::complete(provider_data.async_block, error, 0) },
+            }
+            S_OK
         }
-        bridge_warn(&format!(
-            "pre-XSTS capability probe native token 请求无法启动；Token slot 不可用 | rp={relying_party} | native_xuid={native_xuid} | native_user_is_backing_identity=false | action=diagnostic-skip"
-        ));
-        return;
-    };
+        XAsyncOp::GetResult => {
+            let context = unsafe { &*context };
+            let Some(required_size) = context.required_size() else {
+                return E_FAIL;
+            };
+            if provider_data.buffer.is_null() || provider_data.buffer_size < required_size {
+                return E_NOT_SUFFICIENT_BUFFER;
+            }
 
-    let Ok(url) = CString::new(url) else {
-        if close_native_user_on_complete {
-            close_native_user(native_user);
+            if context.utf16 {
+                let data = provider_data.buffer.cast::<TokenUtf16Data>();
+                let token = unsafe { data.add(1).cast::<u16>() };
+                let signature = unsafe { token.add(context.authorization_utf16.len()) };
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        context.authorization_utf16.as_ptr(),
+                        token,
+                        context.authorization_utf16.len(),
+                    );
+                    ptr::copy_nonoverlapping(
+                        context.signature_utf16.as_ptr(),
+                        signature,
+                        context.signature_utf16.len(),
+                    );
+                    data.write(TokenUtf16Data {
+                        token_count: context.authorization_utf16.len() * mem::size_of::<u16>(),
+                        signature_count: context.signature_utf16.len() * mem::size_of::<u16>(),
+                        token,
+                        signature,
+                    });
+                }
+            } else {
+                let data = provider_data.buffer.cast::<TokenData>();
+                let token = unsafe { data.add(1).cast::<u8>() };
+                let signature = unsafe { token.add(context.authorization.len()) };
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        context.authorization.as_ptr(),
+                        token,
+                        context.authorization.len(),
+                    );
+                    ptr::copy_nonoverlapping(
+                        context.signature.as_ptr(),
+                        signature,
+                        context.signature.len(),
+                    );
+                    data.write(TokenData {
+                        token_size: context.authorization.len(),
+                        signature_size: context.signature.len(),
+                        token: token.cast(),
+                        signature: signature.cast(),
+                    });
+                }
+            }
+            S_OK
         }
-        bridge_warn(&format!(
-            "pre-XSTS capability probe URL 包含非法 NUL；跳过 native token 请求 | rp={relying_party} | native_xuid={native_xuid} | native_user_is_backing_identity=false | action=diagnostic-skip"
-        ));
-        return;
+        XAsyncOp::Cancel => S_OK,
+        XAsyncOp::Cleanup => {
+            unsafe {
+                drop(Box::from_raw(context));
+            }
+            S_OK
+        }
+    }
+}
+
+unsafe fn begin_token_request(
+    user: XUserHandle,
+    options: u32,
+    method: &str,
+    url: &str,
+    headers: Vec<RequestHeader>,
+    body_size: usize,
+    body: *const c_void,
+    async_block: *mut XAsyncBlock,
+    utf16: bool,
+) -> HResult {
+    if user.is_null() || async_block.is_null() || (body_size != 0 && body.is_null()) {
+        return E_POINTER;
+    }
+    if options & !TOKEN_OPTIONS_MASK != 0
+        || method.is_empty()
+        || method.len() > MAX_METHOD_LENGTH
+        || !method.is_ascii()
+        || url.is_empty()
+        || url.len() > MAX_URL_LENGTH
+        || !url.is_ascii()
+        || body_size > MAX_REQUEST_BODY_SIZE
+    {
+        return E_INVALIDARG;
+    }
+
+    let body = if body_size == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(body.cast::<u8>(), body_size) }
     };
-    let method = CString::new("GET").expect("static diagnostic method has no interior NUL");
-
-    let context = Box::new(NativeTokenProbeContext {
-        relying_party,
-        native_user,
-        native_xuid,
-        method,
-        url,
-        original_options,
-        diagnostic_options,
-        close_native_user_on_complete,
-    });
-    let method_ptr = context.method.as_ptr();
-    let url_ptr = context.url.as_ptr();
-    let relying_party_for_log = context.relying_party.clone();
-    let context_ptr = Box::into_raw(context);
-
-    let block = Box::new(XAsyncBlock {
-        queue: ptr::null_mut(),
-        context: context_ptr.cast(),
-        callback: Some(native_token_probe_complete),
-        internal: [0; 4],
-    });
-    let block_ptr = Box::into_raw(block);
-
-    type Function = unsafe extern "system" fn(
-        *mut c_void,
-        XUserHandle,
-        u32,
-        *const c_char,
-        *const c_char,
-        usize,
-        *const TokenHeader,
-        usize,
-        *const c_void,
-        *mut XAsyncBlock,
-    ) -> HResult;
-    let function: Function = unsafe { mem::transmute(slot) };
+    let context = match TokenContext::new(user, method, url, headers, body, utf16) {
+        Ok(context) => Box::into_raw(Box::new(context)),
+        Err(error) => return error,
+    };
     let result = unsafe {
-        function(
-            interface,
-            native_user,
-            diagnostic_options,
-            method_ptr,
-            url_ptr,
-            0,
-            ptr::null(),
-            0,
-            ptr::null(),
-            block_ptr,
+        xasync::begin(
+            async_block,
+            context.cast(),
+            token_identity(utf16),
+            token_name(utf16),
+            token_provider,
         )
     };
     if result < 0 {
         unsafe {
-            drop(Box::from_raw(context_ptr));
-            drop(Box::from_raw(block_ptr));
+            drop(Box::from_raw(context));
         }
-        if close_native_user_on_complete {
-            close_native_user(native_user);
-        }
-        bridge_warn(&format!(
-            "pre-XSTS capability probe native token 请求启动失败；诊断请求未进入 Runtime | rp={relying_party_for_log} | native_xuid={native_xuid} | result=0x{:08X} | native_user_is_backing_identity=false | native_final_xsts_reuse=false | original_options=0x{original_options:08X} | diagnostic_options=0x{diagnostic_options:08X} | diagnostic_force_refresh=true | result_returned_to_minecraft=false | secrets_logged=false",
-            result as u32
-        ));
-        return;
     }
-
-    bridge_info(&format!(
-        "pre-XSTS capability probe native token 请求已启动 | rp={relying_party_for_log} | native_xuid={native_xuid} | native_identity_relation={} | mode=trigger-pre-xsts-capability-only | identity_owner=bloader-virtual-xuser | native_user_is_backing_identity=false | native_final_xsts_reuse=false | original_options=0x{original_options:08X} | diagnostic_options=0x{diagnostic_options:08X} | diagnostic_force_refresh=true | result_returned_to_minecraft=false | result_discarded=true | secrets_logged=false",
-        native_relation(native_xuid),
-    ));
-}
-
-unsafe extern "system" fn native_token_probe_complete(async_block: *mut XAsyncBlock) {
-    if async_block.is_null() {
-        return;
-    }
-
-    let context_ptr = unsafe { (*async_block).context }.cast::<NativeTokenProbeContext>();
-    if context_ptr.is_null() {
-        unsafe { drop(Box::from_raw(async_block)) };
-        return;
-    }
-
-    let context = unsafe { Box::from_raw(context_ptr) };
-    let mut result_size = 0usize;
-    let size_status = native_token_result_size(async_block, &mut result_size);
-    unsafe { drop(Box::from_raw(async_block)) };
-
-    bridge_info(&format!(
-        "pre-XSTS capability probe native token 请求完成并丢弃结果 | rp={} | native_xuid={} | native_identity_relation={} | result_size_status=0x{:08X} | result_size={} | original_options=0x{:08X} | diagnostic_options=0x{:08X} | diagnostic_force_refresh=true | identity_owner=bloader-virtual-xuser | native_user_is_backing_identity=false | native_final_xsts_reuse=false | result_returned_to_minecraft=false | token_body_read=false | secrets_logged=false",
-        context.relying_party,
-        context.native_xuid,
-        native_relation(context.native_xuid),
-        size_status as u32,
-        result_size,
-        context.original_options,
-        context.diagnostic_options,
-    ));
-
-    if context.close_native_user_on_complete {
-        close_native_user(context.native_user);
-    }
-}
-
-fn native_token_result_size(async_block: *mut XAsyncBlock, size: *mut usize) -> HResult {
-    let (Ok(interface), Ok(slot)) = (native_token_interface(), native_token_slot(24)) else {
-        return E_FAIL;
-    };
-    type Function = unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, *mut usize) -> HResult;
-    let function: Function = unsafe { mem::transmute(slot) };
-    unsafe { function(interface, async_block, size) }
-}
-
-/// Resolves the only Microsoft Runtime handle that is allowed to feed the
-/// normal `XUserGetTokenAndSignature*` result path.
-///
-/// The fast path is deliberately restricted to a verified same-XUID Windows
-/// user. Different-account and no-system-account sessions must use the
-/// pre-XSTS auth adapter, where Microsoft's device/title credentials and
-/// XSTS/signature machinery remain official while BMCBL supplies only B's
-/// raw UToken before `xsts/authorize`.
-///
-/// Until the pre-XSTS ABI is resolved, that virtual-user route fails closed.
-/// In particular, a native account A may be used to *trigger diagnostics*,
-/// but A is never a backing XUser and A's final XSTS is never returned.
-fn microsoft_auth_capability_for_request(
-    relying_party: &str,
-    url: &str,
-    options: u32,
-) -> Result<MicrosoftAuthCapability, HResult> {
-    let runtime = session().ok_or(E_FAIL)?;
-    if runtime.custom_user_token().is_none() {
-        bridge_warn(&format!(
-            "BMCBL UToken 不可用；拒绝 Xbox Token 请求 | rp={relying_party} | custom_xuid={} | identity_owner=bloader-virtual-xuser | action=fail-closed",
-            runtime.xuid
-        ));
-        return Err(E_FAIL);
-    }
-
-    if let Some(native_user) = xuser::native_user_for_custom_identity() {
-        let key = format!("native:{relying_party}");
-        log_once(key, || {
-            bridge_info(&format!(
-                "BMCBL 账号存在同 XUID 的系统 native XUser；使用 Microsoft Runtime 官方同身份快速路径 | rp={relying_party} | xuid={} | route=same-identity-native-capability | public_identity=bloader-synthetic | native_identity_relation=same | DToken=official | UToken=official-same-user | TToken=official | XSTS=official | signature=official",
-                runtime.xuid,
-            ));
-        });
-        return Ok(MicrosoftAuthCapability::SameIdentity(
-            SameIdentityNativeCapability { user: native_user },
-        ));
-    }
-
-    let cached_capability = cached_auth_capability_user();
-    let native_identity_relation = cached_capability.map_or_else(
-        || match runtime.native_system_xuid_hint {
-            Some(native_xuid) if native_xuid == runtime.xuid => "same-hint-no-verified-capability",
-            Some(_) => "different",
-            None => "none",
-        },
-        |(_, native_xuid)| native_relation(native_xuid),
-    );
-
-    let discovery = pre_xsts::ensure_discovered();
-    if pre_xsts::custom_user_injection_ready()
-        && let Some((native_user, native_xuid)) = cached_capability
-    {
-        let key = format!("pre-xsts-ready:{relying_party}");
-        log_once(key, || {
-            bridge_info(&format!(
-                "pre-XSTS UToken 注入 ABI 已解析；启用跨身份 Microsoft Runtime 认证能力路径 | rp={relying_party} | custom_xuid={} | native_xuid={native_xuid} | native_identity_relation={} | route=virtual-user-pre-xsts-injected | identity_owner=bloader-virtual-xuser | native_user_is_backing_identity=false | DToken=official | UToken=bmcbl-custom | TToken=official | XSTS=official-after-user-substitution | signature=official | secrets_logged=false",
-                runtime.xuid,
-                native_relation(native_xuid),
-            ));
-        });
-        return Ok(MicrosoftAuthCapability::PreXstsInjected {
-            user: native_user,
-            native_xuid,
-        });
-    }
-    if discovery
-        .as_ref()
-        .is_ok_and(|summary| summary.high_confidence_builder_candidates != 0)
-    {
-        start_pre_xsts_diagnostic_probe(relying_party, url, options);
-    }
-    let key = format!("pre-xsts:{relying_party}");
-    log_once(key, || match discovery {
-        Ok(summary) => bridge_warn(&format!(
-            "Virtual XUser(B) 已独立建立；Microsoft Runtime 仅作为认证能力源，但 pre-XSTS UToken 注入 ABI 尚未解析 | rp={relying_party} | custom_xuid={} | route=virtual-user-official-auth-adapter-pending | identity_owner=bloader-virtual-xuser | microsoft_runtime_role=device-title-xsts-signature-capability | custom_utoken_available=true | native_identity_relation={native_identity_relation} | native_user_is_backing_identity=false | native_final_xsts_reuse=false | UserTokens_markers={} | UserTokens_text_xrefs={} | DeviceToken_markers={} | TitleToken_markers={} | XSTS_markers={} | reason=pre-xsts-user-token-provider-unresolved | action=fail-closed",
-            runtime.xuid,
-            summary.user_tokens_markers,
-            summary.user_tokens_xrefs,
-            summary.device_token_markers,
-            summary.title_token_markers,
-            summary.xsts_markers,
-        )),
-        Err(error) => bridge_warn(&format!(
-            "Virtual XUser(B) 已独立建立，但无法定位 Microsoft Runtime pre-XSTS 认证能力聚合点 | rp={relying_party} | custom_xuid={} | route=virtual-user-official-auth-adapter-pending | identity_owner=bloader-virtual-xuser | microsoft_runtime_role=device-title-xsts-signature-capability | custom_utoken_available=true | native_identity_relation={native_identity_relation} | native_user_is_backing_identity=false | native_final_xsts_reuse=false | reason={error} | action=fail-closed",
-            runtime.xuid,
-        )),
-    });
-    Err(E_FAIL)
-}
-
-fn relying_party_for_url(url: &str) -> String {
-    let host = url_host(url).unwrap_or_default();
-    if matches!(
-        host.as_str(),
-        "collections.mp.microsoft.com"
-            | "purchase.mp.microsoft.com"
-            | "displaycatalog.mp.microsoft.com"
-            | "inventory.xboxlive.com"
-            | "licensing.xboxlive.com"
-    ) {
-        LICENSING_RP.to_string()
-    } else if host == "playfabapi.com" || host.ends_with(".playfabapi.com") {
-        PLAYFAB_RP.to_string()
-    } else if host == "multiplayer.minecraft.net" || host.ends_with(".multiplayer.minecraft.net") {
-        MULTIPLAYER_RP.to_string()
-    } else if matches!(
-        host.as_str(),
-        "pocket.realms.minecraft.net"
-            | "bedrock.frontend.realms.minecraft-services.net"
-            | "bedrock.frontendlegacy.realms.minecraft-services.net"
-    ) {
-        REALMS_RP.to_string()
-    } else {
-        XBOX_LIVE_RP.to_string()
-    }
-}
-
-fn url_host(url: &str) -> Option<String> {
-    let authority = url.split_once("://")?.1;
-    let end = authority
-        .char_indices()
-        .find_map(|(index, character)| matches!(character, '/' | '?' | '#').then_some(index))
-        .unwrap_or(authority.len());
-    let authority = &authority[..end];
-    let host_port = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    let host = if let Some(value) = host_port.strip_prefix('[') {
-        value.split_once(']')?.0
-    } else {
-        host_port
-            .split_once(':')
-            .map_or(host_port, |(host, _)| host)
-    };
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
-}
-
-unsafe fn ansi_url(url: *const c_char) -> Result<String, HResult> {
-    if url.is_null() {
-        return Err(E_INVALIDARG);
-    }
-    let value = unsafe { CStr::from_ptr(url) }
-        .to_str()
-        .map_err(|_| E_INVALIDARG)?;
-    if value.is_empty() || value.len() > MAX_URL_BYTES || !value.is_ascii() {
-        return Err(E_INVALIDARG);
-    }
-    Ok(value.to_string())
-}
-
-unsafe fn utf16_url(url: *const u16) -> Result<String, HResult> {
-    if url.is_null() {
-        return Err(E_INVALIDARG);
-    }
-    let mut length = 0usize;
-    while length <= MAX_URL_BYTES / 2 {
-        if unsafe { url.add(length).read() } == 0 {
-            let value = String::from_utf16(unsafe { std::slice::from_raw_parts(url, length) })
-                .map_err(|_| E_INVALIDARG)?;
-            if value.is_empty() || !value.is_ascii() {
-                return Err(E_INVALIDARG);
-            }
-            return Ok(value);
-        }
-        length += 1;
-    }
-    Err(E_INVALIDARG)
+    result
 }
 
 pub unsafe extern "system" fn get_token_and_signature_async(
@@ -638,45 +390,37 @@ pub unsafe extern "system" fn get_token_and_signature_async(
     body: *const c_void,
     async_block: *mut XAsyncBlock,
 ) -> HResult {
-    if !xuser::valid_user(user) {
-        return E_INVALIDARG;
+    if method.is_null()
+        || url.is_null()
+        || header_count > MAX_HEADER_COUNT
+        || (header_count != 0 && headers.is_null())
+    {
+        return E_POINTER;
     }
-    let url_text = hresult_try!(unsafe { ansi_url(url) });
-    let relying_party = relying_party_for_url(&url_text);
-    let capability = hresult_try!(microsoft_auth_capability_for_request(
-        &relying_party,
-        &url_text,
-        options
-    ));
-    let native_user = capability.handle();
 
-    type Function = unsafe extern "system" fn(
-        *mut c_void,
-        XUserHandle,
-        u32,
-        *const c_char,
-        *const c_char,
-        usize,
-        *const TokenHeader,
-        usize,
-        *const c_void,
-        *mut XAsyncBlock,
-    ) -> HResult;
-    let slot = hresult_try!(native_token_slot(23));
-    let interface = hresult_try!(native_token_interface());
-    let function: Function = unsafe { mem::transmute(slot) };
+    let headers = match unsafe { copy_ansi_headers(headers, header_count) } {
+        Ok(headers) => headers,
+        Err(error) => return error,
+    };
+    let method = match unsafe { CStr::from_ptr(method) }.to_str() {
+        Ok(value) if value.len() <= MAX_METHOD_LENGTH && value.is_ascii() => value,
+        _ => return E_INVALIDARG,
+    };
+    let url = match unsafe { CStr::from_ptr(url) }.to_str() {
+        Ok(value) if value.len() <= MAX_URL_LENGTH && value.is_ascii() => value,
+        _ => return E_INVALIDARG,
+    };
     unsafe {
-        function(
-            interface,
-            native_user,
+        begin_token_request(
+            user,
             options,
             method,
             url,
-            header_count,
             headers,
             body_size,
             body,
             async_block,
+            false,
         )
     }
 }
@@ -686,11 +430,7 @@ pub unsafe extern "system" fn get_token_and_signature_result_size(
     async_block: *mut XAsyncBlock,
     size: *mut usize,
 ) -> HResult {
-    type Function = unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, *mut usize) -> HResult;
-    let slot = hresult_try!(native_token_slot(24));
-    let interface = hresult_try!(native_token_interface());
-    let function: Function = unsafe { mem::transmute(slot) };
-    unsafe { function(interface, async_block, size) }
+    unsafe { xasync::get_result_size(async_block, size) }
 }
 
 pub unsafe extern "system" fn get_token_and_signature_result(
@@ -701,18 +441,17 @@ pub unsafe extern "system" fn get_token_and_signature_result(
     data: *mut *mut TokenData,
     used: *mut usize,
 ) -> HResult {
-    type Function = unsafe extern "system" fn(
-        *mut c_void,
-        *mut XAsyncBlock,
-        usize,
-        *mut c_void,
-        *mut *mut TokenData,
-        *mut usize,
-    ) -> HResult;
-    let slot = hresult_try!(native_token_slot(25));
-    let interface = hresult_try!(native_token_interface());
-    let function: Function = unsafe { mem::transmute(slot) };
-    unsafe { function(interface, async_block, size, buffer, data, used) }
+    if async_block.is_null() || buffer.is_null() || data.is_null() {
+        return E_POINTER;
+    }
+    let result =
+        unsafe { xasync::get_result(async_block, token_identity(false), size, buffer, used) };
+    if result >= 0 {
+        unsafe {
+            data.write(buffer.cast());
+        }
+    }
+    result
 }
 
 pub unsafe extern "system" fn get_token_and_signature_utf16_async(
@@ -727,59 +466,45 @@ pub unsafe extern "system" fn get_token_and_signature_utf16_async(
     body: *const c_void,
     async_block: *mut XAsyncBlock,
 ) -> HResult {
-    if !xuser::valid_user(user) {
-        return E_INVALIDARG;
+    if header_count > MAX_HEADER_COUNT || (header_count != 0 && headers.is_null()) {
+        return E_POINTER;
     }
-    let url_text = hresult_try!(unsafe { utf16_url(url) });
-    let relying_party = relying_party_for_url(&url_text);
-    let capability = hresult_try!(microsoft_auth_capability_for_request(
-        &relying_party,
-        &url_text,
-        options
-    ));
-    let native_user = capability.handle();
 
-    type Function = unsafe extern "system" fn(
-        *mut c_void,
-        XUserHandle,
-        u32,
-        *const u16,
-        *const u16,
-        usize,
-        *const TokenUtf16Header,
-        usize,
-        *const c_void,
-        *mut XAsyncBlock,
-    ) -> HResult;
-    let slot = hresult_try!(native_token_slot(26));
-    let interface = hresult_try!(native_token_interface());
-    let function: Function = unsafe { mem::transmute(slot) };
+    let headers = match unsafe { copy_utf16_headers(headers, header_count) } {
+        Ok(headers) => headers,
+        Err(error) => return error,
+    };
+    let method = match unsafe { utf16_to_string_bounded(method, MAX_METHOD_LENGTH) } {
+        Ok(value) if value.is_ascii() => value,
+        Ok(_) => return E_INVALIDARG,
+        Err(error) => return error,
+    };
+    let url = match unsafe { utf16_to_string_bounded(url, MAX_URL_LENGTH) } {
+        Ok(value) if value.is_ascii() => value,
+        Ok(_) => return E_INVALIDARG,
+        Err(error) => return error,
+    };
     unsafe {
-        function(
-            interface,
-            native_user,
+        begin_token_request(
+            user,
             options,
-            method,
-            url,
-            header_count,
+            &method,
+            &url,
             headers,
             body_size,
             body,
             async_block,
+            true,
         )
     }
 }
 
 pub unsafe extern "system" fn get_token_and_signature_utf16_result_size(
-    _interface: *mut c_void,
+    interface: *mut c_void,
     async_block: *mut XAsyncBlock,
     size: *mut usize,
 ) -> HResult {
-    type Function = unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, *mut usize) -> HResult;
-    let slot = hresult_try!(native_token_slot(27));
-    let interface = hresult_try!(native_token_interface());
-    let function: Function = unsafe { mem::transmute(slot) };
-    unsafe { function(interface, async_block, size) }
+    unsafe { get_token_and_signature_result_size(interface, async_block, size) }
 }
 
 pub unsafe extern "system" fn get_token_and_signature_utf16_result(
@@ -790,41 +515,318 @@ pub unsafe extern "system" fn get_token_and_signature_utf16_result(
     data: *mut *mut TokenUtf16Data,
     used: *mut usize,
 ) -> HResult {
-    type Function = unsafe extern "system" fn(
-        *mut c_void,
-        *mut XAsyncBlock,
-        usize,
-        *mut c_void,
-        *mut *mut TokenUtf16Data,
-        *mut usize,
-    ) -> HResult;
-    let slot = hresult_try!(native_token_slot(28));
-    let interface = hresult_try!(native_token_interface());
-    let function: Function = unsafe { mem::transmute(slot) };
-    unsafe { function(interface, async_block, size, buffer, data, used) }
+    if async_block.is_null() || buffer.is_null() || data.is_null() {
+        return E_POINTER;
+    }
+    let result =
+        unsafe { xasync::get_result(async_block, token_identity(true), size, buffer, used) };
+    if result >= 0 {
+        unsafe {
+            data.write(buffer.cast());
+        }
+    }
+    result
+}
+
+unsafe fn copy_ansi_headers(
+    headers: *const TokenHeader,
+    count: usize,
+) -> Result<Vec<RequestHeader>, HResult> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if headers.is_null() {
+        return Err(E_POINTER);
+    }
+
+    let mut copied = Vec::with_capacity(count);
+    for header in unsafe { std::slice::from_raw_parts(headers, count) } {
+        if header.name.is_null() || header.value.is_null() {
+            return Err(E_POINTER);
+        }
+        let name = unsafe { CStr::from_ptr(header.name) }
+            .to_str()
+            .map_err(|_| E_INVALIDARG)?;
+        let value = unsafe { CStr::from_ptr(header.value) }
+            .to_str()
+            .map_err(|_| E_INVALIDARG)?;
+        copied.push(validate_header(name, value)?);
+    }
+    Ok(copied)
+}
+
+unsafe fn copy_utf16_headers(
+    headers: *const TokenUtf16Header,
+    count: usize,
+) -> Result<Vec<RequestHeader>, HResult> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if headers.is_null() {
+        return Err(E_POINTER);
+    }
+
+    let mut copied = Vec::with_capacity(count);
+    for header in unsafe { std::slice::from_raw_parts(headers, count) } {
+        let name = unsafe { utf16_to_string_bounded(header.name, MAX_HEADER_NAME_LENGTH) }?;
+        let value = unsafe { utf16_to_string_bounded(header.value, MAX_HEADER_VALUE_LENGTH) }?;
+        copied.push(validate_header(&name, &value)?);
+    }
+    Ok(copied)
+}
+
+fn validate_header(name: &str, value: &str) -> Result<RequestHeader, HResult> {
+    if name.is_empty()
+        || name.len() > MAX_HEADER_NAME_LENGTH
+        || value.len() > MAX_HEADER_VALUE_LENGTH
+        || !name.is_ascii()
+        || !value.is_ascii()
+        || !name.bytes().all(is_http_token_byte)
+        || value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+    {
+        return Err(E_INVALIDARG);
+    }
+    Ok(RequestHeader {
+        name: name.to_ascii_lowercase(),
+        value: value.to_string(),
+    })
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn is_transport_or_auth_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "signature" | "host" | "content-length"
+    )
+}
+
+fn select_policy_header_values(
+    headers: &[RequestHeader],
+    policy_header_names: &[String],
+) -> Vec<String> {
+    policy_header_names
+        .iter()
+        .map(|policy_name| {
+            headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case(policy_name))
+                .map(|header| header.value.clone())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn signing_policy_for_url(url: &str, headers: &[RequestHeader]) -> SigningPolicy {
+    let host = url_host(url).unwrap_or_default();
+
+    // Microsoft XSAPI's default NSAL maps ordinary *.xboxlive.com endpoints,
+    // including userpresence.xboxlive.com, to policy v1 with no ExtraHeaders
+    // and an 8192-byte body limit. Adding contract/content headers to those
+    // signatures would be incorrect even though those headers are sent.
+    if host == "device.mgt.xboxlive.com" || host == "data-vef.xboxlive.com" {
+        return SigningPolicy::xbox_full_body();
+    }
+    if host == "xboxlive.com" || host.ends_with(".xboxlive.com") {
+        return SigningPolicy::xbox_default();
+    }
+
+    // BLoader currently has no title NSAL payload for custom Partner Center
+    // endpoints. Preserve the caller-provided order as a compatibility
+    // fallback instead of silently discarding every header. Transport-derived
+    // and always-signed headers are excluded.
+    SigningPolicy::caller_headers(headers)
+}
+
+fn relying_party_for_url(url: &str) -> &'static str {
+    let host = url_host(url).unwrap_or_default();
+    if matches!(
+        host.as_str(),
+        "collections.mp.microsoft.com"
+            | "purchase.mp.microsoft.com"
+            | "displaycatalog.mp.microsoft.com"
+            | "inventory.xboxlive.com"
+            | "licensing.xboxlive.com"
+    ) {
+        LICENSING_RP
+    } else if host == "playfabapi.com" || host.ends_with(".playfabapi.com") {
+        PLAYFAB_RP
+    } else if host == "multiplayer.minecraft.net" || host.ends_with(".multiplayer.minecraft.net") {
+        MULTIPLAYER_RP
+    } else if matches!(
+        host.as_str(),
+        "pocket.realms.minecraft.net"
+            | "bedrock.frontend.realms.minecraft-services.net"
+            | "bedrock.frontendlegacy.realms.minecraft-services.net"
+    ) {
+        REALMS_RP
+    } else {
+        XBOX_LIVE_RP
+    }
+}
+
+fn url_host(url: &str) -> Option<String> {
+    let authority = url.split_once("://")?.1;
+    let end = authority
+        .char_indices()
+        .find_map(|(index, character)| matches!(character, '/' | '?' | '#').then_some(index))
+        .unwrap_or(authority.len());
+    let authority = &authority[..end];
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host = if let Some(value) = host_port.strip_prefix('[') {
+        value.split_once(']')?.0
+    } else {
+        host_port.split_once(':').map_or(host_port, |(host, _)| host)
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+fn request_target_from_url(url: &str) -> Option<String> {
+    let authority = url.split_once("://")?.1;
+    if authority.is_empty() {
+        return None;
+    }
+    let start = authority
+        .char_indices()
+        .find_map(|(index, character)| matches!(character, '/' | '?' | '#').then_some(index));
+    let Some(start) = start else {
+        return Some("/".to_string());
+    };
+    let suffix = &authority[start..];
+    if suffix.starts_with('#') {
+        return Some("/".to_string());
+    }
+    let suffix = suffix.split_once('#').map_or(suffix, |(value, _)| value);
+    if suffix.starts_with('?') {
+        Some(format!("/{suffix}"))
+    } else {
+        Some(suffix.to_string())
+    }
+}
+
+unsafe fn utf16_to_string_bounded(value: *const u16, max_units: usize) -> Result<String, HResult> {
+    if value.is_null() {
+        return Err(E_POINTER);
+    }
+    let mut length = 0usize;
+    while length <= max_units && length < MAX_UTF16_INPUT_UNITS {
+        if unsafe { value.add(length).read() } == 0 {
+            return String::from_utf16(unsafe { std::slice::from_raw_parts(value, length) })
+                .map_err(|_| E_INVALIDARG);
+        }
+        length += 1;
+    }
+    Err(E_INVALIDARG)
+}
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn header(name: &str, value: &str) -> RequestHeader {
+        RequestHeader {
+            name: name.to_ascii_lowercase(),
+            value: value.to_string(),
+        }
+    }
+
     #[test]
-    fn maps_known_minecraft_services_to_native_relying_parties() {
+    fn presence_uses_xbox_live_relying_party() {
         assert_eq!(
-            relying_party_for_url("https://userpresence.xboxlive.com/users/xuid(1)"),
-            XBOX_LIVE_RP,
+            relying_party_for_url(
+                "https://userpresence.xboxlive.com/users/xuid(1)/devices/current"
+            ),
+            XBOX_LIVE_RP
+        );
+    }
+
+    #[test]
+    fn known_services_use_specific_tokens() {
+        assert_eq!(
+            relying_party_for_url("https://multiplayer.minecraft.net/authentication"),
+            MULTIPLAYER_RP
         );
         assert_eq!(
             relying_party_for_url("https://b980a380.minecraft.playfabapi.com/Client/Login"),
-            PLAYFAB_RP,
+            PLAYFAB_RP
         );
+    }
+
+    #[test]
+    fn xbox_default_policy_does_not_sign_transport_headers() {
+        let headers = vec![
+            header("x-xbl-contract-version", "3"),
+            header("content-type", "application/json"),
+            header("accept-language", "zh-CN"),
+        ];
+        let policy = signing_policy_for_url(
+            "https://userpresence.xboxlive.com/users/xuid(1)/devices/current/titles/current",
+            &headers,
+        );
+        assert_eq!(policy.max_body_bytes, DEFAULT_XBOX_MAX_BODY_BYTES);
+        assert!(policy.extra_header_names.is_empty());
+    }
+
+    #[test]
+    fn policy_headers_are_case_insensitive_ordered_and_keep_missing_slots() {
+        let headers = vec![
+            header("content-type", "application/json"),
+            header("x-xbl-contract-version", "3"),
+        ];
+        let policy_names = vec![
+            "X-XBL-CONTRACT-VERSION".to_string(),
+            "Accept-Language".to_string(),
+            "Content-Type".to_string(),
+        ];
         assert_eq!(
-            relying_party_for_url("https://multiplayer.minecraft.net/authentication"),
-            MULTIPLAYER_RP,
+            select_policy_header_values(&headers, &policy_names),
+            vec!["3", "", "application/json"]
         );
+    }
+
+    #[test]
+    fn custom_endpoint_fallback_preserves_caller_header_order() {
+        let headers = vec![
+            header("content-type", "application/json"),
+            header("authorization", "ignored"),
+            header("x-custom-policy", "value"),
+        ];
+        let policy = signing_policy_for_url("https://api.example.test/path", &headers);
         assert_eq!(
-            relying_party_for_url("https://pocket.realms.minecraft.net/worlds"),
-            REALMS_RP,
+            policy.extra_header_names,
+            vec!["content-type", "x-custom-policy"]
         );
+    }
+
+    #[test]
+    fn header_validation_rejects_injection() {
+        assert_eq!(validate_header("x-test", "ok\r\nbad"), Err(E_INVALIDARG));
+        assert_eq!(validate_header("bad header", "ok"), Err(E_INVALIDARG));
     }
 }
