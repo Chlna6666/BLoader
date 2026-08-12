@@ -86,6 +86,23 @@ struct NativeTokenProbeContext {
     diagnostic_options: u32,
 }
 
+/// A Microsoft Runtime user handle that has already been verified to represent
+/// exactly the same Xbox identity as the BMCBL virtual XUser.
+///
+/// Keeping this wrapper private is intentional: the normal token forwarding
+/// path cannot accept an arbitrary native user (for example Windows account A)
+/// and therefore cannot accidentally return A's final XSTS for virtual user B.
+#[derive(Clone, Copy)]
+struct SameIdentityNativeCapability {
+    user: XUserHandle,
+}
+
+impl SameIdentityNativeCapability {
+    fn handle(self) -> XUserHandle {
+        self.user
+    }
+}
+
 fn native_add_result(async_block: *mut XAsyncBlock, user: *mut XUserHandle) -> HResult {
     let Ok(interface) = native_token_interface() else {
         return E_FAIL;
@@ -127,10 +144,24 @@ fn close_native_user(user: XUserHandle) {
     unsafe { function(interface, user) };
 }
 
+fn native_relation(native_xuid: u64) -> &'static str {
+    match session() {
+        Some(runtime) if native_xuid == runtime.xuid => "same",
+        Some(_) => "different",
+        None => "unknown",
+    }
+}
+
+/// Triggers Microsoft Runtime's own token machinery only to observe the
+/// pre-XSTS DeviceToken/TitleToken/UserTokens aggregation path.
+///
+/// A native Windows user returned here is a disposable capability-bootstrap
+/// handle. It is never installed as the backing identity for BLoader's public
+/// synthetic XUser and its final token result is never returned to Minecraft.
 fn start_pre_xsts_diagnostic_probe(relying_party: &str, url: &str, options: u32) {
     if !diagnostic_probe_once(relying_party) {
         bridge_info(&format!(
-            "pre-XSTS builder 诊断已存在；跳过重复启动 | rp={relying_party} | reason=diagnostic-already-started | result_discarded=true | secrets_logged=false"
+            "pre-XSTS capability probe 已存在；跳过重复启动 | rp={relying_party} | reason=diagnostic-already-started | native_user_is_backing_identity=false | result_discarded=true | secrets_logged=false"
         ));
         return;
     }
@@ -139,7 +170,7 @@ fn start_pre_xsts_diagnostic_probe(relying_party: &str, url: &str, options: u32)
 
     let (Ok(interface), Ok(slot)) = (native_token_interface(), native_token_slot(7)) else {
         bridge_warn(&format!(
-            "pre-XSTS builder 诊断无法启动 native Add；Microsoft Runtime XUserAddAsync 不可用 | rp={relying_party} | result=no-native-provider | action=diagnostic-skip"
+            "pre-XSTS capability probe 无法启动 native Add；Microsoft Runtime XUserAddAsync 不可用 | rp={relying_party} | system_account_optional=true | result=no-native-provider | action=diagnostic-skip"
         ));
         return;
     };
@@ -169,14 +200,14 @@ fn start_pre_xsts_diagnostic_probe(relying_party: &str, url: &str, options: u32)
             drop(Box::from_raw(block_ptr));
         }
         bridge_warn(&format!(
-            "pre-XSTS builder 诊断 native Add 启动失败；不会触发系统登录 UI | rp={relying_party} | result=0x{:08X} | action=diagnostic-skip",
+            "pre-XSTS capability probe native Add 启动失败；不会触发系统登录 UI | rp={relying_party} | result=0x{:08X} | system_account_optional=true | action=diagnostic-skip",
             result as u32
         ));
         return;
     }
 
     bridge_info(&format!(
-        "pre-XSTS builder 诊断 native Add 已启动 | rp={relying_party} | mode=silent-diagnostic | system_login_ui=not-invoked | original_options=0x{options:08X} | diagnostic_options=0x{diagnostic_options:08X} | diagnostic_force_refresh=true | result_discarded=true | secrets_logged=false"
+        "pre-XSTS capability probe native Add 已启动 | rp={relying_party} | mode=silent-diagnostic | identity_owner=bloader-virtual-xuser | microsoft_runtime_role=auth-capability-only | native_user_is_backing_identity=false | system_login_ui=not-invoked | original_options=0x{options:08X} | diagnostic_options=0x{diagnostic_options:08X} | diagnostic_force_refresh=true | result_discarded=true | secrets_logged=false"
     ));
 }
 
@@ -205,7 +236,7 @@ unsafe extern "system" fn native_add_probe_complete(async_block: *mut XAsyncBloc
 
     if result < 0 || native_user.is_null() {
         bridge_warn(&format!(
-            "pre-XSTS builder 诊断 native Add 未返回用户；无系统账号或 Runtime 拒绝 silent Add | rp={relying_party} | result=0x{:08X} | action=diagnostic-skip",
+            "pre-XSTS capability probe native Add 未返回用户；无系统账号或 Runtime 拒绝 silent Add | rp={relying_party} | result=0x{:08X} | system_account_optional=true | action=diagnostic-skip",
             result as u32
         ));
         return;
@@ -216,15 +247,16 @@ unsafe extern "system" fn native_add_probe_complete(async_block: *mut XAsyncBloc
         Err(status) => {
             close_native_user(native_user);
             bridge_warn(&format!(
-                "pre-XSTS builder 诊断 native 用户身份无法读取；已关闭诊断句柄 | rp={relying_party} | result=0x{:08X} | action=diagnostic-skip",
+                "pre-XSTS capability probe native 用户身份无法读取；已关闭诊断句柄 | rp={relying_party} | result=0x{:08X} | native_user_is_backing_identity=false | action=diagnostic-skip",
                 status as u32
             ));
             return;
         }
     };
+    let relation = native_relation(native_xuid);
 
     bridge_info(&format!(
-        "pre-XSTS builder 诊断 native 用户已建立 | rp={relying_party} | native_xuid={native_xuid} | purpose=trigger-builder-probe-only | diagnostic_force_refresh=true | result_discarded=true | secrets_logged=false"
+        "pre-XSTS capability probe native 用户已建立 | rp={relying_party} | native_xuid={native_xuid} | native_identity_relation={relation} | purpose=trigger-microsoft-auth-capability-only | identity_owner=bloader-virtual-xuser | native_user_is_backing_identity=false | diagnostic_force_refresh=true | result_discarded=true | secrets_logged=false"
     ));
 
     start_native_token_diagnostic_probe(
@@ -248,7 +280,7 @@ fn start_native_token_diagnostic_probe(
     let (Ok(interface), Ok(slot)) = (native_token_interface(), native_token_slot(23)) else {
         close_native_user(native_user);
         bridge_warn(&format!(
-            "pre-XSTS builder 诊断 native token 请求无法启动；Token slot 不可用 | rp={relying_party} | native_xuid={native_xuid} | action=diagnostic-skip"
+            "pre-XSTS capability probe native token 请求无法启动；Token slot 不可用 | rp={relying_party} | native_xuid={native_xuid} | native_user_is_backing_identity=false | action=diagnostic-skip"
         ));
         return;
     };
@@ -256,7 +288,7 @@ fn start_native_token_diagnostic_probe(
     let Ok(url) = CString::new(url) else {
         close_native_user(native_user);
         bridge_warn(&format!(
-            "pre-XSTS builder 诊断 URL 包含非法 NUL；跳过 native token 请求 | rp={relying_party} | native_xuid={native_xuid} | action=diagnostic-skip"
+            "pre-XSTS capability probe URL 包含非法 NUL；跳过 native token 请求 | rp={relying_party} | native_xuid={native_xuid} | native_user_is_backing_identity=false | action=diagnostic-skip"
         ));
         return;
     };
@@ -318,14 +350,15 @@ fn start_native_token_diagnostic_probe(
         }
         close_native_user(native_user);
         bridge_warn(&format!(
-            "pre-XSTS builder 诊断 native token 请求启动失败；已关闭诊断 native 句柄 | rp={relying_party_for_log} | native_xuid={native_xuid} | result=0x{:08X} | original_options=0x{original_options:08X} | diagnostic_options=0x{diagnostic_options:08X} | diagnostic_force_refresh=true | result_returned_to_minecraft=false | secrets_logged=false",
+            "pre-XSTS capability probe native token 请求启动失败；已关闭诊断 native 句柄 | rp={relying_party_for_log} | native_xuid={native_xuid} | result=0x{:08X} | native_user_is_backing_identity=false | native_final_xsts_reuse=false | original_options=0x{original_options:08X} | diagnostic_options=0x{diagnostic_options:08X} | diagnostic_force_refresh=true | result_returned_to_minecraft=false | secrets_logged=false",
             result as u32
         ));
         return;
     }
 
     bridge_info(&format!(
-        "pre-XSTS builder 诊断 native token 请求已启动 | rp={relying_party_for_log} | native_xuid={native_xuid} | mode=trigger-builder-probe-only | original_options=0x{original_options:08X} | diagnostic_options=0x{diagnostic_options:08X} | diagnostic_force_refresh=true | result_returned_to_minecraft=false | result_discarded=true | secrets_logged=false"
+        "pre-XSTS capability probe native token 请求已启动 | rp={relying_party_for_log} | native_xuid={native_xuid} | native_identity_relation={} | mode=trigger-pre-xsts-capability-only | identity_owner=bloader-virtual-xuser | native_user_is_backing_identity=false | native_final_xsts_reuse=false | original_options=0x{original_options:08X} | diagnostic_options=0x{diagnostic_options:08X} | diagnostic_force_refresh=true | result_returned_to_minecraft=false | result_discarded=true | secrets_logged=false",
+        native_relation(native_xuid),
     ));
 }
 
@@ -346,9 +379,10 @@ unsafe extern "system" fn native_token_probe_complete(async_block: *mut XAsyncBl
     unsafe { drop(Box::from_raw(async_block)) };
 
     bridge_info(&format!(
-        "pre-XSTS builder 诊断 native token 请求完成并丢弃结果 | rp={} | native_xuid={} | result_size_status=0x{:08X} | result_size={} | original_options=0x{:08X} | diagnostic_options=0x{:08X} | diagnostic_force_refresh=true | result_returned_to_minecraft=false | token_body_read=false | secrets_logged=false",
+        "pre-XSTS capability probe native token 请求完成并丢弃结果 | rp={} | native_xuid={} | native_identity_relation={} | result_size_status=0x{:08X} | result_size={} | original_options=0x{:08X} | diagnostic_options=0x{:08X} | diagnostic_force_refresh=true | identity_owner=bloader-virtual-xuser | native_user_is_backing_identity=false | native_final_xsts_reuse=false | result_returned_to_minecraft=false | token_body_read=false | secrets_logged=false",
         context.relying_party,
         context.native_xuid,
+        native_relation(context.native_xuid),
         size_status as u32,
         result_size,
         context.original_options,
@@ -367,21 +401,27 @@ fn native_token_result_size(async_block: *mut XAsyncBlock, size: *mut usize) -> 
     unsafe { function(interface, async_block, size) }
 }
 
-/// Selects an official Microsoft user only when Windows already exposes the
-/// exact same XUID as the BMCBL session. The public XUser handle remains the
-/// synthetic BMCBL object and is never passed into the official Runtime.
+/// Resolves the only Microsoft Runtime handle that is allowed to feed the
+/// normal `XUserGetTokenAndSignature*` result path.
 ///
-/// Different-account and no-system-account cases intentionally share the same
-/// path: neither is allowed to borrow an unrelated native user's final XSTS.
-fn official_user_for_request(
+/// The fast path is deliberately restricted to a verified same-XUID Windows
+/// user. Different-account and no-system-account sessions must use the
+/// pre-XSTS auth adapter, where Microsoft's device/title credentials and
+/// XSTS/signature machinery remain official while BMCBL supplies only B's
+/// raw UToken before `xsts/authorize`.
+///
+/// Until the pre-XSTS ABI is resolved, that virtual-user route fails closed.
+/// In particular, a native account A may be used to *trigger diagnostics*,
+/// but A is never a backing XUser and A's final XSTS is never returned.
+fn microsoft_auth_capability_for_request(
     relying_party: &str,
     url: &str,
     options: u32,
-) -> Result<XUserHandle, HResult> {
+) -> Result<SameIdentityNativeCapability, HResult> {
     let runtime = session().ok_or(E_FAIL)?;
     if runtime.custom_user_token().is_none() {
         bridge_warn(&format!(
-            "BMCBL UToken 不可用；拒绝 Xbox Token 请求 | rp={relying_party} | custom_xuid={} | action=fail-closed",
+            "BMCBL UToken 不可用；拒绝 Xbox Token 请求 | rp={relying_party} | custom_xuid={} | identity_owner=bloader-virtual-xuser | action=fail-closed",
             runtime.xuid
         ));
         return Err(E_FAIL);
@@ -391,12 +431,18 @@ fn official_user_for_request(
         let key = format!("native:{relying_party}");
         log_once(key, || {
             bridge_info(&format!(
-                "BMCBL 账号存在同 XUID 的系统 native XUser；使用 Microsoft Runtime 官方 Token 快速路径 | rp={relying_party} | xuid={} | route=same-account-native-capability | DToken=official | UToken=official-same-user | TToken=official | XSTS=official | signature=official",
+                "BMCBL 账号存在同 XUID 的系统 native XUser；使用 Microsoft Runtime 官方同身份快速路径 | rp={relying_party} | xuid={} | route=same-identity-native-capability | public_identity=bloader-synthetic | native_identity_relation=same | DToken=official | UToken=official-same-user | TToken=official | XSTS=official | signature=official",
                 runtime.xuid,
             ));
         });
-        return Ok(native_user);
+        return Ok(SameIdentityNativeCapability { user: native_user });
     }
+
+    let native_identity_relation = match runtime.native_system_xuid_hint {
+        Some(native_xuid) if native_xuid == runtime.xuid => "same-hint-no-verified-capability",
+        Some(_) => "different",
+        None => "none",
+    };
 
     let discovery = pre_xsts::ensure_discovered();
     if discovery
@@ -408,7 +454,7 @@ fn official_user_for_request(
     let key = format!("pre-xsts:{relying_party}");
     log_once(key, || match discovery {
         Ok(summary) => bridge_warn(&format!(
-            "BMCBL custom XUser 已独立于系统账号建立，但官方 pre-XSTS UToken 注入 ABI 尚未解析 | rp={relying_party} | custom_xuid={} | route=custom-user-pre-xsts-pending | custom_utoken_available=true | native_matching_user=false | UserTokens_markers={} | UserTokens_text_xrefs={} | DeviceToken_markers={} | TitleToken_markers={} | XSTS_markers={} | reason=pre-xsts-user-token-provider-unresolved | action=fail-closed",
+            "Virtual XUser(B) 已独立建立；Microsoft Runtime 仅作为认证能力源，但 pre-XSTS UToken 注入 ABI 尚未解析 | rp={relying_party} | custom_xuid={} | route=virtual-user-official-auth-adapter-pending | identity_owner=bloader-virtual-xuser | microsoft_runtime_role=device-title-xsts-signature-capability | custom_utoken_available=true | native_identity_relation={native_identity_relation} | native_user_is_backing_identity=false | native_final_xsts_reuse=false | UserTokens_markers={} | UserTokens_text_xrefs={} | DeviceToken_markers={} | TitleToken_markers={} | XSTS_markers={} | reason=pre-xsts-user-token-provider-unresolved | action=fail-closed",
             runtime.xuid,
             summary.user_tokens_markers,
             summary.user_tokens_xrefs,
@@ -417,7 +463,7 @@ fn official_user_for_request(
             summary.xsts_markers,
         )),
         Err(error) => bridge_warn(&format!(
-            "BMCBL custom XUser 已独立于系统账号建立，但无法定位官方 pre-XSTS UToken 聚合点 | rp={relying_party} | custom_xuid={} | route=custom-user-pre-xsts-pending | custom_utoken_available=true | native_matching_user=false | reason={error} | action=fail-closed",
+            "Virtual XUser(B) 已独立建立，但无法定位 Microsoft Runtime pre-XSTS 认证能力聚合点 | rp={relying_party} | custom_xuid={} | route=virtual-user-official-auth-adapter-pending | identity_owner=bloader-virtual-xuser | microsoft_runtime_role=device-title-xsts-signature-capability | custom_utoken_available=true | native_identity_relation={native_identity_relation} | native_user_is_backing_identity=false | native_final_xsts_reuse=false | reason={error} | action=fail-closed",
             runtime.xuid,
         )),
     });
@@ -516,7 +562,9 @@ pub unsafe extern "system" fn get_token_and_signature_async(
     }
     let url_text = hresult_try!(unsafe { ansi_url(url) });
     let relying_party = relying_party_for_url(&url_text);
-    let native_user = hresult_try!(official_user_for_request(&relying_party, &url_text, options));
+    let capability =
+        hresult_try!(microsoft_auth_capability_for_request(&relying_party, &url_text, options));
+    let native_user = capability.handle();
 
     type Function = unsafe extern "system" fn(
         *mut c_void,
@@ -600,7 +648,9 @@ pub unsafe extern "system" fn get_token_and_signature_utf16_async(
     }
     let url_text = hresult_try!(unsafe { utf16_url(url) });
     let relying_party = relying_party_for_url(&url_text);
-    let native_user = hresult_try!(official_user_for_request(&relying_party, &url_text, options));
+    let capability =
+        hresult_try!(microsoft_auth_capability_for_request(&relying_party, &url_text, options));
+    let native_user = capability.handle();
 
     type Function = unsafe extern "system" fn(
         *mut c_void,
