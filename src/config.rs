@@ -14,6 +14,13 @@ const DEFAULT_RELOAD_HOTKEY_VK: u32 = 0x78;
 #[cfg(feature = "panel-ui")]
 const DEFAULT_OVERLAY_BLUR_STRENGTH: f32 = 1.0;
 const DEFAULT_REDIRECTION_ROOT: &str = "Minecraft Bedrock";
+const REMOVED_CONFIG_KEYS: &[&str] = &[
+    "xgameruntime_redirection",
+    "editor_mode",
+    "lock_mouse_on_launch",
+    "unlock_mouse_hotkey",
+    "reduce_pixels",
+];
 
 #[cfg(feature = "panel-ui")]
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,20 +62,11 @@ pub struct Config {
     #[serde(default = "default_false")]
     pub enable_redirection: bool,
 
-    #[serde(default = "default_false")]
-    pub editor_mode: bool,
-
-    #[serde(default = "default_false")]
-    pub lock_mouse_on_launch: bool,
-
-    #[serde(default = "default_unlock_mouse_hotkey")]
-    pub unlock_mouse_hotkey: String,
-
-    #[serde(default = "default_reduce_pixels")]
-    pub reduce_pixels: i32,
-
     #[serde(default = "default_redirection_root")]
     pub redirection_root: String,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vanilla_skin_pack_redirect: Option<String>,
 
     #[serde(default)]
     pub file_redirections: Vec<FileRedirectionConfig>,
@@ -128,14 +126,6 @@ fn default_false() -> bool {
 
 fn default_true() -> bool {
     true
-}
-
-fn default_unlock_mouse_hotkey() -> String {
-    "ALT".to_string()
-}
-
-fn default_reduce_pixels() -> i32 {
-    20
 }
 
 fn default_network_listen_port() -> u16 {
@@ -216,11 +206,8 @@ impl Default for Config {
         Self {
             enable_debug_console: false,
             enable_redirection: false,
-            editor_mode: false,
-            lock_mouse_on_launch: false,
-            unlock_mouse_hotkey: default_unlock_mouse_hotkey(),
-            reduce_pixels: default_reduce_pixels(),
             redirection_root: default_redirection_root(),
+            vanilla_skin_pack_redirect: None,
             file_redirections: Vec::new(),
             mods: Vec::new(),
             disable_mod_loading: false,
@@ -313,7 +300,10 @@ fn is_config_file_outdated(content: &str, loaded_cfg: &Config) -> bool {
         return true;
     };
 
-    if disk_obj.contains_key("xgameruntime_redirection") {
+    if REMOVED_CONFIG_KEYS
+        .iter()
+        .any(|key| disk_obj.contains_key(*key))
+    {
         return true;
     }
 
@@ -324,6 +314,28 @@ fn is_config_file_outdated(content: &str, loaded_cfg: &Config) -> bool {
     }
 
     false
+}
+
+fn merged_config_json(content: Option<&str>, config: &Config) -> std::io::Result<String> {
+    let mut output = content
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let typed = serde_json::to_value(config)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let typed = typed
+        .as_object()
+        .ok_or_else(|| std::io::Error::other("serialized config is not a JSON object"))?;
+
+    for key in REMOVED_CONFIG_KEYS {
+        output.remove(*key);
+    }
+    for (key, value) in typed {
+        output.insert(key.clone(), value.clone());
+    }
+
+    serde_json::to_string_pretty(&output)
+        .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
 impl Config {
@@ -344,14 +356,14 @@ impl Config {
         }
 
         if let Ok(content) = fs::read_to_string(&config_path) {
-            if let Ok(cfg) = serde_json::from_str::<Config>(&content) {
+            if let Ok(mut cfg) = serde_json::from_str::<Config>(&content) {
                 #[cfg(feature = "panel-ui")]
                 {
                     cfg.overlay.blur_strength = clamp_overlay_blur_strength(cfg.overlay.blur_strength);
                 }
                 if is_config_file_outdated(&content, &cfg) {
                     if file_io_policy::writes_allowed() {
-                        logging::info_message(&format!("[config] Discovered outdated config.json schema; automatically syncing current schema to disk at {}", config_path.display()));
+                        logging::info_message(&format!("[config] Discovered outdated config.json schema; synchronizing BLoader-owned fields without deleting launcher-owned fields at {}", config_path.display()));
                         let _ = cfg.save();
                     } else {
                         logging::info_message(
@@ -397,9 +409,10 @@ impl Config {
             return Ok(());
         }
 
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let res = fs::write(config_path(), json);
+        let path = config_path();
+        let existing = fs::read_to_string(&path).ok();
+        let json = merged_config_json(existing.as_deref(), self)?;
+        let res = fs::write(path, json);
         if res.is_ok() {
             Self::apply_update(self);
         }
@@ -439,6 +452,7 @@ mod tests {
                 "disable_mod_loading": true,
                 "enable_redirection": true,
                 "redirection_root": "C:\\Games\\Minecraft\\Minecraft Bedrock",
+                "vanilla_skin_pack_redirect": "C:\\BMCBL\\skin_packs\\custom",
                 "file_redirections": [
                     {
                         "source": "C:\\Games\\Minecraft\\data\\skin_packs\\vanilla",
@@ -453,6 +467,10 @@ mod tests {
 
         assert!(config.disable_mod_loading);
         assert!(config.enable_redirection);
+        assert_eq!(
+            config.vanilla_skin_pack_redirect.as_deref(),
+            Some(r"C:\BMCBL\skin_packs\custom")
+        );
         #[cfg(feature = "panel-ui")]
         assert!(!config.enable_dx11);
         assert_eq!(config.file_redirections.len(), 1);
@@ -463,9 +481,11 @@ mod tests {
     fn config_defaults_to_relative_redirection_root() {
         let config = Config::default();
         assert_eq!(config.redirection_root, DEFAULT_REDIRECTION_ROOT);
+        assert!(config.vanilla_skin_pack_redirect.is_none());
 
         let parsed: Config = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(parsed.redirection_root, DEFAULT_REDIRECTION_ROOT);
+        assert!(parsed.vanilla_skin_pack_redirect.is_none());
     }
 
     #[test]
@@ -473,11 +493,8 @@ mod tests {
         let json = r#"{
           "enable_debug_console": true,
           "enable_redirection": false,
-          "editor_mode": false,
           "disable_mod_loading": false,
-          "lock_mouse_on_launch": false,
-          "unlock_mouse_hotkey": "ALT",
-          "reduce_pixels": 20,
+          "vanilla_skin_pack_redirect": null,
           "file_redirections": [],
           "redirection_root": "Minecraft Bedrock",
           "mods": []
@@ -486,11 +503,8 @@ mod tests {
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.enable_debug_console);
         assert!(!config.enable_redirection);
-        assert!(!config.editor_mode);
         assert!(!config.disable_mod_loading);
-        assert!(!config.lock_mouse_on_launch);
-        assert_eq!(config.unlock_mouse_hotkey, "ALT");
-        assert_eq!(config.reduce_pixels, 20);
+        assert!(config.vanilla_skin_pack_redirect.is_none());
         assert_eq!(config.redirection_root, "Minecraft Bedrock");
     }
 
@@ -506,5 +520,37 @@ mod tests {
 
         let complete_json = serde_json::to_string_pretty(&loaded).unwrap();
         assert!(!is_config_file_outdated(&complete_json, &loaded));
+    }
+
+    #[test]
+    fn config_sync_removes_dead_bloader_fields_and_preserves_launcher_fields() {
+        let legacy_json = r#"{
+          "editor_mode": false,
+          "lock_mouse_on_launch": false,
+          "unlock_mouse_hotkey": "ALT",
+          "reduce_pixels": 20,
+          "shortcut_silent_launch": true,
+          "launcher_owned_value": "keep-me"
+        }"#;
+        let config: Config = serde_json::from_str(legacy_json).unwrap();
+        assert!(is_config_file_outdated(legacy_json, &config));
+
+        let merged = merged_config_json(Some(legacy_json), &config).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        let object = value.as_object().unwrap();
+
+        for key in [
+            "editor_mode",
+            "lock_mouse_on_launch",
+            "unlock_mouse_hotkey",
+            "reduce_pixels",
+        ] {
+            assert!(!object.contains_key(key));
+        }
+        assert_eq!(object.get("shortcut_silent_launch"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            object.get("launcher_owned_value"),
+            Some(&serde_json::json!("keep-me"))
+        );
     }
 }
