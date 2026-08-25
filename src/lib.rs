@@ -313,6 +313,7 @@ unsafe fn bootstrap(
     );
 
     let game_dir = utils::get_exe_directory();
+    core::launch_info::install(&game_dir);
     let native_preload_summary = core::loader::publish_native_preload_reports();
     let native_load_failure_message = core::loader::required_native_failure_message();
     let native_load_success_message = core::loader::native_success_notification_message();

@@ -1,5 +1,6 @@
 pub mod console;
 pub mod file_redirection;
+pub mod launch_info;
 pub mod loader;
 pub mod network_hook;
 pub mod pre_main_gate;
