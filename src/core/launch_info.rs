@@ -174,7 +174,7 @@ pub fn install(game_dir: &Path) -> bool {
     logging::scoped_info_message(
         "launch-info",
         &format!(
-            "installed {installed} in-memory hooks | target=vanilla/texts/*.lang | text=©Mojang AB / BMCBL , BLoader {} | disk_mutation=none | shadow_files=none",
+            "installed {installed} in-memory hooks | target=vanilla/texts/*.lang | text=© Mojang AB · BMCBL · BLoader v{} | disk_mutation=none | shadow_files=none",
             build_info::VERSION
         ),
     );
@@ -628,7 +628,7 @@ fn classify_handle(
             return None;
         };
         let launch_text = format!(
-            "©Mojang AB / BMCBL , BLoader {}",
+            "© Mojang AB · BMCBL · BLoader v{}",
             build_info::VERSION
         );
         let rewritten: Arc<[u8]> = rewrite_language_bytes(&original, &launch_text).into();
@@ -863,7 +863,7 @@ fn rewrite_language_bytes(input: &[u8], launch_text: &str) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    const TEST_TEXT: &str = "©Mojang AB / BMCBL , BLoader 0.2.77";
+    const TEST_TEXT: &str = "© Mojang AB · BMCBL · BLoader v0.2.77";
 
     #[test]
     fn rewrites_copyright_without_touching_other_keys() {
