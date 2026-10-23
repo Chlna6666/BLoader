@@ -913,16 +913,22 @@ fn level_rank(level: Level) -> u8 {
     }
 }
 
+// Preserve millisecond timestamps in events/files but keep the interactive
+// console compact. External log history may also supply fractional seconds.
+fn compact_console_clock(timestamp: &str) -> &str {
+    timestamp.get(..8).unwrap_or(timestamp)
+}
+
 fn format_console_line_at(timestamp: &str, level: Level, scope: &str, message: &str) -> String {
+    let timestamp = compact_console_clock(timestamp);
     let level_text = level_label(level);
-    let sequence = CONSOLE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let source = truncate(&console_source(scope), 28);
     let message = localized_console_message(scope, message)
         .replace('\r', "")
         .replace('\n', " | ");
 
     if !console_supports_ansi() {
-        return format!("[{timestamp} {level_text} #{sequence:06}] [{source}] {message}\r\n");
+        return format!("[{timestamp} {level_text}] [{source}] {message}\r\n");
     }
 
     let level_color = match level {
@@ -935,7 +941,7 @@ fn format_console_line_at(timestamp: &str, level: Level, scope: &str, message: &
     let source_color = source_color(scope, &source);
 
     format!(
-        "\x1b[38;2;120;126;136m[{timestamp} \x1b[0m{level_color}{level_text}\x1b[38;2;120;126;136m #{sequence:06}]\x1b[0m {source_color}[{source}]\x1b[0m \x1b[38;2;220;224;230m{message}\x1b[0m\r\n"
+        "\x1b[38;2;120;126;136m[{timestamp} \x1b[0m{level_color}{level_text}\x1b[38;2;120;126;136m]\x1b[0m {source_color}[{source}]\x1b[0m \x1b[38;2;220;224;230m{message}\x1b[0m\r\n"
     )
 }
 
@@ -1158,9 +1164,8 @@ fn write_bytes_to_bootstrap_file(bytes: &[u8]) {
     }
 }
 
-// This dispatcher is the only structured-console writer. The lock covers both
-// sequence assignment and the complete output write, so concurrent producers
-// cannot cause displayed sequence numbers to overtake each other.
+// This dispatcher is the only structured-console writer. The lock covers
+// the complete output write, preventing interleaved lines from producers.
 fn write_console_record_at(clock: &str, level: Level, scope: &str, message: &str) {
     let _guard = console_write_lock()
         .lock()
@@ -1239,5 +1244,27 @@ fn write_debug_string(line: &str) {
     let wide: Vec<u16> = line.encode_utf16().chain(Some(0)).collect();
     unsafe {
         OutputDebugStringW(wide.as_ptr());
+    }
+}
+
+#[cfg(test)]
+mod compact_console_tests {
+    use super::*;
+
+    #[test]
+    fn console_uses_second_precision_without_sequence() {
+        assert_eq!(compact_console_clock("10:09:04.376"), "10:09:04");
+        assert_eq!(compact_console_clock("10:09:04"), "10:09:04");
+
+        let rendered = format_console_line_at(
+            "10:09:04.376",
+            Level::INFO,
+            "mod:Cosmetics",
+            "Native module loaded",
+        );
+        assert!(rendered.contains("10:09:04"));
+        assert!(rendered.contains("[Cosmetics]"));
+        assert!(!rendered.contains("10:09:04.376"));
+        assert!(!rendered.contains("#000"));
     }
 }
