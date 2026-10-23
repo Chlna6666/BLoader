@@ -203,14 +203,56 @@ fn is_public_runtime_info_key(key: &str) -> bool {
         .any(|prefix| key.starts_with(prefix))
 }
 
+// The BL API is also used from Mod-owned worker threads. Those threads do
+// not inherit ACTIVE_MOD_NAME, so the old fallback emitted [BLoader/BL] while
+// the message itself already contained [Mod Name]. Resolve this exactly like
+// standalone native-Mod console output, but only trust registered BL identities.
+fn resolve_host_log<'a>(
+    message: &'a str,
+    active_mod: Option<&str>,
+    resolve_registered: impl FnOnce(&str) -> Option<String>,
+) -> (String, &'a str) {
+    let prefix = message.strip_prefix('[').and_then(|rest| {
+        let (name, tail) = rest.split_once(']')?;
+        if name.is_empty() || name.len() > 64 || name.chars().any(char::is_control) {
+            return None;
+        }
+        Some((name, tail))
+    });
+
+    let registered = if active_mod.is_none() {
+        prefix.as_ref().and_then(|(name, _)| resolve_registered(name))
+    } else {
+        None
+    };
+
+    let owner = active_mod
+        .map(str::to_string)
+        .or_else(|| registered.clone())
+        .unwrap_or_else(|| "BL".to_string());
+    let body = match prefix {
+        Some((name, tail))
+            if name.eq_ignore_ascii_case(&owner) || registered.is_some() =>
+        {
+            tail.trim_start()
+        }
+        _ => message,
+    };
+    (format!("mod:{owner}"), body)
+}
+
 unsafe extern "system" fn host_log(level: u32, message: BlStringView) {
     let msg = view_to_string(message);
-    let scope = current_mod_name().unwrap_or_else(|| "BL".to_string());
+    let (scope, body) = resolve_host_log(&msg, current_mod_name().as_deref(), |name| {
+        mod_diagnostics::find_by_name(name)
+            .filter(|identity| identity.kind.eq_ignore_ascii_case("BL"))
+            .map(|identity| identity.name)
+    });
     match level {
-        BL_LOG_DEBUG => logging::scoped_debug_message(&scope, &msg),
-        BL_LOG_WARN => logging::scoped_warn_message(&scope, &msg),
-        BL_LOG_ERROR => logging::scoped_error_message(&scope, &msg),
-        _ => logging::scoped_info_message(&scope, &msg),
+        BL_LOG_DEBUG => logging::scoped_debug_message(&scope, body),
+        BL_LOG_WARN => logging::scoped_warn_message(&scope, body),
+        BL_LOG_ERROR => logging::scoped_error_message(&scope, body),
+        _ => logging::scoped_info_message(&scope, body),
     }
 }
 
@@ -715,6 +757,45 @@ fn process_working_set_mb() -> u64 { 0 }
 mod tests {
     use super::{host_get_runtime_info, is_public_runtime_info_key};
     use crate::bl::abi::BlStringView;
+    #[test]
+    fn worker_thread_log_uses_registered_bl_mod_instead_of_bloader_bl() {
+        let (scope, body) = super::resolve_host_log(
+            "[BLoader DevTools] UI_WINDOW_SHOWN_BY_DEFAULT; hotkey is optional",
+            None,
+            |name| (name == "BLoader DevTools").then(|| name.to_string()),
+        );
+        assert_eq!(scope, "mod:BLoader DevTools");
+        assert_eq!(body, "UI_WINDOW_SHOWN_BY_DEFAULT; hotkey is optional");
+    }
+
+    #[test]
+    fn callback_log_deduplicates_module_prefix() {
+        let (scope, body) = super::resolve_host_log(
+            "[BLoader DevTools] UI_THREAD_STARTED",
+            Some("BLoader DevTools"),
+            |_| panic!("active callback must not query registered identity"),
+        );
+        assert_eq!(scope, "mod:BLoader DevTools");
+        assert_eq!(body, "UI_THREAD_STARTED");
+    }
+
+    #[test]
+    fn unknown_mod_does_not_spoof_registered_owner() {
+        let message = "[Other Mod] arbitrary message";
+        let (scope, body) = super::resolve_host_log(message, None, |_| None);
+        assert_eq!(scope, "mod:BL");
+        assert_eq!(body, message);
+    }
+
+    #[test]
+    fn unprefixed_log_keeps_active_mod_identity() {
+        let (scope, body) = super::resolve_host_log(
+            "loading textures", Some("BLoader DevTools"), |_| None,
+        );
+        assert_eq!(scope, "mod:BLoader DevTools");
+        assert_eq!(body, "loading textures");
+    }
+
 
     #[test]
     fn exposes_the_symbol_mapping_runtime_info_keys() {
