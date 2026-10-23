@@ -170,7 +170,8 @@ pub unsafe fn activate_console_logging() {
     }
 
     configure_output(h_conout);
-    emit_runtime_identity();
+    // i18n is not configured during the priority native preload stage.
+    // Attach the log sink now; publish localized host identity after OEP.
     logging::set_console_handle(h_conout);
     logging::scoped_debug_message(
         "console",
@@ -233,6 +234,7 @@ pub unsafe fn init_console() {
     init_console_window_early();
     activate_console_logging();
     bind_process_stdio();
+    emit_runtime_identity();
 }
 
 fn open_conout() -> HANDLE {

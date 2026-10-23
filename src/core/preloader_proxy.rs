@@ -66,6 +66,11 @@ struct ManifestBundle {
 pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
     if crate::core::console::early_console_requested() {
         crate::core::console::init_console_window_early();
+        crate::core::console::activate_console_logging();
+        // The bridge initialized before third-party preloads. Publish its
+        // bounded early records now, before native DLL output can overtake it.
+        crate::core::xuser_bridge::publish_pending_logs();
+        crate::runtime::foundation::console_capture::install();
     }
 
     let started = Instant::now();

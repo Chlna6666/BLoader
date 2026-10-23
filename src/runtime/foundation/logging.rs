@@ -86,7 +86,7 @@ fn current_console_timestamp() -> (String, String) {
     let now = Local::now();
     (
         now.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
-        now.format("%H:%M:%S").to_string(),
+        now.format("%H:%M:%S%.3f").to_string(),
     )
 }
 
@@ -130,6 +130,7 @@ pub fn init(level: &str) {
             )),
         }
         let _ = LOGGING_READY.set(());
+        flush_early_events();
         write_bootstrap_marker(&format!(
             "logging.init.ready level={} mode={} sinks=console+OutputDebugString file_writes=false",
             level,
@@ -201,6 +202,7 @@ pub fn init(level: &str) {
     }
 
     let _ = LOGGING_READY.set(());
+    flush_early_events();
     write_bootstrap_marker(&format!(
         "logging.init.ready level={} mode={} sinks=latest+archive+console+OutputDebugString latest={} archive={} file_writes=true",
         level,
@@ -238,9 +240,7 @@ fn replay_console_message_at(level: &str, scope: &str, message: &str, timestamp_
         _ => Level::INFO,
     };
     if console_should_show(level, scope, message) {
-        write_bytes_to_console(
-            format_console_line_at(timestamp_clock, level, scope, message).as_bytes(),
-        );
+        write_console_record_at(timestamp_clock, level, scope, message);
     }
 }
 
@@ -442,13 +442,98 @@ pub fn write_bootstrap_marker(message: &str) {
     write_debug_string(&file_line);
 
     if console_is_ready() && console_should_show(Level::DEBUG, "bootstrap", message) {
-        write_bytes_to_console(format_console_line(Level::DEBUG, "bootstrap", message).as_bytes());
+        let (_, clock) = current_console_timestamp();
+        write_console_record_at(&clock, Level::DEBUG, "bootstrap", message);
     }
 }
 
+// Log events generated before the tracing subscriber must be preserved with
+// their actual event time, not silently lost or retimestamped upon replay.
+#[derive(Clone)]
+struct EarlyFileEvent {
+    timestamp: String,
+    level: Level,
+    scope: String,
+    message: String,
+}
+static EARLY_EVENTS: OnceLock<Mutex<VecDeque<EarlyFileEvent>>> = OnceLock::new();
+const EARLY_EVENTS_LIMIT: usize = 4096;
+
 fn log_message(level: Level, scope: &str, message: &str) {
-    mirror_message(level, scope, message);
-    emit_event(level, scope, message);
+    if LOGGING_READY.get().is_none() {
+        let (timestamp, clock) = current_console_timestamp();
+        let store = EARLY_EVENTS.get_or_init(|| Mutex::new(VecDeque::new()));
+        let mut pending = store.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.len() == EARLY_EVENTS_LIMIT { pending.pop_front(); }
+        pending.push_back(EarlyFileEvent {
+            timestamp: timestamp.clone(), level, scope: scope.to_string(), message: message.to_string(),
+        });
+        drop(pending);
+        mirror_message_at(level, scope, message, &timestamp, &clock);
+    } else {
+        mirror_message(level, scope, message);
+        emit_event(level, scope, message);
+    }
+}
+
+fn flush_early_events() {
+    let Some(store) = EARLY_EVENTS.get() else { return; };
+    let entries = {
+        let mut lock = store.lock().unwrap_or_else(|e| e.into_inner());
+        lock.drain(..).collect::<Vec<_>>()
+    };
+    if !file_io_policy::writes_allowed() { return; }
+    for event in entries {
+        // Avoid duplicate console output from the external log tailer.
+        let text = format!(
+            "EARLY [{}] [{}] [{}] {}\r\n",
+            event.timestamp, level_label(event.level), event.scope, event.message
+        );
+        write_bytes_to_bootstrap_file(text.as_bytes());
+    }
+}
+
+/// Receive Win32 console text without any third-party SDK requirement.
+pub fn captured_console_output(input: &str) {
+    let line = sanitize_terminal_text(input);
+    if line.trim().is_empty() { return; }
+    if let Some(rest) = line.strip_prefix('[')
+        && let Some((source, value)) = rest.split_once(']')
+        && source.len() >= 3 && source.len() <= 40
+        && source.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        log_message(Level::INFO, &format!("mod:{source}"), value.trim_start());
+    } else if let Some(owner) = crate::runtime::foundation::mod_diagnostics::resolve_output_owner(&line) {
+        log_message(Level::INFO, &format!("mod:{}", owner.name), &line);
+    } else {
+        log_message(Level::INFO, "game-stdio", &line);
+    }
+}
+
+fn enqueue_early_replay(level: Level, scope: &str, message: &str, timestamp: &str) {
+    let store = EARLY_EVENTS.get_or_init(|| Mutex::new(VecDeque::new()));
+    let mut pending = store.lock().unwrap_or_else(|e| e.into_inner());
+    if pending.len() == EARLY_EVENTS_LIMIT { pending.pop_front(); }
+    pending.push_back(EarlyFileEvent {
+        timestamp: timestamp.to_string(), level, scope: scope.to_string(), message: message.to_string(),
+    });
+}
+
+/// Replay a previously recorded event with its original timestamp.
+pub fn replay_early_message_at(level: &str, scope: &str, message: &str, timestamp: &str) {
+    let level = match level {
+        "warn" => Level::WARN,
+        "error" => Level::ERROR,
+        _ => Level::INFO,
+    };
+    let clock = timestamp.split_whitespace().last().unwrap_or("00:00:00.000");
+    if LOGGING_READY.get().is_none() {
+        enqueue_early_replay(level, scope, message, timestamp);
+    }
+    mirror_message_at(level, scope, message, timestamp, clock);
+    if LOGGING_READY.get().is_some() {
+        emit_event(level, scope, &format!("replayed=true occurred_at={timestamp} {message}"));
+    }
 }
 
 fn emergency_log_message(level: Level, scope: &str, message: &str) {
@@ -463,7 +548,8 @@ fn emergency_log_message(level: Level, scope: &str, message: &str) {
     );
     if console_should_show(level, scope, message) {
         if console_is_ready() {
-            write_bytes_to_console(format_console_line(level, scope, message).as_bytes());
+            let (_, clock) = current_console_timestamp();
+            write_console_record_at(&clock, level, scope, message);
         } else {
             queue_console_backlog(level, scope, message);
         }
@@ -497,9 +583,7 @@ fn mirror_message_at(
 ) {
     if console_should_show(level, scope, message) {
         if console_is_ready() {
-            write_bytes_to_console(
-                format_console_line_at(timestamp_clock, level, scope, message).as_bytes(),
-            );
+            write_console_record_at(timestamp_clock, level, scope, message);
         } else {
             queue_console_backlog_at(level, scope, message, timestamp_full, timestamp_clock);
         }
@@ -562,14 +646,8 @@ fn flush_console_backlog() {
     });
     for record in records {
         if console_should_show(record.level, &record.scope, &record.message) {
-            write_bytes_to_console(
-                format_console_line_at(
-                    &record.timestamp_clock,
-                    record.level,
-                    &record.scope,
-                    &record.message,
-                )
-                .as_bytes(),
+            write_console_record_at(
+                &record.timestamp_clock, record.level, &record.scope, &record.message,
             );
         }
     }
@@ -694,8 +772,8 @@ fn parse_external_structured_line(line: &str) -> Option<ExternalStructuredLine> 
     let timestamp_clock = timestamp_full
         .split_whitespace()
         .last()
-        .map(|value| value.chars().take(8).collect::<String>())
-        .filter(|value| value.len() == 8)
+        .map(str::to_string)
+        .filter(|value| value.len() >= 8)
         .unwrap_or_else(|| current_console_timestamp().1);
 
     let second = first[first_end + 1..].trim_start().strip_prefix('[')?;
@@ -835,20 +913,16 @@ fn level_rank(level: Level) -> u8 {
     }
 }
 
-fn format_console_line(level: Level, scope: &str, message: &str) -> String {
-    let (_, timestamp_clock) = current_console_timestamp();
-    format_console_line_at(&timestamp_clock, level, scope, message)
-}
-
 fn format_console_line_at(timestamp: &str, level: Level, scope: &str, message: &str) -> String {
     let level_text = level_label(level);
+    let sequence = CONSOLE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let source = truncate(&console_source(scope), 28);
     let message = localized_console_message(scope, message)
         .replace('\r', "")
         .replace('\n', " | ");
 
     if !console_supports_ansi() {
-        return format!("[{timestamp} {level_text}] [{source}] {message}\r\n");
+        return format!("[{timestamp} {level_text} #{sequence:06}] [{source}] {message}\r\n");
     }
 
     let level_color = match level {
@@ -861,7 +935,7 @@ fn format_console_line_at(timestamp: &str, level: Level, scope: &str, message: &
     let source_color = source_color(scope, &source);
 
     format!(
-        "\x1b[38;2;120;126;136m[{timestamp} \x1b[0m{level_color}{level_text}\x1b[38;2;120;126;136m]\x1b[0m {source_color}[{source}]\x1b[0m \x1b[38;2;220;224;230m{message}\x1b[0m\r\n"
+        "\x1b[38;2;120;126;136m[{timestamp} \x1b[0m{level_color}{level_text}\x1b[38;2;120;126;136m #{sequence:06}]\x1b[0m {source_color}[{source}]\x1b[0m \x1b[38;2;220;224;230m{message}\x1b[0m\r\n"
     )
 }
 
@@ -1084,7 +1158,18 @@ fn write_bytes_to_bootstrap_file(bytes: &[u8]) {
     }
 }
 
-fn write_bytes_to_console(bytes: &[u8]) {
+// This dispatcher is the only structured-console writer. The lock covers both
+// sequence assignment and the complete output write, so concurrent producers
+// cannot cause displayed sequence numbers to overtake each other.
+fn write_console_record_at(clock: &str, level: Level, scope: &str, message: &str) {
+    let _guard = console_write_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let bytes = format_console_line_at(clock, level, scope, message);
+    write_bytes_to_console_locked(bytes.as_bytes());
+}
+
+fn write_bytes_to_console_locked(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
@@ -1096,21 +1181,20 @@ fn write_bytes_to_console(bytes: &[u8]) {
         return;
     }
 
-    let _guard = console_write_lock()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        unsafe {
-            let mut written = 0;
-            if WriteFile(handle, Some(&bytes[offset..]), Some(&mut written), None).is_err()
-                || written == 0
-            {
-                break;
+    crate::runtime::foundation::console_capture::with_passthrough(|| {
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            unsafe {
+                let mut written = 0;
+                if WriteFile(handle, Some(&bytes[offset..]), Some(&mut written), None).is_err()
+                    || written == 0
+                {
+                    break;
+                }
+                offset += written as usize;
             }
-            offset += written as usize;
         }
-    }
+    });
 }
 
 fn console_supports_ansi() -> bool {

@@ -8,9 +8,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 pub use inner::{
-    captured_mod_output, captured_process_output, console_is_ready, debug_message,
+    captured_console_output, captured_mod_output, captured_process_output, console_is_ready, debug_message,
     emergency_error_message, emergency_info_message, emergency_warn_message, error_message,
-    is_ready, replay_console_message, scoped_debug_message, scoped_error_message,
+    is_ready, replay_console_message, replay_early_message_at, scoped_debug_message, scoped_error_message,
     scoped_trace_message, scoped_warn_message, set_console_handle, set_console_stream_handle,
     startup_banner, trace_message, warn_message,
 };

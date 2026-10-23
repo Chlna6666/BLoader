@@ -50,6 +50,7 @@ enum BridgeLogLevel {
 struct PendingLog {
     level: BridgeLogLevel,
     message: String,
+    occurred_at: String,
 }
 
 #[derive(Debug)]
@@ -144,11 +145,12 @@ pub fn publish_pending_logs() {
         ),
     );
     for entry in pending {
-        match entry.level {
-            BridgeLogLevel::Info => logging::scoped_info_message("xuser-bridge", &entry.message),
-            BridgeLogLevel::Warn => logging::scoped_warn_message("xuser-bridge", &entry.message),
-            BridgeLogLevel::Error => logging::scoped_error_message("xuser-bridge", &entry.message),
-        }
+        let level = match entry.level {
+            BridgeLogLevel::Info => "info",
+            BridgeLogLevel::Warn => "warn",
+            BridgeLogLevel::Error => "error",
+        };
+        logging::replay_early_message_at(level, "xuser-bridge", &entry.message, &entry.occurred_at);
     }
 }
 
@@ -340,6 +342,7 @@ fn queue_pending(level: BridgeLogLevel, message: &str) {
     guard.push(PendingLog {
         level,
         message: message.to_string(),
+        occurred_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
     });
 }
 

@@ -127,8 +127,13 @@ pub unsafe fn install_process_capture() {
 
     let stdout_handle = HANDLE(stdout_write.as_raw_handle() as *mut c_void);
     let stderr_handle = HANDLE(stderr_write.as_raw_handle() as *mut c_void);
-    let _ = SetStdHandle(STD_OUTPUT_HANDLE, stdout_handle);
-    let _ = SetStdHandle(STD_ERROR_HANDLE, stderr_handle);
+    // Retain process Win32 console handles for standalone native DLLs that
+    // probe GetConsoleMode before calling WriteConsoleW. Redirect their CRT
+    // descriptors instead; the compatibility hooks capture Win32 console I/O.
+    if !logging::console_is_ready() {
+        let _ = SetStdHandle(STD_OUTPUT_HANDLE, stdout_handle);
+        let _ = SetStdHandle(STD_ERROR_HANDLE, stderr_handle);
+    }
 
     let redirect = CrtRedirect::install(stdout_handle, stderr_handle);
     std::mem::forget(redirect);
