@@ -317,15 +317,16 @@ pub fn captured_mod_output(mod_name: &str, mod_id: &str, stream: &str, message: 
         // The same logical line usually also arrives through the console hook
         // or the latest.log relay; route it through the shared forwarded-record
         // path so the dedupe journal sees it and the console shows it once.
-        forward_captured_record(CapturedRecord {
+        if forward_captured_record(CapturedRecord {
             timestamp_full: external.timestamp_full,
             timestamp_clock: external.timestamp_clock,
             level: external_level_for(&external.source, external.level, &external.message),
             scope: external_scope(&external.source),
             message: external.message,
             channel: CaptureChannel::Stdio,
-        });
-        append_mod_log(mod_name, mod_id, stream, message);
+        }) {
+            append_mod_log(mod_name, mod_id, stream, message);
+        }
         return;
     }
 
@@ -336,15 +337,16 @@ pub fn captured_mod_output(mod_name: &str, mod_id: &str, stream: &str, message: 
         message.to_string()
     };
     let (timestamp_full, timestamp_clock) = current_console_timestamp();
-    forward_captured_record(CapturedRecord {
+    if forward_captured_record(CapturedRecord {
         timestamp_full,
         timestamp_clock,
         level: level_from_markers(&console_message),
         scope,
         message: console_message,
         channel: CaptureChannel::Stdio,
-    });
-    append_mod_log(mod_name, mod_id, stream, message);
+    }) {
+        append_mod_log(mod_name, mod_id, stream, message);
+    }
 }
 
 pub fn captured_process_output(stream: &str, message: &str) {
@@ -820,27 +822,46 @@ fn flush_console_backlog() {
     }
 }
 
+/// Only inspect a bounded tail of a shared log at console attach. The old
+/// fs::read() path allocated and parsed the entire historical file, sometimes
+/// megabytes of previous LeviLamina sessions on the game startup thread.
+const EXTERNAL_HISTORY_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+
 fn queue_external_log_history() -> u64 {
     if !file_io_policy::writes_allowed() {
         return 0;
     }
-
     let path = PathBuf::from("logs").join("latest.log");
-    let Ok(bytes) = fs::read(&path) else {
+    let Ok(mut file) = File::open(&path) else {
         return 0;
     };
-    let end_offset = bytes.len() as u64;
-    for raw in bytes.split(|byte| *byte == b'\n') {
+    let Ok(length) = file.metadata().map(|m| m.len()) else {
+        return 0;
+    };
+    let start = length.saturating_sub(EXTERNAL_HISTORY_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return length;
+    }
+    let mut bytes = Vec::<u8>::with_capacity((length - start) as usize);
+    if file.read_to_end(&mut bytes).is_err() {
+        return length;
+    }
+    // A suffix may begin in the middle of a UTF-8 line; skip that fragment.
+    let first = if start > 0 {
+        bytes.iter().position(|byte| *byte == b'\n').map_or(bytes.len(), |i| i + 1)
+    } else {
+        0
+    };
+    for raw in bytes[first..].split(|byte| *byte == b'\n') {
         if raw.is_empty() {
             continue;
         }
         let line = String::from_utf8_lossy(raw).trim_end_matches('\r').to_string();
-        let Some(external) = parse_external_structured_line(&line) else {
-            continue;
-        };
-        forward_external_line(&external);
+        if let Some(external) = parse_external_structured_line(&line) {
+            forward_external_line(&external);
+        }
     }
-    end_offset
+    length
 }
 
 fn start_external_log_relay(start_offset: u64) {
@@ -1056,13 +1077,13 @@ fn forward_external_line(external: &ExternalStructuredLine) {
     });
 }
 
-fn forward_captured_record(record: CapturedRecord) {
+fn forward_captured_record(record: CapturedRecord) -> bool {
     if !external_line_from_current_run(&record.timestamp_full) {
         RELAY_STALE_SKIPPED.fetch_add(1, Ordering::Relaxed);
-        return;
+        return false;
     }
     if !record_captured_line_once(&record) {
-        return;
+        return false;
     }
     RELAY_FORWARDED.fetch_add(1, Ordering::Relaxed);
     if console_should_show(record.level, &record.scope, &record.message) {
@@ -1084,6 +1105,7 @@ fn forward_captured_record(record: CapturedRecord) {
         }
     }
     write_captured_file_record(&record);
+    true
 }
 
 /// External lines keep their original timestamp in the file sinks; without
