@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::platform::{build_info, console_branding, file_io_policy, i18n, logging};
-use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
+use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE, RECT};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, WriteFile,
 };
@@ -22,7 +22,7 @@ use windows::Win32::System::Console::{
     STD_OUTPUT_HANDLE, SetConsoleCursorPosition, SetConsoleMode, SetConsoleTitleW, SetStdHandle,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DeleteMenu, GetSystemMenu, MF_BYCOMMAND, SC_CLOSE, SW_SHOW, ShowWindow,
+    DeleteMenu, GetSystemMenu, GetWindowRect, MF_BYCOMMAND, SC_CLOSE, SW_SHOW, ShowWindow,
 };
 use windows::core::PCWSTR;
 
@@ -492,24 +492,37 @@ fn start_console_resize_monitor() {
             if handle.is_invalid() {
                 return;
             }
-            let mut last = visible_geometry(handle);
+            let mut last = (visible_geometry(handle), console_window_origin());
             let mut candidate = None;
             loop {
                 thread::sleep(Duration::from_millis(200));
-                let size = visible_geometry(handle);
-                if size == last || size.0 == 0 || size.1 == 0 {
+                let geometry = (visible_geometry(handle), console_window_origin());
+                let size = geometry.0;
+                if geometry == last || size.0 == 0 || size.1 == 0 {
                     candidate = None;
                     continue;
                 }
-                if candidate == Some(size) {
-                    last = size;
+                if candidate == Some(geometry) {
+                    last = geometry;
                     candidate = None;
+                    // Both window moves and dimension changes can expose stale
+                    // ConHost pixel-art cells; repaint once the drag settles.
                     logging::request_console_repaint(size.0, size.1);
                 } else {
-                    candidate = Some(size);
+                    candidate = Some(geometry);
                 }
             }
         });
+}
+
+fn console_window_origin() -> Option<(i32, i32)> {
+    let window = unsafe { GetConsoleWindow() };
+    if window.0.is_null() {
+        return None;
+    }
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(window, &mut rect).ok()?; }
+    Some((rect.left, rect.top))
 }
 
 fn visible_geometry(handle: HANDLE) -> (usize, usize) {
