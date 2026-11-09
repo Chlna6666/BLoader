@@ -31,6 +31,7 @@ const BMCBL_TERMINAL_HOST_PID_ENV: &str = "BMCBL_TERMINAL_HOST_PID";
 static CONSOLE_WINDOW_READY: AtomicBool = AtomicBool::new(false);
 static CONSOLE_LOGGING_READY: AtomicBool = AtomicBool::new(false);
 static CONSOLE_STDIO_READY: AtomicBool = AtomicBool::new(false);
+static CONSOLE_RESIZE_MONITOR: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -147,6 +148,7 @@ pub unsafe fn init_console_window_early() {
             console_has_vt(h_conout),
             true,
         );
+        start_console_resize_monitor();
     }
 
     logging::write_bootstrap_marker(&format!(
@@ -477,6 +479,52 @@ fn replay_mod_inventory() {
 pub fn publish_runtime_state() {
     replay_pre_main_load_state();
     replay_mod_inventory();
+}
+
+fn start_console_resize_monitor() {
+    if CONSOLE_RESIZE_MONITOR.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let _ = thread::Builder::new()
+        .name("bloader-console-resize".to_string())
+        .spawn(|| {
+            let handle = open_conout();
+            if handle.is_invalid() {
+                return;
+            }
+            let mut last = visible_geometry(handle);
+            let mut candidate = None;
+            loop {
+                thread::sleep(Duration::from_millis(200));
+                let size = visible_geometry(handle);
+                if size == last || size.0 == 0 || size.1 == 0 {
+                    candidate = None;
+                    continue;
+                }
+                if candidate == Some(size) {
+                    last = size;
+                    candidate = None;
+                    logging::request_console_repaint(size.0, size.1);
+                } else {
+                    candidate = Some(size);
+                }
+            }
+        });
+}
+
+fn visible_geometry(handle: HANDLE) -> (usize, usize) {
+    if handle.is_invalid() {
+        return (80, 25);
+    }
+    unsafe {
+        let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+        if GetConsoleScreenBufferInfo(handle, &mut info).is_ok() {
+            let width = i32::from(info.srWindow.Right) - i32::from(info.srWindow.Left) + 1;
+            let height = i32::from(info.srWindow.Bottom) - i32::from(info.srWindow.Top) + 1;
+            return (width.max(0) as usize, height.max(0) as usize);
+        }
+    }
+    (80, 25)
 }
 
 fn visible_columns(handle: HANDLE) -> usize {

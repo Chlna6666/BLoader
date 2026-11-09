@@ -11,7 +11,7 @@ pub use backend::{
     captured_console_output_from, captured_logger_line, captured_mod_output,
     captured_process_output, console_is_ready, debug_message, emergency_error_message,
     emergency_info_message, emergency_warn_message, error_message, game_console_message, is_ready,
-    note_process_start, replay_console_message, replay_early_message_at, scoped_debug_message,
+    note_process_start, replay_console_message, replay_early_message_at, request_console_repaint, scoped_debug_message,
     scoped_error_message, scoped_trace_message, scoped_warn_message, set_console_handle,
     set_console_stream_handle, startup_banner, trace_message, warn_message,
 };

@@ -1684,24 +1684,61 @@ fn write_bytes_to_bootstrap_file(bytes: &[u8]) {
     }
 }
 
-// One dedicated writer thread owns the console device. Producers only format
-// a record and enqueue it, so a slow or blocked console (ConPTY under load,
-// game startup) can never stall the game thread, the external log relay or
-// BLoader's own logging. Queue order is write order, which keeps the console
-// chronological.
-static CONSOLE_SINK: OnceLock<Option<std::sync::mpsc::Sender<Vec<u8>>>> = OnceLock::new();
+// One dedicated writer owns console output and resize repaint commands.
+// The terminal reflows pixel-art cells when its width changes. Reconstruct
+// the banner and the most recent visible records instead of keeping a broken
+// colour-block logo in the scrollback after a window resize.
+enum ConsoleCommand {
+    Line(Vec<u8>),
+    Repaint { columns: usize, rows: usize },
+}
+
+static CONSOLE_SINK: OnceLock<Option<std::sync::mpsc::Sender<ConsoleCommand>>> = OnceLock::new();
 static CONSOLE_PENDING: AtomicUsize = AtomicUsize::new(0);
 const CONSOLE_QUEUE_LIMIT: usize = 8192;
+const CONSOLE_HISTORY_LIMIT: usize = 512;
 
-fn console_sink() -> &'static Option<std::sync::mpsc::Sender<Vec<u8>>> {
+fn console_sink() -> &'static Option<std::sync::mpsc::Sender<ConsoleCommand>> {
     CONSOLE_SINK.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (sender, receiver) = std::sync::mpsc::channel::<ConsoleCommand>();
         match thread::Builder::new()
             .name("bloader-console-writer".to_string())
             .spawn(move || {
-                while let Ok(bytes) = receiver.recv() {
-                    CONSOLE_PENDING.fetch_sub(1, Ordering::Relaxed);
-                    write_bytes_to_console_locked(&bytes);
+                let mut history = VecDeque::<Vec<u8>>::new();
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        ConsoleCommand::Line(bytes) => {
+                            CONSOLE_PENDING.fetch_sub(1, Ordering::Relaxed);
+                            if history.len() == CONSOLE_HISTORY_LIMIT {
+                                history.pop_front();
+                            }
+                            history.push_back(bytes.clone());
+                            write_bytes_to_console_locked(&bytes);
+                        }
+                        ConsoleCommand::Repaint { columns, rows } => {
+                            if !console_supports_ansi() {
+                                continue;
+                            }
+                            let banner = crate::platform::console_branding::render_banner(columns, true);
+                            let mut output = Vec::<u8>::new();
+                            output.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[3J\x1b[H");
+                            for line in &banner {
+                                output.extend_from_slice(line.as_bytes());
+                                output.extend_from_slice(b"\r\n");
+                            }
+                            // Budget extra rows for log messages that wrap. The
+                            // complete history is retained in latest.log.
+                            let visible_records = rows
+                                .saturating_sub(banner.len().saturating_add(1))
+                                .saturating_div(2)
+                                .min(32);
+                            let skip = history.len().saturating_sub(visible_records);
+                            for line in history.iter().skip(skip) {
+                                output.extend_from_slice(line);
+                            }
+                            write_bytes_to_console_locked(&output);
+                        }
+                    }
                 }
             }) {
             Ok(_) => Some(sender),
@@ -1715,16 +1752,29 @@ fn console_sink() -> &'static Option<std::sync::mpsc::Sender<Vec<u8>>> {
     })
 }
 
+/// A resize notification is always handled by the same writer that owns log
+/// records, so a repaint cannot interleave ANSI sequences with a live line.
+pub fn request_console_repaint(columns: usize, rows: usize) {
+    if !console_is_ready() || columns == 0 || rows == 0 {
+        return;
+    }
+    if let Some(sender) = console_sink() {
+        let _ = sender.send(ConsoleCommand::Repaint { columns, rows });
+    }
+}
+
 fn write_console_record_at(clock: &str, level: Level, scope: &str, message: &str) {
     let bytes = format_console_line_at(clock, level, scope, message).into_bytes();
     if let Some(sender) = console_sink() {
         if CONSOLE_PENDING.load(Ordering::Relaxed) < CONSOLE_QUEUE_LIMIT {
             CONSOLE_PENDING.fetch_add(1, Ordering::Relaxed);
-            match sender.send(bytes) {
+            match sender.send(ConsoleCommand::Line(bytes)) {
                 Ok(()) => return,
                 Err(error) => {
                     CONSOLE_PENDING.fetch_sub(1, Ordering::Relaxed);
-                    write_bytes_to_console_locked(&error.0);
+                    if let ConsoleCommand::Line(bytes) = error.0 {
+                        write_bytes_to_console_locked(&bytes);
+                    }
                     return;
                 }
             }
