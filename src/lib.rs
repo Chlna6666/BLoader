@@ -85,6 +85,27 @@ pub unsafe extern "system" fn DllMain(
     1
 }
 
+// Legacy ABI compatibility exports. Older BL Mods resolve these symbols at load
+// time; keep them even though the panel renderer and BL host were removed.
+#[unsafe(export_name = "bl_i18n_current_locale")]
+pub unsafe extern "system" fn bl_i18n_current_locale(out_buf: *mut u8, out_len: usize) -> usize {
+    let value = crate::platform::i18n::current_locale();
+    let bytes = value.as_bytes();
+    if !out_buf.is_null() && out_len > 0 {
+        let copy_len = bytes.len().min(out_len - 1);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, copy_len);
+            *out_buf.add(copy_len) = 0;
+        }
+    }
+    bytes.len()
+}
+
+#[unsafe(export_name = "bl_register_d3d12_render_callback")]
+pub unsafe extern "system" fn bl_register_d3d12_render_callback(_callback: *const c_void) {
+    // Renderer service is not compiled in the lightweight build.
+}
+
 pub(crate) fn run_bootstrap_on_startup_thread() -> bool {
     crate::platform::logging::write_bootstrap_marker(
         "bootstrap.inline.start execution=minecraft-startup-thread",
