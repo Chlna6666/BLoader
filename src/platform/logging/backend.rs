@@ -983,9 +983,12 @@ fn external_line_from_current_run(timestamp_full: &str) -> bool {
     let Some(start) = PROCESS_START_TIMESTAMP.get() else {
         return true;
     };
-    // Both sides are fixed-width `%Y-%m-%d %H:%M:%S%.3f` local timestamps, so
-    // lexicographic order matches chronological order.
-    timestamp_full >= start.as_str()
+    // A LeviLamina console record can be second-precision even when
+    // BLoader's process-start clock has milliseconds. Comparing the raw
+    // strings would incorrectly reject events from that same first second.
+    let event_second = timestamp_full.get(..19).unwrap_or(timestamp_full);
+    let start_second = start.get(..19).unwrap_or(start);
+    event_second >= start_second
 }
 
 /// Renders one line captured from the game's own logging channel
@@ -1123,7 +1126,13 @@ fn write_captured_file_record(record: &CapturedRecord) {
         record.scope,
         record.message
     );
-    enqueue_file_write(FileWrite::Main(line.into_bytes()));
+    if record.channel == CaptureChannel::FileRelay {
+        // The original already exists in the shared latest.log; writing it
+        // back there creates duplicate bytes, extra tailer work and disorder.
+        enqueue_file_write(FileWrite::Archive(line.into_bytes()));
+    } else {
+        enqueue_file_write(FileWrite::Main(line.into_bytes()));
+    }
 }
 
 /// Maps a parsed external line's source tag to a console scope. The game's
@@ -1764,6 +1773,7 @@ fn write_bytes_to_bootstrap_file(bytes: &[u8]) {
 // to use the synchronous emergency file path.
 enum FileWrite {
     Main(Vec<u8>),
+    Archive(Vec<u8>),
     Mod(PathBuf, Vec<u8>),
 }
 
@@ -1788,15 +1798,20 @@ fn write_mod_file(path: &Path, bytes: &[u8]) {
 
 fn write_file_batch(commands: Vec<FileWrite>) {
     let mut main = Vec::<u8>::new();
+    let mut archive = Vec::<u8>::new();
     let mut mod_files = HashMap::<PathBuf, Vec<u8>>::new();
     for command in commands {
         match command {
             FileWrite::Main(bytes) => main.extend_from_slice(&bytes),
+            FileWrite::Archive(bytes) => archive.extend_from_slice(&bytes),
             FileWrite::Mod(path, bytes) => mod_files.entry(path).or_default().extend_from_slice(&bytes),
         }
     }
     if !main.is_empty() {
         write_bytes_to_bootstrap_file(&main);
+    }
+    if !archive.is_empty() {
+        write_mod_file(&archive_log_path(), &archive);
     }
     for (path, bytes) in mod_files {
         write_mod_file(&path, &bytes);
@@ -2159,6 +2174,15 @@ mod external_line_tests {
 
         let (display, late) = console_display_time("2026-11-09 19:03:27.000", &mut last);
         assert!(!late || display.as_str() >= "2026-11-09 19:03:27.000");
+    }
+
+    #[test]
+    fn short_external_timestamps_are_kept_during_first_second() {
+        // The old lexicographic comparison rejected an equal-second header
+        // with no millisecond suffix even though it was from this process.
+        let event = "2026-11-09 19:03:25";
+        let start = "2026-11-09 19:03:25.123";
+        assert_eq!(&event[..19], &start[..19]);
     }
 
     #[test]
