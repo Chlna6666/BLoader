@@ -270,13 +270,16 @@ fn logging_scoped_debug_relay_report(total_secs: u64) {
     scoped_debug_message(
         "logging",
         &format!(
-            "relay channel check (after {total_secs}s): seen={} unparsed={} forwarded={} stale_skipped={} file_batches={} file_sync_fallbacks={}",
+            "capture channel check (after {total_secs}s): seen={} unparsed={} forwarded={} stale_skipped={} file_batches={} file_sync_fallbacks={} console_batches={} console_late={} console_omitted={}",
             RELAY_SEEN.load(Ordering::Relaxed),
             RELAY_UNPARSED.load(Ordering::Relaxed),
             RELAY_FORWARDED.load(Ordering::Relaxed),
             RELAY_STALE_SKIPPED.load(Ordering::Relaxed),
             FILE_BATCHES.load(Ordering::Relaxed),
             FILE_SYNC_FALLBACKS.load(Ordering::Relaxed),
+            CONSOLE_BATCHES.load(Ordering::Relaxed),
+            CONSOLE_LATE_TOTAL.load(Ordering::Relaxed),
+            CONSOLE_DROPPED_TOTAL.load(Ordering::Relaxed),
         ),
     );
 }
@@ -1859,6 +1862,9 @@ enum ConsoleCommand {
 
 static CONSOLE_SINK: OnceLock<Option<std::sync::mpsc::SyncSender<ConsoleCommand>>> = OnceLock::new();
 static CONSOLE_DROPPED: AtomicUsize = AtomicUsize::new(0);
+static CONSOLE_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONSOLE_LATE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONSOLE_BATCHES: AtomicU64 = AtomicU64::new(0);
 const CONSOLE_QUEUE_LIMIT: usize = 8192;
 const CONSOLE_HISTORY_LIMIT: usize = 512;
 const CONSOLE_BATCH_LIMIT: usize = 128;
@@ -1889,6 +1895,9 @@ fn append_console_line(
     last_display: &mut String,
 ) {
     let (display_time, late) = console_display_time(&line.timestamp_full, last_display);
+    if late {
+        CONSOLE_LATE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
     let rendered = if late {
         let message = format!("{} [late occurred_at={}]", line.message, line.timestamp_full);
         format_console_line_at(&display_time, line.level, &line.scope, &message).into_bytes()
@@ -1957,6 +1966,7 @@ fn console_sink() -> &'static Option<std::sync::mpsc::SyncSender<ConsoleCommand>
                         a.timestamp_full.cmp(&b.timestamp_full)
                             .then_with(|| a.sequence.cmp(&b.sequence))
                     });
+                    CONSOLE_BATCHES.fetch_add(1, Ordering::Relaxed);
                     let mut output = Vec::<u8>::with_capacity(lines.len() * 160);
                     for line in lines {
                         append_console_line(line, &mut history, &mut output, &mut last_display);
@@ -1971,7 +1981,12 @@ fn console_sink() -> &'static Option<std::sync::mpsc::SyncSender<ConsoleCommand>
                                 level: Level::WARN,
                                 scope: "logging".to_string(),
                                 message: format!(
-                                    "console busy: {skipped} live records omitted; full logs are in logs/latest.log"
+                                    "console busy: {skipped} live records omitted; {}",
+                                    if file_io_policy::writes_allowed() {
+                                        "full logs are in logs/latest.log"
+                                    } else {
+                                        "legacy UWP file logging is disabled"
+                                    }
                                 ),
                             },
                             &mut history, &mut output, &mut last_display,
@@ -1985,9 +2000,10 @@ fn console_sink() -> &'static Option<std::sync::mpsc::SyncSender<ConsoleCommand>
             }) {
             Ok(_) => Some(sender),
             Err(error) => {
-                write_bootstrap_marker(&format!(
-                    "logging.console.writer.spawn.failed error={error}"
-                ));
+                // Do not recursively call console_sink() while its OnceLock
+                // initializer still owns the initialization state.
+                let line = format!("logging.console.writer.spawn.failed error={error}");
+                write_debug_string(&line);
                 None
             }
         }
@@ -2006,6 +2022,7 @@ pub fn request_console_repaint(columns: usize, rows: usize) {
 fn write_console_record_at(timestamp_full: &str, level: Level, scope: &str, message: &str) {
     let Some(sender) = console_sink() else {
         CONSOLE_DROPPED.fetch_add(1, Ordering::Relaxed);
+        CONSOLE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
         return;
     };
     let line = ConsoleLine {
@@ -2018,6 +2035,7 @@ fn write_console_record_at(timestamp_full: &str, level: Level, scope: &str, mess
     if sender.try_send(ConsoleCommand::Line(line)).is_err() {
         // Never fall back to synchronous WriteFile from a native hook.
         CONSOLE_DROPPED.fetch_add(1, Ordering::Relaxed);
+        CONSOLE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
 }
 
