@@ -10,6 +10,7 @@ use windows::core::PCWSTR;
 use crate::platform::{crash_report, logging, mod_diagnostics};
 
 const PRELOAD_TYPE: &str = "preload";
+const LEVILAMINA_PRELOAD_TYPE: &str = "preload-native";
 const PRELOADER_DLL: &str = "PreLoader.dll";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,7 +266,11 @@ fn discover_candidates(mods_dir: &Path) -> Vec<Candidate> {
         let Ok(manifest) = parse_manifest(&text) else {
             continue;
         };
-        if !manifest.mod_type.eq_ignore_ascii_case(PRELOAD_TYPE) {
+        // Current LeviLamina manifests use preload-native, while older
+        // BMCBL installs used the loader-specific type=preload spelling.
+        if !manifest.mod_type.eq_ignore_ascii_case(PRELOAD_TYPE)
+            && !manifest.mod_type.eq_ignore_ascii_case(LEVILAMINA_PRELOAD_TYPE)
+        {
             continue;
         }
 

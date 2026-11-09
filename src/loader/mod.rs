@@ -55,6 +55,14 @@ struct ModManifest {
     notify_success: bool,
     #[serde(default)]
     log_aliases: Vec<String>,
+    /// Explicit BLoader ownership when LeviLamina is also active.
+    /// Ordinary LeviLamina native mods remain owned by LeviLamina.
+    #[serde(default)]
+    bloader_managed: bool,
+    /// BLoader's own dependency IDs; do not reinterpret LeviLamina's
+    /// versioned 'dependencies' field (it has a different schema).
+    #[serde(default)]
+    bloader_dependencies: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -66,6 +74,7 @@ struct ManifestBundle {
 struct PreloadMod {
     id: String,
     name: String,
+    dependencies: Vec<String>,
     version: Option<String>,
     kind: String,
     dll_path: PathBuf,
@@ -80,6 +89,7 @@ struct PreloadMod {
 struct HotMod {
     id: String,
     name: String,
+    dependencies: Vec<String>,
     version: Option<String>,
     kind: String,
     dll_path: PathBuf,
@@ -254,6 +264,7 @@ pub unsafe fn load_native_preloads_in_dllmain(game_dir: &Path) -> NativePreloadS
         let preload = PreloadMod {
             id,
             name: manifest.name,
+            dependencies: manifest.bloader_dependencies,
             version: manifest.version,
             kind: manifest.mod_type,
             dll_path,
@@ -865,9 +876,9 @@ pub fn native_success_notification_message() -> Option<String> {
     Some(lines.join("\n"))
 }
 
-pub unsafe fn load_mods(game_dir: &Path) -> bool {
+pub unsafe fn load_mods(game_dir: &Path, preloader_active: bool) -> bool {
     let mods_dir = ensure_mods_dir(game_dir);
-    let mut discovered = discover_mods(&mods_dir);
+    let mut discovered = discover_mods(&mods_dir, preloader_active);
 
     if discovered.preload.is_empty() && discovered.hot.is_empty() {
         logging::info_message("No mods found to load.");
@@ -895,7 +906,7 @@ fn ensure_mods_dir(game_dir: &Path) -> PathBuf {
     mods_dir
 }
 
-fn discover_mods(mods_dir: &Path) -> DiscoveredMods {
+fn discover_mods(mods_dir: &Path, preloader_active: bool) -> DiscoveredMods {
     let mut discovered = DiscoveredMods::default();
     let entries: Vec<_> = fs::read_dir(mods_dir)
         .ok()
@@ -907,7 +918,7 @@ fn discover_mods(mods_dir: &Path) -> DiscoveredMods {
     for entry in entries {
         let entry_path = entry.path();
         if entry_path.is_dir() {
-            discover_packaged_mod(&entry_path, &mut discovered);
+            discover_packaged_mod(&entry_path, preloader_active, &mut discovered);
             continue;
         }
 
@@ -919,7 +930,11 @@ fn discover_mods(mods_dir: &Path) -> DiscoveredMods {
     discovered
 }
 
-fn discover_packaged_mod(entry_path: &Path, discovered: &mut DiscoveredMods) {
+fn discover_packaged_mod(
+    entry_path: &Path,
+    preloader_active: bool,
+    discovered: &mut DiscoveredMods,
+) {
     let manifest_path = entry_path.join("manifest.json");
     if !manifest_path.exists() {
         return;
@@ -940,6 +955,29 @@ fn discover_packaged_mod(entry_path: &Path, discovered: &mut DiscoveredMods) {
         ));
         return;
     };
+
+    let mod_type = manifest.mod_type.as_str();
+    if mod_type.eq_ignore_ascii_case(MOD_TYPE_BL) {
+        logging::scoped_warn_message(
+            "native-loader",
+            &format!("SKIP_BL_MOD_TYPE | {} | install the separate BLRuntime to use BL mods", manifest.name),
+        );
+        return;
+    }
+    if mod_type == "preload" {
+        // Handled exclusively by the priority PreLoader discovery path.
+        return;
+    }
+    if !matches!(mod_type, "native" | "preload-native" | "hot-native" | "hot-inject") {
+        logging::scoped_warn_message(
+            "native-loader",
+            &format!(
+                "SKIP_UNSUPPORTED_MOD_TYPE | {} | type={} | external runtime owns its own types",
+                manifest.name, mod_type,
+            ),
+        );
+        return;
+    }
 
     let dll_path = entry_path.join(&manifest.entry);
     if !is_dll_path(&dll_path) {
@@ -976,6 +1014,22 @@ fn discover_packaged_mod(entry_path: &Path, discovered: &mut DiscoveredMods) {
 
     let id = manifest.id.clone().unwrap_or_else(|| manifest.name.clone());
     let kind = manifest.mod_type.clone();
+
+    // LeviLamina's registrar loads and orders its 'native' mods. Running
+    // LoadLibrary again in BLoader bypasses its dependency planner and can
+    // misreport already loaded modules as BLoader-owned. Opt in explicitly
+    // with bloader_managed=true for native mods intended for both runtimes.
+    if preloader_active
+        && !manifest.bloader_managed
+        && matches!(mod_type, "native" | "preload-native")
+    {
+        let identity = mod_diagnostics::register_discovered(
+            id, manifest.name, manifest.version, kind, &dll_path,
+            manifest.log_aliases,
+        );
+        mod_diagnostics::mark_delegated(&identity, "LeviLamina/PreLoader");
+        return;
+    }
     match manifest.mod_type.as_str() {
         MOD_TYPE_BL => {
             logging::scoped_warn_message(
@@ -1002,6 +1056,7 @@ fn discover_packaged_mod(entry_path: &Path, discovered: &mut DiscoveredMods) {
             discovered.hot.push(HotMod {
                 id,
                 name: manifest.name,
+                dependencies: manifest.bloader_dependencies,
                 version: manifest.version,
                 kind,
                 dll_path,
@@ -1019,6 +1074,7 @@ fn discover_packaged_mod(entry_path: &Path, discovered: &mut DiscoveredMods) {
         _ => discovered.preload.push(PreloadMod {
             id,
             name: manifest.name,
+            dependencies: manifest.bloader_dependencies,
             version: manifest.version,
             kind,
             dll_path,
@@ -1144,6 +1200,8 @@ fn package_loose_dll(mods_dir: &Path, entry_path: &Path) -> Option<PreloadMod> {
             verify_modules: Vec::new(),
             notify_success: false,
             log_aliases: Vec::new(),
+            bloader_managed: true,
+            bloader_dependencies: Vec::new(),
         };
 
         match serde_json::to_string_pretty(&manifest) {
@@ -1165,6 +1223,7 @@ fn package_loose_dll(mods_dir: &Path, entry_path: &Path) -> Option<PreloadMod> {
     Some(PreloadMod {
         id: file_stem.clone(),
         name: file_stem,
+        dependencies: Vec::new(),
         version: None,
         kind: MOD_TYPE_PRELOAD_NATIVE.to_string(),
         dll_path: target_dll,
@@ -1270,6 +1329,7 @@ fn spawn_hot_mod_loader(mut hot_mods: Vec<HotMod>) {
                 let native_mod = PreloadMod {
                     id: hot_mod.id.clone(),
                     name: hot_mod.name.clone(),
+                    dependencies: hot_mod.dependencies.clone(),
                     version: hot_mod.version.clone(),
                     kind: hot_mod.kind.clone(),
                     dll_path: hot_mod.dll_path.clone(),

@@ -149,6 +149,11 @@ pub fn mark_loaded(identity: &ModIdentity, module: usize, phase: &str) -> ModIde
     updated
 }
 
+pub fn mark_delegated(identity: &ModIdentity, owner: &str) {
+    let updated = update_identity(identity, None, "delegated");
+    record_lifecycle(&updated, "delegated", &format!("owner={owner}"));
+}
+
 pub fn mark_failed(identity: &ModIdentity, phase: &str, detail: &str) {
     update_identity(identity, None, "failed");
     record_lifecycle(identity, "load_failed", &format!("{phase}: {detail}"));
