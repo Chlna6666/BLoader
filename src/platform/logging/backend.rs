@@ -451,7 +451,7 @@ fn sanitize_file_component(value: &str) -> String {
 }
 
 pub fn set_console_handle(handle: HANDLE) {
-    let relay_offset = queue_external_log_history();
+    let relay_offset = external_history_start_offset();
     let _ = CONSOLE_HANDLE.set(SendHandle(handle));
     CONSOLE_FORCE_ANSI.store(false, Ordering::Release);
     enable_console_ansi(handle);
@@ -468,7 +468,7 @@ pub fn set_console_handle(handle: HANDLE) {
 /// mirror) as the interactive output sink. ANSI is forced because GetConsoleMode
 /// is not defined for pipe handles.
 pub fn set_console_stream_handle(handle: HANDLE, ansi: bool) {
-    let relay_offset = queue_external_log_history();
+    let relay_offset = external_history_start_offset();
     let _ = CONSOLE_HANDLE.set(SendHandle(handle));
     CONSOLE_FORCE_ANSI.store(ansi, Ordering::Release);
     write_bootstrap_marker(&format!(
@@ -818,46 +818,19 @@ fn flush_console_backlog() {
     }
 }
 
-/// Only inspect a bounded tail of a shared log at console attach. The old
-/// fs::read() path allocated and parsed the entire historical file, sometimes
-/// megabytes of previous LeviLamina sessions on the game startup thread.
+/// Discover the bounded history range without performing file I/O on the
+/// Minecraft bootstrap thread. The relay worker parses this tail asynchronously.
+/// Older entries are excluded by the process-start timestamp filter.
 const EXTERNAL_HISTORY_TAIL_BYTES: u64 = 4 * 1024 * 1024;
 
-fn queue_external_log_history() -> u64 {
+fn external_history_start_offset() -> u64 {
     if !file_io_policy::writes_allowed() {
         return 0;
     }
     let path = PathBuf::from("logs").join("latest.log");
-    let Ok(mut file) = File::open(&path) else {
-        return 0;
-    };
-    let Ok(length) = file.metadata().map(|m| m.len()) else {
-        return 0;
-    };
-    let start = length.saturating_sub(EXTERNAL_HISTORY_TAIL_BYTES);
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return length;
-    }
-    let mut bytes = Vec::<u8>::with_capacity((length - start) as usize);
-    if file.read_to_end(&mut bytes).is_err() {
-        return length;
-    }
-    // A suffix may begin in the middle of a UTF-8 line; skip that fragment.
-    let first = if start > 0 {
-        bytes.iter().position(|byte| *byte == b'\n').map_or(bytes.len(), |i| i + 1)
-    } else {
-        0
-    };
-    for raw in bytes[first..].split(|byte| *byte == b'\n') {
-        if raw.is_empty() {
-            continue;
-        }
-        let line = String::from_utf8_lossy(raw).trim_end_matches('\r').to_string();
-        if let Some(external) = parse_external_structured_line(&line) {
-            forward_external_line(&external);
-        }
-    }
-    length
+    fs::metadata(path)
+        .map(|metadata| metadata.len().saturating_sub(EXTERNAL_HISTORY_TAIL_BYTES))
+        .unwrap_or(0)
 }
 
 fn start_external_log_relay(start_offset: u64) {
@@ -980,14 +953,15 @@ pub fn note_process_start() {
 }
 
 fn external_line_from_current_run(timestamp_full: &str) -> bool {
-    let Some(start) = PROCESS_START_TIMESTAMP.get() else {
-        return true;
-    };
-    // A LeviLamina console record can be second-precision even when
-    // BLoader's process-start clock has milliseconds. Comparing the raw
-    // strings would incorrectly reject events from that same first second.
+    PROCESS_START_TIMESTAMP
+        .get()
+        .is_none_or(|start| external_timestamp_at_or_after(timestamp_full, start))
+}
+
+fn external_timestamp_at_or_after(timestamp_full: &str, process_start: &str) -> bool {
+    // Source loggers may omit milliseconds; include the shared first second.
     let event_second = timestamp_full.get(..19).unwrap_or(timestamp_full);
-    let start_second = start.get(..19).unwrap_or(start);
+    let start_second = process_start.get(..19).unwrap_or(process_start);
     event_second >= start_second
 }
 
@@ -2182,7 +2156,8 @@ mod external_line_tests {
         // with no millisecond suffix even though it was from this process.
         let event = "2026-11-09 19:03:25";
         let start = "2026-11-09 19:03:25.123";
-        assert_eq!(&event[..19], &start[..19]);
+        assert!(external_timestamp_at_or_after(event, start));
+        assert!(!external_timestamp_at_or_after("2026-11-09 19:03:24", start));
     }
 
     #[test]
