@@ -27,6 +27,7 @@ const MAX_FRAGMENT_BUFFER: usize = 128 * 1024;
 struct PendingConsoleLine {
     text: String,
     scope: Option<String>,
+    scope_checked: bool,
 }
 const CP_ACP: u32 = 0;
 static ATTEMPTED: AtomicBool = AtomicBool::new(false);
@@ -194,13 +195,17 @@ fn capture(_handle: *mut c_void, s: &str, resolve_scope: impl FnOnce() -> Option
     if s.contains('\0') {
         return false;
     }
+    if s.is_empty() {
+        return true;
+    }
     PENDING_CONSOLE_LINE.with(|cell| {
         let mut pending = cell.borrow_mut();
         // A single colourful log line may use dozens of WriteConsole calls.
         // Stack walking and module attribution are only needed for its first
         // fragment, not for every subsequent ANSI/text write.
-        if pending.text.is_empty() || pending.scope.is_none() {
+        if !pending.scope_checked {
             pending.scope = resolve_scope();
+            pending.scope_checked = true;
         }
         pending.text.push_str(s);
 
@@ -208,6 +213,7 @@ fn capture(_handle: *mut c_void, s: &str, resolve_scope: impl FnOnce() -> Option
         if pending.text.len() > MAX_FRAGMENT_BUFFER {
             pending.text.clear();
             pending.scope = None;
+            pending.scope_checked = false;
             return;
         }
 
@@ -217,6 +223,7 @@ fn capture(_handle: *mut c_void, s: &str, resolve_scope: impl FnOnce() -> Option
             let attribution = pending.scope.clone();
             if pending.text.is_empty() {
                 pending.scope = None;
+                pending.scope_checked = false;
             }
             if !line.is_empty() {
                 logging::captured_console_output_from(attribution.as_deref(), &line);
@@ -317,6 +324,19 @@ mod tests {
         assert!(capture(std::ptr::null_mut(), "[19:03:25 INFO] ", resolve));
         assert!(capture(std::ptr::null_mut(), "[LeviLamina] line", resolve));
         assert!(capture(std::ptr::null_mut(), "\n", resolve));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn unresolved_mod_attribution_is_not_retried_for_each_fragment() {
+        let calls = std::cell::Cell::new(0usize);
+        let unknown = || {
+            calls.set(calls.get() + 1);
+            None
+        };
+        assert!(capture(std::ptr::null_mut(), "prefix", unknown));
+        assert!(capture(std::ptr::null_mut(), " body", unknown));
+        assert!(capture(std::ptr::null_mut(), "\n", unknown));
         assert_eq!(calls.get(), 1);
     }
 
