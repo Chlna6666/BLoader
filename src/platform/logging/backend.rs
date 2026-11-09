@@ -2107,9 +2107,9 @@ fn enable_console_ansi(handle: HANDLE) {
 
 fn write_debug_string(line: &str) {
     let wide: Vec<u16> = line.encode_utf16().chain(Some(0)).collect();
-    unsafe {
+    crate::game::game_log::with_passthrough(|| unsafe {
         OutputDebugStringW(wide.as_ptr());
-    }
+    });
 }
 
 #[cfg(test)]

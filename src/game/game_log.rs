@@ -34,6 +34,20 @@ thread_local! {
     static INSIDE: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Do not stack-walk BLoader's own OutputDebugString diagnostic mirrors.
+/// This guard is thread-local, so unrelated Minecraft threads are captured.
+pub fn with_passthrough<T>(f: impl FnOnce() -> T) -> T {
+    INSIDE.with(|cell| {
+        let previous = cell.replace(true);
+        struct Restore<'a>(&'a Cell<bool>, bool);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) { self.0.set(self.1); }
+        }
+        let _guard = Restore(cell, previous);
+        f()
+    })
+}
+
 /// Forwards one captured debug-channel message, splitting embedded newlines
 /// so the unified sinks keep their one-line-per-record shape.
 fn forward_game_message(message: &str, scope: &str) {
@@ -64,7 +78,7 @@ fn caller_scope() -> Option<String> {
 
 unsafe extern "system" fn detour_output_debug_string_a(text: *const u8) {
     HOOK_SEEN.fetch_add(1, Ordering::Relaxed);
-    let scope = caller_scope();
+    let scope = if INSIDE.with(Cell::get) { None } else { caller_scope() };
     if let Some(scope) = scope {
         if !INSIDE.with(|cell| cell.replace(true)) {
             if !text.is_null() {
@@ -89,7 +103,7 @@ unsafe extern "system" fn detour_output_debug_string_a(text: *const u8) {
 
 unsafe extern "system" fn detour_output_debug_string_w(text: *const u16) {
     HOOK_SEEN.fetch_add(1, Ordering::Relaxed);
-    let scope = caller_scope();
+    let scope = if INSIDE.with(Cell::get) { None } else { caller_scope() };
     if let Some(scope) = scope {
         if !INSIDE.with(|cell| cell.replace(true)) {
             if !text.is_null() {
