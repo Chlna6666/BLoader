@@ -68,6 +68,7 @@ struct ExternalStructuredLine {
 
 static CONSOLE_HANDLE: OnceLock<SendHandle> = OnceLock::new();
 static CONSOLE_FORCE_ANSI: AtomicBool = AtomicBool::new(false);
+static CONSOLE_ANSI_ENABLED: AtomicBool = AtomicBool::new(false);
 static CONSOLE_BACKLOG: OnceLock<Mutex<VecDeque<ConsoleBacklogRecord>>> = OnceLock::new();
 static CONSOLE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CONSOLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -458,6 +459,9 @@ pub fn set_console_handle(handle: HANDLE) {
     let _ = CONSOLE_HANDLE.set(SendHandle(handle));
     CONSOLE_FORCE_ANSI.store(false, Ordering::Release);
     enable_console_ansi(handle);
+    // A GetConsoleMode syscall for every formatted line was unnecessary.
+    // Refresh only when the host console sink is initialized.
+    CONSOLE_ANSI_ENABLED.store(query_console_ansi(handle), Ordering::Release);
     write_bootstrap_marker(&format!(
         "logging.console.ready handle=0x{:X} ansi={} banner_owner=console-branding",
         handle.0 as usize,
@@ -474,6 +478,7 @@ pub fn set_console_stream_handle(handle: HANDLE, ansi: bool) {
     let relay_offset = external_history_start_offset();
     let _ = CONSOLE_HANDLE.set(SendHandle(handle));
     CONSOLE_FORCE_ANSI.store(ansi, Ordering::Release);
+    CONSOLE_ANSI_ENABLED.store(ansi, Ordering::Release);
     write_bootstrap_marker(&format!(
         "logging.console.stream.ready handle=0x{:X} ansi={} banner_owner=console-branding",
         handle.0 as usize,
@@ -2068,16 +2073,14 @@ fn write_bytes_to_console_locked(bytes: &[u8]) {
 }
 
 fn console_supports_ansi() -> bool {
-    if CONSOLE_FORCE_ANSI.load(Ordering::Acquire) {
-        return true;
-    }
-    let Some(handle) = CONSOLE_HANDLE.get().map(|value| value.0) else {
-        return false;
-    };
+    CONSOLE_FORCE_ANSI.load(Ordering::Acquire)
+        || CONSOLE_ANSI_ENABLED.load(Ordering::Acquire)
+}
+
+fn query_console_ansi(handle: HANDLE) -> bool {
     if handle.is_invalid() {
         return false;
     }
-
     unsafe {
         let mut mode = CONSOLE_MODE(0);
         if GetConsoleMode(handle, &mut mode).is_ok() {
