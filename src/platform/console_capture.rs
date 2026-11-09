@@ -9,7 +9,7 @@
 //! hooks live in kernelbase and cover both import styles.
 
 use core::ffi::c_void;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use minhook::MinHook;
@@ -19,6 +19,15 @@ use windows::core::{PCSTR, w};
 use crate::platform::logging;
 
 const MAX_WRITE: usize = 64 * 1024;
+const MAX_FRAGMENT_BUFFER: usize = 128 * 1024;
+
+/// Win32/LeviLamina loggers split a single coloured logical line across
+/// multiple WriteConsole calls. Keep the fragments until the newline arrives.
+#[derive(Default)]
+struct PendingConsoleLine {
+    text: String,
+    scope: Option<String>,
+}
 const CP_ACP: u32 = 0;
 static ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
@@ -30,6 +39,8 @@ thread_local! {
     // A hooked implementation may re-enter another hooked export (for example
     // WriteFile on a console handle); only the outermost detour captures.
     static IN_DETOUR: Cell<bool> = const { Cell::new(false) };
+    static PENDING_CONSOLE_LINE: RefCell<PendingConsoleLine> =
+        RefCell::new(PendingConsoleLine::default());
 }
 
 #[link(name = "kernel32")]
@@ -180,26 +191,37 @@ fn decode_ansi(bytes: &[u8]) -> String {
 }
 
 fn capture(_handle: *mut c_void, s: &str, scope: Option<&str>) -> bool {
-    if s.contains('\0') { return false; }
-    // Only complete writes are recorded: a piece is accepted when the write
-    // that produced it ended with a newline. Native loaders often split one
-    // logical line into several WriteConsole calls (colour prefix, text,
-    // reset); forwarding those fragments produced a second and third copy of
-    // the same line next to the complete one from stdout / the log file.
-    // Fragments are consumed without being rendered (the complete line comes
-    // from the other channel), so the raw fragment never leaks to the console
-    // either.
-    let mut pieces = s.split('\n').peekable();
-    while let Some(piece) = pieces.next() {
-        if pieces.peek().is_none() {
-            break;
-        }
-        let part = piece.trim_end_matches('\r');
-        if part.is_empty() {
-            continue;
-        }
-        logging::captured_console_output_from(scope, part);
+    if s.contains('\0') {
+        return false;
     }
+    PENDING_CONSOLE_LINE.with(|cell| {
+        let mut pending = cell.borrow_mut();
+        if pending.text.is_empty() {
+            pending.scope = scope.map(str::to_owned);
+        } else if pending.scope.is_none() {
+            pending.scope = scope.map(str::to_owned);
+        }
+        pending.text.push_str(s);
+
+        // Never let a logger that does not terminate a line grow memory forever.
+        if pending.text.len() > MAX_FRAGMENT_BUFFER {
+            pending.text.clear();
+            pending.scope = None;
+            return;
+        }
+
+        while let Some(end) = pending.text.find('\n') {
+            let line = pending.text[..end].trim_end_matches('\r').to_string();
+            pending.text.drain(..=end);
+            let attribution = pending.scope.clone();
+            if pending.text.is_empty() {
+                pending.scope = None;
+            }
+            if !line.is_empty() {
+                logging::captured_console_output_from(attribution.as_deref(), &line);
+            }
+        }
+    });
     true
 }
 

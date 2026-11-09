@@ -584,9 +584,9 @@ pub fn captured_console_output_from(attribution: Option<&str>, input: &str) {
         if external_line_ignored(&external.source) {
             return;
         }
-        let scope = attribution
-            .map(str::to_string)
-            .unwrap_or_else(|| external_scope(&external.source));
+        // Prefer the structured producer tag for LeviLamina's cross-DLL
+        // forwarding. A shim's call stack often belongs to PreLoader.
+        let scope = external_scope(&external.source);
         forward_captured_record(CapturedRecord {
             timestamp_full: external.timestamp_full,
             timestamp_clock: external.timestamp_clock,
@@ -846,14 +846,19 @@ fn tail_external_structured_log(path: &Path, mut offset: u64) {
         }
 
         let current = file_epoch(path);
-        if current != epoch {
-            // The file was rotated or truncated under us: the recorded offset
-            // points into a file that no longer exists. Restart from the new
-            // file's beginning.
-            epoch = current;
+        let rotated_or_truncated = match (epoch, current) {
+            (Some((old_creation, _)), Some((new_creation, new_len))) => {
+                old_creation != new_creation || new_len < offset
+            }
+            (None, None) => false,
+            _ => true,
+        };
+        if rotated_or_truncated {
+            // Rotation or truncation invalidates the byte offset; appends do not.
             offset = 0;
             pending.clear();
         }
+        epoch = current;
 
         if let Ok(mut file) = File::open(path) {
             if file.seek(SeekFrom::Start(offset)).is_ok() {
@@ -1008,8 +1013,7 @@ fn forward_captured_record(record: CapturedRecord) {
         RELAY_STALE_SKIPPED.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let key = captured_line_key(&record.message);
-    if !record_captured_line_once(&record.timestamp_full, &key) {
+    if !record_captured_line_once(&record) {
         return;
     }
     RELAY_FORWARDED.fetch_add(1, Ordering::Relaxed);
@@ -1145,16 +1149,16 @@ fn captured_line_key(message: &str) -> String {
     text.to_string()
 }
 
-fn record_captured_line_once(_timestamp_full: &str, message: &str) -> bool {
-    // One logical line reaches the sinks through several channels: the
-    // console hook, the CRT pipe reader and the latest.log tail relay. Those
-    // copies can be minutes apart — the log relay only sees a line once the
-    // writer flushed it, and during a slow preload that is much later than the
-    // live copies. A short time window therefore let the same line through
-    // again; the journal is session-wide instead, bounded so it cannot grow
-    // without limit. The key is the normalized text (channel decorations
-    // removed), so every copy of one line maps to the same entry.
-    let key = captured_line_key(message);
+fn record_captured_line_once(record: &CapturedRecord) -> bool {
+    // Distinguish different sources and seconds. Text-only session-wide keys
+    // accidentally suppressed legitimate recurring errors for the entire run.
+    let clock = record.timestamp_clock.get(..8).unwrap_or(&record.timestamp_clock);
+    let key = format!(
+        "{}|{}|{}",
+        clock,
+        record.scope.to_ascii_lowercase(),
+        captured_line_key(&record.message)
+    );
     let mut recent = EXTERNAL_DEDUPE
         .get_or_init(|| Mutex::new(VecDeque::new()))
         .lock()
@@ -1176,7 +1180,17 @@ fn parse_external_structured_line(line: &str) -> Option<ExternalStructuredLine> 
     let level_token = header.split_whitespace().last()?;
     let level = external_level(level_token)?;
 
-    let timestamp_full = header.strip_suffix(level_token)?.trim();
+    let raw_timestamp = header.strip_suffix(level_token)?.trim();
+    // Win32 console loggers commonly omit the date, while the file relay
+    // includes it. Normalize both before the current-session cutoff check.
+    let timestamp_full = if raw_timestamp.len() >= 8
+        && raw_timestamp.as_bytes().get(2) == Some(&b':')
+        && raw_timestamp.as_bytes().get(5) == Some(&b':')
+    {
+        format!("{} {raw_timestamp}", Local::now().format("%Y-%m-%d"))
+    } else {
+        raw_timestamp.to_string()
+    };
     let timestamp_clock = timestamp_full
         .split_whitespace()
         .last()
@@ -1829,6 +1843,16 @@ mod external_line_tests {
         assert_eq!(external_level("INFO"), Some(Level::INFO));
         assert_eq!(external_level("WARNING"), Some(Level::WARN));
         assert_eq!(external_level("bogus"), None);
+    }
+
+    #[test]
+    fn console_short_timestamp_is_normalized() {
+        let parsed = parse_external_structured_line(
+            "[19:03:25 INFO] [LeviLamina] Loading BedrockSceneCapture"
+        ).expect("short console timestamp");
+        assert!(parsed.timestamp_full.ends_with(" 19:03:25"));
+        assert_eq!(parsed.timestamp_clock, "19:03:25");
+        assert_eq!(parsed.source, "LeviLamina");
     }
 
     #[test]
