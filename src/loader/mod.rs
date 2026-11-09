@@ -1,3 +1,5 @@
+mod registry;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -284,11 +286,36 @@ pub unsafe fn load_native_preloads_in_dllmain(game_dir: &Path) -> NativePreloadS
             .then_with(|| a.dll_path.cmp(&b.dll_path))
     });
 
-    for preload in native_preloads {
+    let mut ready = ready_mod_ids();
+    let plan = plan_preload_mods(&native_preloads, &ready);
+    for (index, reason) in plan.rejected {
+        let preload = &native_preloads[index];
+        record_dependency_failure(preload, "dllmain_preload", reason);
+        summary.failed += 1;
+        if preload.required {
+            summary.required_failed += 1;
+        }
+    }
+    for index in plan.order {
+        let preload = &native_preloads[index];
+        if let Some(dependency) = dependency_not_ready(&preload.dependencies, &ready) {
+            record_dependency_failure(
+                preload,
+                "dllmain_preload",
+                format!("required dependency {dependency} did not load successfully"),
+            );
+            summary.failed += 1;
+            if preload.required {
+                summary.required_failed += 1;
+            }
+            continue;
+        }
         summary.attempted += 1;
-        let report = unsafe { load_and_verify_native(&preload, "dllmain_preload", true) };
+        let report = unsafe { load_and_verify_native(preload, "dllmain_preload", true) };
         match report.state {
             NativeLoadState::Verified | NativeLoadState::AlreadyVerified => {
+                ready.insert(preload.id.to_ascii_lowercase());
+                ready.insert(preload.name.to_ascii_lowercase());
                 summary.verified += 1;
                 if report.notify_success {
                     summary.success_notifications += 1;
@@ -301,7 +328,7 @@ pub unsafe fn load_native_preloads_in_dllmain(game_dir: &Path) -> NativePreloadS
                 }
             }
         }
-        apply_native_diagnostics(&preload, &report);
+        apply_native_diagnostics(preload, &report);
         record_native_report(report);
     }
 
@@ -338,6 +365,65 @@ fn diagnostics_identity(preload: &PreloadMod) -> mod_diagnostics::ModIdentity {
         &preload.dll_path,
         preload.log_aliases.clone(),
     )
+}
+
+fn ready_mod_ids() -> HashSet<String> {
+    crate::platform::mod_diagnostics::all_mods()
+        .into_iter()
+        .filter(|identity| identity.state == "loaded")
+        .flat_map(|identity| [
+            identity.id.to_ascii_lowercase(),
+            identity.name.to_ascii_lowercase(),
+        ])
+        .collect()
+}
+
+fn dependency_not_ready<'a>(
+    dependencies: &'a [String],
+    ready: &HashSet<String>,
+) -> Option<&'a str> {
+    dependencies
+        .iter()
+        .find(|dep| !ready.contains(&dep.trim().to_ascii_lowercase()))
+        .map(String::as_str)
+}
+
+fn plan_preload_mods(mods: &[PreloadMod], ready: &HashSet<String>) -> registry::LoadPlan {
+    let nodes = mods.iter()
+        .map(|item| registry::ModNode {
+            id: item.id.clone(),
+            dependencies: item.dependencies.clone(),
+        })
+        .collect::<Vec<_>>();
+    registry::plan_mods(&nodes, ready)
+}
+
+fn record_dependency_failure(preload: &PreloadMod, phase: &str, reason: String) {
+    let report = NativeLoadReport {
+        name: preload.name.clone(),
+        phase: phase.to_string(),
+        required: preload.required,
+        notify_success: false,
+        expected_path: preload.dll_path.display().to_string(),
+        resolved_path: None,
+        loader_api: None,
+        module_handle: None,
+        state: NativeLoadState::Failed,
+        stage: "dependency_graph".to_string(),
+        detail: reason,
+        verified_exports: Vec::new(),
+        verified_modules: Vec::new(),
+        elapsed_ms: 0,
+    };
+    logging::scoped_error_message(
+        "native-loader",
+        &format!(
+            "MOD_DEPENDENCY_FAILURE | phase={} name={} reason={}",
+            phase, report.name, report.detail,
+        ),
+    );
+    apply_native_diagnostics(preload, &report);
+    record_native_report(report);
 }
 
 fn apply_native_diagnostics(preload: &PreloadMod, report: &NativeLoadReport) {
@@ -1236,110 +1322,122 @@ fn package_loose_dll(mods_dir: &Path, entry_path: &Path) -> Option<PreloadMod> {
 }
 
 fn load_preload_mods(preload_mods: &mut Vec<PreloadMod>) -> bool {
-    preload_mods.sort_by(|a, b| {
-        let a_is_preloader = a.name == "PreLoader";
-        let b_is_preloader = b.name == "PreLoader";
-
-        if a_is_preloader && !b_is_preloader {
-            std::cmp::Ordering::Less
-        } else if !a_is_preloader && b_is_preloader {
-            std::cmp::Ordering::Greater
-        } else {
-            a.name.cmp(&b.name)
-        }
-    });
+    preload_mods.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+    let mut ready = ready_mod_ids();
+    let plan = plan_preload_mods(preload_mods, &ready);
+    for (index, reason) in plan.rejected {
+        record_dependency_failure(&preload_mods[index], "preload_native", reason);
+    }
 
     let mut preloader_activated = false;
-
-    for preload in preload_mods {
+    for index in plan.order {
+        let preload = &preload_mods[index];
+        if let Some(dependency) = dependency_not_ready(&preload.dependencies, &ready) {
+            record_dependency_failure(
+                preload,
+                "preload_native",
+                format!("required dependency {dependency} did not load successfully"),
+            );
+            continue;
+        }
         let is_preloader = preload.name == "PreLoader";
-
         logging::info_message(&format!(
             "Loading Mod: {} <{}>",
             preload.name,
-            preload
-                .dll_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
+            preload.dll_path.file_name().unwrap_or_default().to_string_lossy(),
         ));
-
         let loaded = unsafe { load_library(preload, "preload_native", is_preloader) };
-
+        if loaded {
+            ready.insert(preload.id.to_ascii_lowercase());
+            ready.insert(preload.name.to_ascii_lowercase());
+        }
         if is_preloader && loaded {
             preloader_activated = true;
             break;
         }
     }
-
     preloader_activated
+}
+
+fn hot_as_native(hot: &HotMod) -> PreloadMod {
+    PreloadMod {
+        id: hot.id.clone(),
+        name: hot.name.clone(),
+        dependencies: hot.dependencies.clone(),
+        version: hot.version.clone(),
+        kind: hot.kind.clone(),
+        dll_path: hot.dll_path.clone(),
+        log_aliases: hot.log_aliases.clone(),
+        required: hot.required,
+        verify_exports: hot.verify_exports.clone(),
+        verify_modules: hot.verify_modules.clone(),
+        notify_success: hot.notify_success,
+    }
 }
 
 fn spawn_hot_mod_loader(mut hot_mods: Vec<HotMod>) {
     if hot_mods.is_empty() {
         return;
     }
-
     let _ = thread::Builder::new()
         .name("bloader-hot-mod-loader".to_string())
         .spawn(move || {
-            logging::scoped_info_message(
-                "runtime-ready",
-                &format!(
-                    "hot Mod queue={} mode=oep+window-stability graphics_hooks=disabled",
-                    hot_mods.len()
-                ),
-            );
-
             hot_mods.sort_by(|a, b| {
                 a.inject_delay_ms
                     .cmp(&b.inject_delay_ms)
                     .then_with(|| a.ready_level.cmp(&b.ready_level))
                     .then_with(|| a.name.cmp(&b.name))
             });
+            let mut ready = ready_mod_ids();
+            let nodes = hot_mods.iter().map(|item| registry::ModNode {
+                id: item.id.clone(),
+                dependencies: item.dependencies.clone(),
+            }).collect::<Vec<_>>();
+            let plan = registry::plan_mods(&nodes, &ready);
+            logging::scoped_info_message(
+                "runtime-ready",
+                &format!("hot Mod queue={} dependency_ordered=true", hot_mods.len()),
+            );
+            for (index, reason) in plan.rejected {
+                record_dependency_failure(&hot_as_native(&hot_mods[index]), "hot_inject", reason);
+            }
+            for index in plan.order {
+                let hot_mod = &hot_mods[index];
+                let native_mod = hot_as_native(hot_mod);
+                if let Some(dependency) = dependency_not_ready(&hot_mod.dependencies, &ready) {
+                    record_dependency_failure(
+                        &native_mod,
+                        "hot_inject",
+                        format!("required dependency {dependency} did not load successfully"),
+                    );
+                    continue;
+                }
 
-            for hot_mod in hot_mods {
                 let readiness_reached =
                     runtime_ready::wait_for(hot_mod.ready_level, HOT_INJECT_WAIT_TIMEOUT);
-                runtime_ready::wait_until_oep_delay(hot_mod.inject_delay_ms);
-
                 if !readiness_reached {
-                    logging::scoped_warn_message(
-                        "runtime-ready",
-                        &format!(
-                            "mod={} readiness={} timed out; continuing for compatibility after configured delay",
-                            hot_mod.name,
+                    record_dependency_failure(
+                        &native_mod,
+                        "hot_inject",
+                        format!(
+                            "runtime readiness {} timed out; refusing unsafe load",
                             hot_mod.ready_level.as_str()
                         ),
                     );
+                    continue;
                 }
-
+                runtime_ready::wait_until_oep_delay(hot_mod.inject_delay_ms);
                 logging::info_message(&format!(
-                    "Hot Loading Mod: {} <{}> readiness={} readiness_reached={} delay_from_oep={}ms graphics_hooks=disabled",
+                    "Hot Loading Mod: {} <{}> readiness={} delay_from_oep={}ms",
                     hot_mod.name,
-                    hot_mod
-                        .dll_path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy(),
+                    hot_mod.dll_path.file_name().unwrap_or_default().to_string_lossy(),
                     hot_mod.ready_level.as_str(),
-                    readiness_reached,
                     hot_mod.inject_delay_ms,
                 ));
-                let native_mod = PreloadMod {
-                    id: hot_mod.id.clone(),
-                    name: hot_mod.name.clone(),
-                    dependencies: hot_mod.dependencies.clone(),
-                    version: hot_mod.version.clone(),
-                    kind: hot_mod.kind.clone(),
-                    dll_path: hot_mod.dll_path.clone(),
-                    log_aliases: hot_mod.log_aliases.clone(),
-                    required: hot_mod.required,
-                    verify_exports: hot_mod.verify_exports.clone(),
-                    verify_modules: hot_mod.verify_modules.clone(),
-                    notify_success: hot_mod.notify_success,
-                };
-                unsafe { load_library(&native_mod, "hot_inject", false) };
+                if unsafe { load_library(&native_mod, "hot_inject", false) } {
+                    ready.insert(hot_mod.id.to_ascii_lowercase());
+                    ready.insert(hot_mod.name.to_ascii_lowercase());
+                }
             }
         });
 }
