@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -72,7 +72,12 @@ static CONSOLE_BACKLOG: OnceLock<Mutex<VecDeque<ConsoleBacklogRecord>>> = OnceLo
 static CONSOLE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CONSOLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static EXTERNAL_LOG_RELAY_STARTED: OnceLock<()> = OnceLock::new();
-static EXTERNAL_DEDUPE: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+#[derive(Default)]
+struct DedupeJournal {
+    order: VecDeque<String>,
+    keys: HashSet<String>,
+}
+static EXTERNAL_DEDUPE: OnceLock<Mutex<DedupeJournal>> = OnceLock::new();
 static PROCESS_START_TIMESTAMP: OnceLock<String> = OnceLock::new();
 static LOGGING_READY: OnceLock<()> = OnceLock::new();
 static LATEST_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -1159,17 +1164,20 @@ fn record_captured_line_once(record: &CapturedRecord) -> bool {
         record.scope.to_ascii_lowercase(),
         captured_line_key(&record.message)
     );
-    let mut recent = EXTERNAL_DEDUPE
-        .get_or_init(|| Mutex::new(VecDeque::new()))
+    let mut journal = EXTERNAL_DEDUPE
+        .get_or_init(|| Mutex::new(DedupeJournal::default()))
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if recent.iter().any(|entry| entry == &key) {
+    if journal.keys.contains(&key) {
         return false;
     }
-    while recent.len() >= EXTERNAL_DEDUPE_LIMIT {
-        recent.pop_front();
+    while journal.order.len() >= EXTERNAL_DEDUPE_LIMIT {
+        if let Some(expired) = journal.order.pop_front() {
+            journal.keys.remove(&expired);
+        }
     }
-    recent.push_back(key);
+    journal.keys.insert(key.clone());
+    journal.order.push_back(key);
     true
 }
 
