@@ -190,16 +190,17 @@ fn decode_ansi(bytes: &[u8]) -> String {
     }
 }
 
-fn capture(_handle: *mut c_void, s: &str, scope: Option<&str>) -> bool {
+fn capture(_handle: *mut c_void, s: &str, resolve_scope: impl FnOnce() -> Option<String>) -> bool {
     if s.contains('\0') {
         return false;
     }
     PENDING_CONSOLE_LINE.with(|cell| {
         let mut pending = cell.borrow_mut();
-        if pending.text.is_empty() {
-            pending.scope = scope.map(str::to_owned);
-        } else if pending.scope.is_none() {
-            pending.scope = scope.map(str::to_owned);
+        // A single colourful log line may use dozens of WriteConsole calls.
+        // Stack walking and module attribution are only needed for its first
+        // fragment, not for every subsequent ANSI/text write.
+        if pending.text.is_empty() || pending.scope.is_none() {
+            pending.scope = resolve_scope();
         }
         pending.text.push_str(s);
 
@@ -248,8 +249,7 @@ unsafe extern "system" fn intercept_w(h: *mut c_void, data: *const c_void, len: 
         };
         // Attribution must be captured here, not inside the closure: the
         // backtrace walk skips exactly two frames (helper + detour).
-        let scope = caller_scope();
-        if std::panic::catch_unwind(|| capture(h, &text, scope.as_deref())).unwrap_or(false) {
+        if std::panic::catch_unwind(|| capture(h, &text, caller_scope)).unwrap_or(false) {
             if !count.is_null() { unsafe { *count = len }; }
             return 1;
         }
@@ -269,8 +269,7 @@ unsafe extern "system" fn intercept_a(h: *mut c_void, data: *const c_void, len: 
             let slice = unsafe { std::slice::from_raw_parts(data as *const u8, len as usize) };
             decode_ansi(slice)
         };
-        let scope = caller_scope();
-        if std::panic::catch_unwind(|| capture(h, &text, scope.as_deref())).unwrap_or(false) {
+        if std::panic::catch_unwind(|| capture(h, &text, caller_scope)).unwrap_or(false) {
             if !count.is_null() { unsafe { *count = len }; }
             return 1;
         }
@@ -295,8 +294,7 @@ unsafe extern "system" fn intercept_file(h: *mut c_void, data: *const c_void, le
         // line; hand it back to the original writer untouched.
         if slice.iter().all(|&b| b >= 0x20 || matches!(b, b'\r' | b'\n' | b'\t')) {
             let text = decode_ansi(slice);
-            let scope = caller_scope();
-            if std::panic::catch_unwind(|| capture(h, &text, scope.as_deref())).unwrap_or(false) {
+            if std::panic::catch_unwind(|| capture(h, &text, caller_scope)).unwrap_or(false) {
                 if !count.is_null() { unsafe { *count = len }; }
                 return 1;
             }
@@ -308,6 +306,20 @@ unsafe extern "system" fn intercept_file(h: *mut c_void, data: *const c_void, le
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preserves_colored_fragments_with_single_attribution() {
+        let calls = std::cell::Cell::new(0usize);
+        // Callback called only when opening a new logical line.
+        let resolve = || {
+            calls.set(calls.get() + 1);
+            Some("mod:LeviLamina".to_string())
+        };
+        assert!(capture(std::ptr::null_mut(), "[19:03:25 INFO] ", resolve));
+        assert!(capture(std::ptr::null_mut(), "[LeviLamina] line", resolve));
+        assert!(capture(std::ptr::null_mut(), "\n", resolve));
+        assert_eq!(calls.get(), 1);
+    }
+
     #[test]
     fn guard_restores_original_mode() {
         assert!(!BYPASS.with(Cell::get));
