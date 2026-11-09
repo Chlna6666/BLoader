@@ -190,17 +190,21 @@ pub fn update_config(config: &Config) {
 /// 早期（DllMain 预加载阶段，先于 Config::load）判断内置披风是否启用。
 /// 直接读 config.json，不触发 schema 重写等副作用。
 fn builtin_enabled_early() -> bool {
+    // The startup policy uses Config::load() before the preload phase.
+    // Use identical defaults here even if the config is absent or malformed:
+    // otherwise an independent Cosmetics.dll can load before the embedded hook.
+    let default = crate::config::Config::default().enable_cosmetics;
     let path = crate::config::config_file_path();
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return false;
+        return default;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return false;
+        return default;
     };
     value
         .get("enable_cosmetics")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
+        .unwrap_or(default)
 }
 
 /// 独立 Cosmetics.dll 抑制判断：内置启用时跳过同名原生 mod 包，

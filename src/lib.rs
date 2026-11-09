@@ -122,6 +122,13 @@ fn run_bootstrap_late_attach() {
 }
 
 fn run_bootstrap_sequence(execution_mode: &'static str) -> bool {
+    // Load the launch policy before any third-party DLL, including PreLoader.
+    // The same immutable startup snapshot governs both OEP preloads and normal mods.
+    let config = config::Config::load();
+    crate::platform::logging::write_bootstrap_marker(&format!(
+        "bootstrap.config.early_loaded disable_mod_loading={} cosmetics={}",
+        config.disable_mod_loading, config.enable_cosmetics
+    ));
     crate::platform::logging::write_bootstrap_marker(&format!(
         "bootstrap.xuser_bridge.premain.begin execution={execution_mode} loader_lock=released"
     ));
@@ -129,6 +136,15 @@ fn run_bootstrap_sequence(execution_mode: &'static str) -> bool {
     crate::platform::logging::write_bootstrap_marker(&format!(
         "bootstrap.xuser_bridge.premain.done execution={execution_mode} loader_lock=released"
     ));
+
+    // A disabled mod chain must not hide the early diagnostic console.
+    if config.enable_debug_console {
+        unsafe {
+            crate::platform::console::init_console_window_early();
+            crate::platform::console::activate_console_logging();
+        }
+        crate::bootstrap::xuser_bridge::publish_pending_logs();
+    }
 
     crate::platform::crash_report::install();
 
@@ -144,7 +160,7 @@ fn run_bootstrap_sequence(execution_mode: &'static str) -> bool {
         crate::game::game_log::install();
     }
 
-    let premain_result = panic::catch_unwind(|| unsafe { prepare_premain_preloads(execution_mode) });
+    let premain_result = panic::catch_unwind(|| unsafe { prepare_premain_preloads(execution_mode, &config) });
     let (preloader_summary, loaded_summary) = match premain_result {
         Ok(summary) => summary,
         Err(panic_payload) => {
@@ -158,7 +174,7 @@ fn run_bootstrap_sequence(execution_mode: &'static str) -> bool {
     };
 
     if let Err(panic_payload) = panic::catch_unwind(|| unsafe {
-        bootstrap(preloader_summary, loaded_summary, execution_mode)
+        bootstrap(preloader_summary, loaded_summary, execution_mode, config)
     }) {
         let details = panic_payload_to_string(panic_payload.as_ref());
         report_bootstrap_panic(&details, execution_mode);
@@ -173,10 +189,23 @@ fn run_bootstrap_sequence(execution_mode: &'static str) -> bool {
 
 unsafe fn prepare_premain_preloads(
     execution_mode: &str,
+    config: &config::Config,
 ) -> (
     crate::bootstrap::preloader_proxy::PreloaderProxySummary,
     crate::loader::NativePreloadSummary,
 ) {
+    if config.disable_mod_loading {
+        crate::platform::logging::write_bootstrap_marker(
+            "bootstrap.mods.skipped phase=pre-main reason=disable_mod_loading",
+        );
+        return (
+            crate::bootstrap::preloader_proxy::PreloaderProxySummary {
+                discovered: 0,
+                state: crate::bootstrap::preloader_proxy::PreloaderProxyState::NotFound,
+            },
+            crate::loader::NativePreloadSummary::default(),
+        );
+    }
     let game_dir = crate::platform::utils::get_exe_directory();
     crate::platform::logging::write_bootstrap_marker(&format!(
         "bootstrap.preloader.premain.begin phase={execution_mode}"
@@ -220,13 +249,13 @@ unsafe fn bootstrap(
     preloader_summary: crate::bootstrap::preloader_proxy::PreloaderProxySummary,
     loaded_summary: crate::loader::NativePreloadSummary,
     execution_mode: &'static str,
+    config: config::Config,
 ) {
     let start_time = Instant::now();
     crate::platform::logging::write_bootstrap_marker(&format!(
         "bootstrap.begin execution={execution_mode}"
     ));
 
-    let config = config::Config::load();
     config::ensure_config_watcher();
     config::Config::apply_update(&config);
     crate::platform::logging::write_bootstrap_marker("bootstrap.config.loaded");
