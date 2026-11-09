@@ -270,11 +270,13 @@ fn logging_scoped_debug_relay_report(total_secs: u64) {
     scoped_debug_message(
         "logging",
         &format!(
-            "relay channel check (after {total_secs}s): seen={} unparsed={} forwarded={} stale_skipped={}",
+            "relay channel check (after {total_secs}s): seen={} unparsed={} forwarded={} stale_skipped={} file_batches={} file_sync_fallbacks={}",
             RELAY_SEEN.load(Ordering::Relaxed),
             RELAY_UNPARSED.load(Ordering::Relaxed),
             RELAY_FORWARDED.load(Ordering::Relaxed),
             RELAY_STALE_SKIPPED.load(Ordering::Relaxed),
+            FILE_BATCHES.load(Ordering::Relaxed),
+            FILE_SYNC_FALLBACKS.load(Ordering::Relaxed),
         ),
     );
 }
@@ -414,15 +416,12 @@ fn append_mod_log(mod_name: &str, mod_id: &str, stream: &str, message: &str) {
     if !file_io_policy::writes_allowed() {
         return;
     }
-
-    let dir = PathBuf::from("logs").join("mods");
-    let _ = fs::create_dir_all(&dir);
     let file_name = format!(
         "{}-{}.log",
         sanitize_file_component(mod_name),
         sanitize_file_component(mod_id)
     );
-    let path = dir.join(file_name);
+    let path = PathBuf::from("logs").join("mods").join(file_name);
     let line = format!(
         "[{}] [tid={}] [thread={}] [stream={}] {}\r\n",
         Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
@@ -431,10 +430,7 @@ fn append_mod_log(mod_name: &str, mod_id: &str, stream: &str, message: &str) {
         stream,
         message,
     );
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = file.write_all(line.as_bytes());
-        let _ = file.flush();
-    }
+    enqueue_file_write(FileWrite::Mod(path, line.into_bytes()));
 }
 
 fn sanitize_file_component(value: &str) -> String {
@@ -1127,7 +1123,7 @@ fn write_captured_file_record(record: &CapturedRecord) {
         record.scope,
         record.message
     );
-    write_bytes_to_bootstrap_file(line.as_bytes());
+    enqueue_file_write(FileWrite::Main(line.into_bytes()));
 }
 
 /// Maps a parsed external line's source tag to a console scope. The game's
@@ -1760,6 +1756,101 @@ fn write_bytes_to_bootstrap_file(bytes: &[u8]) {
             let _ = file.flush();
         }
     }
+}
+
+// Captured stdio and per-Mod logs must not open and flush a file on every
+// intercepted native print. Batch the two existing log destinations and Mod
+// files through one bounded writer. Critical bootstrap/panic markers continue
+// to use the synchronous emergency file path.
+enum FileWrite {
+    Main(Vec<u8>),
+    Mod(PathBuf, Vec<u8>),
+}
+
+static FILE_SINK: OnceLock<Option<std::sync::mpsc::SyncSender<FileWrite>>> = OnceLock::new();
+static FILE_SYNC_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static FILE_BATCHES: AtomicU64 = AtomicU64::new(0);
+const FILE_QUEUE_LIMIT: usize = 8192;
+const FILE_BATCH_LIMIT: usize = 256;
+const FILE_BATCH_WINDOW: Duration = Duration::from_millis(25);
+
+fn write_mod_file(path: &Path, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(bytes);
+    }
+}
+
+fn write_file_batch(commands: Vec<FileWrite>) {
+    let mut main = Vec::<u8>::new();
+    let mut mod_files = HashMap::<PathBuf, Vec<u8>>::new();
+    for command in commands {
+        match command {
+            FileWrite::Main(bytes) => main.extend_from_slice(&bytes),
+            FileWrite::Mod(path, bytes) => mod_files.entry(path).or_default().extend_from_slice(&bytes),
+        }
+    }
+    if !main.is_empty() {
+        write_bytes_to_bootstrap_file(&main);
+    }
+    for (path, bytes) in mod_files {
+        write_mod_file(&path, &bytes);
+    }
+    FILE_BATCHES.fetch_add(1, Ordering::Relaxed);
+}
+
+fn file_sink() -> &'static Option<std::sync::mpsc::SyncSender<FileWrite>> {
+    FILE_SINK.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<FileWrite>(FILE_QUEUE_LIMIT);
+        match thread::Builder::new()
+            .name("bloader-file-writer".to_string())
+            .spawn(move || {
+                while let Ok(first) = receiver.recv() {
+                    let mut batch = Vec::with_capacity(FILE_BATCH_LIMIT);
+                    batch.push(first);
+                    let start = Instant::now();
+                    while batch.len() < FILE_BATCH_LIMIT {
+                        let Some(remaining) = FILE_BATCH_WINDOW.checked_sub(start.elapsed()) else {
+                            break;
+                        };
+                        match receiver.recv_timeout(remaining) {
+                            Ok(command) => batch.push(command),
+                            Err(_) => break,
+                        }
+                    }
+                    write_file_batch(batch);
+                }
+            }) {
+            Ok(_) => Some(sender),
+            Err(_) => None,
+        }
+    })
+}
+
+fn enqueue_file_write(command: FileWrite) {
+    if !file_io_policy::writes_allowed() {
+        return;
+    }
+    if let Some(sender) = file_sink() {
+        match sender.try_send(command) {
+            Ok(()) => return,
+            Err(std::sync::mpsc::TrySendError::Full(command))
+            | Err(std::sync::mpsc::TrySendError::Disconnected(command)) => {
+                // File records are lossless even under severe overload. This
+                // rare fallback may be synchronous; the ordinary hot path isn't.
+                FILE_SYNC_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                write_file_batch(vec![command]);
+                return;
+            }
+        }
+    }
+    FILE_SYNC_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    write_file_batch(vec![command]);
 }
 
 // All console I/O is owned by a single writer. A full queue discards only
