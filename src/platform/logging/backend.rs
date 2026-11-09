@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -72,10 +72,38 @@ static CONSOLE_BACKLOG: OnceLock<Mutex<VecDeque<ConsoleBacklogRecord>>> = OnceLo
 static CONSOLE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CONSOLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static EXTERNAL_LOG_RELAY_STARTED: OnceLock<()> = OnceLock::new();
+/// The same logical record may be seen from the native console, CRT pipes,
+/// OutputDebugString, logger callback and the shared file relay. Keep a
+/// per-channel occurrence counter, rather than dropping *all* equal lines
+/// in the same second (which suppresses genuine repeated errors).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureChannel {
+    Console,
+    Stdio,
+    DebugString,
+    Logger,
+    FileRelay,
+}
+impl CaptureChannel {
+    const fn index(self) -> usize {
+        match self {
+            Self::Console => 0,
+            Self::Stdio => 1,
+            Self::DebugString => 2,
+            Self::Logger => 3,
+            Self::FileRelay => 4,
+        }
+    }
+}
+#[derive(Default)]
+struct DedupeCounts {
+    by_channel: [u32; 5],
+    emitted: u32,
+}
 #[derive(Default)]
 struct DedupeJournal {
     order: VecDeque<String>,
-    keys: HashSet<String>,
+    entries: HashMap<String, DedupeCounts>,
 }
 static EXTERNAL_DEDUPE: OnceLock<Mutex<DedupeJournal>> = OnceLock::new();
 static PROCESS_START_TIMESTAMP: OnceLock<String> = OnceLock::new();
@@ -295,6 +323,7 @@ pub fn captured_mod_output(mod_name: &str, mod_id: &str, stream: &str, message: 
             level: external_level_for(&external.source, external.level, &external.message),
             scope: external_scope(&external.source),
             message: external.message,
+            channel: CaptureChannel::Stdio,
         });
         append_mod_log(mod_name, mod_id, stream, message);
         return;
@@ -313,6 +342,7 @@ pub fn captured_mod_output(mod_name: &str, mod_id: &str, stream: &str, message: 
         level: level_from_markers(&console_message),
         scope,
         message: console_message,
+        channel: CaptureChannel::Stdio,
     });
     append_mod_log(mod_name, mod_id, stream, message);
 }
@@ -326,6 +356,7 @@ pub fn captured_process_output(stream: &str, message: &str) {
             level: external_level_for(&external.source, external.level, &external.message),
             scope: external_scope(&external.source),
             message: external.message,
+            channel: CaptureChannel::Stdio,
         });
         return;
     }
@@ -353,6 +384,7 @@ pub fn captured_process_output(stream: &str, message: &str) {
         level: level_from_markers(&console_message),
         scope,
         message: console_message,
+        channel: CaptureChannel::Stdio,
     });
 }
 
@@ -372,6 +404,7 @@ pub fn captured_logger_line(scope: &str, level: Level, message: &str) {
         level,
         scope: scope.to_string(),
         message: sanitized,
+        channel: CaptureChannel::Logger,
     });
 }
 
@@ -598,12 +631,13 @@ pub fn captured_console_output_from(attribution: Option<&str>, input: &str) {
             level: external_level_for(&external.source, external.level, &external.message),
             scope,
             message: external.message,
+            channel: CaptureChannel::Console,
         });
         return;
     }
     if let Some(scope) = attribution {
         let level = level_from_markers(&line);
-        forward_captured_now(scope, level, &line);
+        forward_captured_now(scope, level, &line, CaptureChannel::Console);
         return;
     }
     // No caller attribution (the write came through a shim). Fall back to the
@@ -619,13 +653,13 @@ pub fn captured_console_output_from(attribution: Option<&str>, input: &str) {
     {
         let scope = external_scope(source);
         let value = value.trim_start().to_string();
-        forward_captured_now(&scope, Level::INFO, &value);
+        forward_captured_now(&scope, Level::INFO, &value, CaptureChannel::Console);
     } else if let Some(owner) = crate::platform::mod_diagnostics::resolve_output_owner(&line) {
-        forward_captured_now(&format!("mod:{}", owner.name), Level::INFO, &line);
+        forward_captured_now(&format!("mod:{}", owner.name), Level::INFO, &line, CaptureChannel::Console);
     } else if let Some(scope) = known_external_scope(&line) {
-        forward_captured_now(&scope, Level::INFO, &line);
+        forward_captured_now(&scope, Level::INFO, &line, CaptureChannel::Console);
     } else {
-        forward_captured_now("native-stdio", Level::INFO, &line);
+        forward_captured_now("native-stdio", Level::INFO, &line, CaptureChannel::Console);
     }
 }
 
@@ -956,6 +990,7 @@ pub fn game_console_message(scope: &str, message: &str) {
             level: external_level_for(&external.source, external.level, &external.message),
             scope: scope.to_string(),
             message: external.message,
+            channel: CaptureChannel::DebugString,
         });
         return;
     }
@@ -968,7 +1003,7 @@ pub fn game_console_message(scope: &str, message: &str) {
     };
     // Route through the shared record path: the same line may also arrive from
     // the console hook or the log relay, and the dedupe journal keeps one copy.
-    forward_captured_now(&resolved_scope, level, &sanitized);
+    forward_captured_now(&resolved_scope, level, &sanitized, CaptureChannel::DebugString);
 }
 
 /// One captured line from any shared channel, already attributed to the module
@@ -980,12 +1015,18 @@ struct CapturedRecord {
     level: Level,
     scope: String,
     message: String,
+    channel: CaptureChannel,
 }
 
 /// Forwards one captured line that carries no timestamp of its own. Every
 /// capture channel goes through the same record path so the dedupe journal sees
 /// all copies and the console shows each line once.
-fn forward_captured_now(scope: &str, level: Level, message: &str) {
+fn forward_captured_now(
+    scope: &str,
+    level: Level,
+    message: &str,
+    channel: CaptureChannel,
+) {
     let (timestamp_full, timestamp_clock) = current_console_timestamp();
     forward_captured_record(CapturedRecord {
         timestamp_full,
@@ -993,6 +1034,7 @@ fn forward_captured_now(scope: &str, level: Level, message: &str) {
         level,
         scope: scope.to_string(),
         message: message.to_string(),
+        channel,
     });
 }
 
@@ -1010,6 +1052,7 @@ fn forward_external_line(external: &ExternalStructuredLine) {
         level: external_level_for(&external.source, external.level, &external.message),
         scope: external_scope(&external.source),
         message: external.message.clone(),
+        channel: CaptureChannel::FileRelay,
     });
 }
 
@@ -1155,8 +1198,6 @@ fn captured_line_key(message: &str) -> String {
 }
 
 fn record_captured_line_once(record: &CapturedRecord) -> bool {
-    // Distinguish different sources and seconds. Text-only session-wide keys
-    // accidentally suppressed legitimate recurring errors for the entire run.
     let clock = record.timestamp_clock.get(..8).unwrap_or(&record.timestamp_clock);
     let key = format!(
         "{}|{}|{}",
@@ -1168,16 +1209,22 @@ fn record_captured_line_once(record: &CapturedRecord) -> bool {
         .get_or_init(|| Mutex::new(DedupeJournal::default()))
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if journal.keys.contains(&key) {
+
+    if !journal.entries.contains_key(&key) {
+        while journal.order.len() >= EXTERNAL_DEDUPE_LIMIT {
+            if let Some(expired) = journal.order.pop_front() {
+                journal.entries.remove(&expired);
+            }
+        }
+        journal.order.push_back(key.clone());
+    }
+    let counts = journal.entries.entry(key).or_default();
+    let index = record.channel.index();
+    counts.by_channel[index] = counts.by_channel[index].saturating_add(1);
+    if counts.by_channel[index] <= counts.emitted {
         return false;
     }
-    while journal.order.len() >= EXTERNAL_DEDUPE_LIMIT {
-        if let Some(expired) = journal.order.pop_front() {
-            journal.keys.remove(&expired);
-        }
-    }
-    journal.keys.insert(key.clone());
-    journal.order.push_back(key);
+    counts.emitted = counts.by_channel[index];
     true
 }
 
@@ -1889,6 +1936,24 @@ mod compact_console_tests {
 #[cfg(test)]
 mod external_line_tests {
     use super::*;
+
+    #[test]
+    fn duplicate_channels_do_not_suppress_repeated_native_errors() {
+        let clock = "19:03:25".to_string();
+        let mut record = |channel| CapturedRecord {
+            timestamp_full: "2026-11-09 19:03:25.000".into(),
+            timestamp_clock: clock.clone(),
+            level: Level::ERROR,
+            scope: "mod:LeviLamina".into(),
+            message: "mod init failed".into(),
+            channel,
+        };
+        assert!(record_captured_line_once(&record(CaptureChannel::Console)));
+        assert!(record_captured_line_once(&record(CaptureChannel::Console)));
+        assert!(!record_captured_line_once(&record(CaptureChannel::FileRelay)));
+        assert!(!record_captured_line_once(&record(CaptureChannel::FileRelay)));
+        assert!(record_captured_line_once(&record(CaptureChannel::FileRelay)));
+    }
 
     #[test]
     fn native_three_letter_levels_are_recognized() {
