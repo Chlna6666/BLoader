@@ -2150,6 +2150,18 @@ mod external_line_tests {
     }
 
     #[test]
+    fn console_late_records_do_not_rewind_clock() {
+        let mut last = "2026-11-09 19:03:26.000".to_string();
+        let (display, late) = console_display_time("2026-11-09 19:03:25.600", &mut last);
+        assert!(late);
+        assert!(display.as_str() >= "2026-11-09 19:03:26.000");
+        assert_eq!(last, display);
+
+        let (display, late) = console_display_time("2026-11-09 19:03:27.000", &mut last);
+        assert!(!late || display.as_str() >= "2026-11-09 19:03:27.000");
+    }
+
+    #[test]
     fn native_three_letter_levels_are_recognized() {
         assert_eq!(external_level("IFO"), Some(Level::INFO));
         assert_eq!(external_level("INF"), Some(Level::INFO));
