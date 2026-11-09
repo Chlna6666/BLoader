@@ -1,6 +1,7 @@
 [workspace]
-# Lightweight default workspace: ArcUI and symbol tooling remain in the tree,
-# but are intentionally excluded from normal loader builds.
+# Excluded crates (ArcUI panels, BL SDK, examples) are archived sources that no
+# longer participate in the loader build; the BL mod type and panel rendering
+# were removed from BLoader.
 members = [
     ".",
 ]
@@ -18,7 +19,7 @@ resolver = "2"
 
 [package]
 name = "BLoader"
-version = "0.2.80"
+version = "0.2.111"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/Chlna6666/BLoader"
@@ -31,31 +32,27 @@ path = "src/lib.rs"
 [features]
 # Default build is deliberately small: no panel renderer and no Minecraft symbol pack loader.
 default = []
-# Kept as a future recovery switch. The source is preserved, but this feature is not enabled by default.
-panel-ui = ["dep:arcui-core", "dep:arcui-hook", "dep:lucide-arcui", "dep:once_cell", "mc-symbols"]
-mc-symbols = ["dep:flate2"]
-blgen = ["dep:bl-sdk"]
 
 [dependencies]
-arcui-core = { path = "crates/arcui-core", optional = true }
-arcui-hook = { path = "crates/arcui-hook", optional = true }
-lucide-arcui = { path = "crates/lucide-arcui", optional = true }
-bl-sdk = { path = "bl-sdk", optional = true }
 chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 minhook = "0.9.0"
 notify = "8.2.0"
 parking_lot = "0.12.3"
-once_cell = { version = "1.21.3", optional = true }
 aes = "0.8.4"
 base64 = "0.22.1"
 sha2 = "0.10.9"
 zeroize = { version = "1.8.2", features = ["derive"] }
-flate2 = { version = "1.0", optional = true }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 tracing-appender = "0.2.3"
+
+# Cosmetics（内置披风 HTTP 覆盖模块）
+image = { version = "0.25", default-features = false, features = ["png"] }
+flate2 = "1"
+brotli = "8"
+zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
 
 # Windows API
 [dependencies.windows]
@@ -64,10 +61,6 @@ features = ["Win32_Foundation", "Win32_System_SystemServices", "Win32_System_Sys
 [build-dependencies]
 winres = "0.1"
 
-[[bin]]
-name = "blgen"
-path = "src/bin/blgen.rs"
-required-features = ["blgen"]
 
 [profile.release]
 opt-level = "s"

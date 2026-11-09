@@ -12,3 +12,8 @@ logs/
 
 # Loader-generated user config (regenerated on first launch)
 /config.json
+
+# Python bytecode
+__pycache__/
+*.pyc
+

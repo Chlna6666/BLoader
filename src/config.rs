@@ -4,15 +4,9 @@ use std::sync::OnceLock;
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::RwLock;
 
-use crate::runtime::foundation::{file_io_policy, logging};
-use crate::utils::get_exe_directory;
+use crate::platform::{file_io_policy, logging};
+use crate::platform::utils::get_exe_directory;
 
-#[cfg(feature = "panel-ui")]
-const DEFAULT_TOGGLE_HOTKEY_VK: u32 = 0x4D;
-#[cfg(feature = "panel-ui")]
-const DEFAULT_RELOAD_HOTKEY_VK: u32 = 0x78;
-#[cfg(feature = "panel-ui")]
-const DEFAULT_OVERLAY_BLUR_STRENGTH: f32 = 1.0;
 const DEFAULT_REDIRECTION_ROOT: &str = "Minecraft Bedrock";
 const DEFAULT_LOG_ARCHIVE_DAYS: u32 = 7;
 const REMOVED_CONFIG_KEYS: &[&str] = &[
@@ -22,30 +16,6 @@ const REMOVED_CONFIG_KEYS: &[&str] = &[
     "unlock_mouse_hotkey",
     "reduce_pixels",
 ];
-
-#[cfg(feature = "panel-ui")]
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HotkeyConfig {
-    #[serde(default = "default_hotkey_key")]
-    pub key: u32,
-    #[serde(default = "default_hotkey_alt")]
-    pub alt: bool,
-    #[serde(default)]
-    pub ctrl: bool,
-    #[serde(default)]
-    pub shift: bool,
-}
-
-#[cfg(feature = "panel-ui")]
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct OverlaySettingsConfig {
-    #[serde(default = "default_toggle_hotkey")]
-    pub toggle_hotkey: HotkeyConfig,
-    #[serde(default = "default_reload_hotkey")]
-    pub reload_hotkey: HotkeyConfig,
-    #[serde(default = "default_overlay_blur_strength")]
-    pub blur_strength: f32,
-}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct FileRedirectionConfig {
@@ -102,9 +72,14 @@ pub struct Config {
     #[serde(default = "default_ignore_ports")]
     pub network_ignore_ports: Vec<u16>,
 
-    #[cfg(feature = "panel-ui")]
-    #[serde(default = "default_false")]
-    pub enable_bedrock_ui_reload_probe: bool,
+    #[serde(default = "default_true")]
+    pub enable_cosmetics: bool,
+
+    #[serde(default = "default_cosmetics_dir")]
+    pub cosmetics_dir: String,
+
+    #[serde(default = "default_cape_texture_mode")]
+    pub cosmetics_cape_texture: String,
 
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -115,13 +90,6 @@ pub struct Config {
     #[serde(default = "default_locale")]
     pub default_locale: String,
 
-    #[cfg(feature = "panel-ui")]
-    #[serde(default = "default_false")]
-    pub enable_dx11: bool,
-
-    #[cfg(feature = "panel-ui")]
-    #[serde(default = "default_overlay_settings")]
-    pub overlay: OverlaySettingsConfig,
 }
 
 fn default_false() -> bool {
@@ -144,6 +112,14 @@ fn default_ignore_ports() -> Vec<u16> {
     vec![7897]
 }
 
+fn default_cosmetics_dir() -> String {
+    crate::cosmetics::DEFAULT_COSMETICS_DIR.to_string()
+}
+
+fn default_cape_texture_mode() -> String {
+    "canonical".to_string()
+}
+
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -158,55 +134,6 @@ fn default_locale() -> String {
 
 fn default_redirection_root() -> String {
     DEFAULT_REDIRECTION_ROOT.to_string()
-}
-
-#[cfg(feature = "panel-ui")]
-fn default_hotkey_key() -> u32 {
-    DEFAULT_TOGGLE_HOTKEY_VK
-}
-
-#[cfg(feature = "panel-ui")]
-fn default_hotkey_alt() -> bool {
-    true
-}
-
-#[cfg(feature = "panel-ui")]
-fn default_toggle_hotkey() -> HotkeyConfig {
-    HotkeyConfig {
-        key: DEFAULT_TOGGLE_HOTKEY_VK,
-        alt: true,
-        ctrl: false,
-        shift: false,
-    }
-}
-
-#[cfg(feature = "panel-ui")]
-fn default_reload_hotkey() -> HotkeyConfig {
-    HotkeyConfig {
-        key: DEFAULT_RELOAD_HOTKEY_VK,
-        alt: false,
-        ctrl: false,
-        shift: false,
-    }
-}
-
-#[cfg(feature = "panel-ui")]
-fn default_overlay_blur_strength() -> f32 {
-    DEFAULT_OVERLAY_BLUR_STRENGTH
-}
-
-#[cfg(feature = "panel-ui")]
-fn clamp_overlay_blur_strength(value: f32) -> f32 {
-    value.clamp(0.0, 2.4)
-}
-
-#[cfg(feature = "panel-ui")]
-fn default_overlay_settings() -> OverlaySettingsConfig {
-    OverlaySettingsConfig {
-        toggle_hotkey: default_toggle_hotkey(),
-        reload_hotkey: default_reload_hotkey(),
-        blur_strength: default_overlay_blur_strength(),
-    }
 }
 
 impl Default for Config {
@@ -227,31 +154,13 @@ impl Default for Config {
             network_log_hex_bytes: 0,
             network_verbose: false,
             network_ignore_ports: default_ignore_ports(),
-            #[cfg(feature = "panel-ui")]
-            enable_bedrock_ui_reload_probe: false,
+            enable_cosmetics: true,
+            cosmetics_dir: default_cosmetics_dir(),
+            cosmetics_cape_texture: default_cape_texture_mode(),
             log_level: default_log_level(),
             log_archive_days: default_log_archive_days(),
             default_locale: default_locale(),
-            #[cfg(feature = "panel-ui")]
-            enable_dx11: false,
-            #[cfg(feature = "panel-ui")]
-            overlay: default_overlay_settings(),
         }
-    }
-}
-
-#[cfg(feature = "panel-ui")]
-impl OverlaySettingsConfig {
-    pub fn reset_to_defaults(&mut self) {
-        *self = default_overlay_settings();
-    }
-
-    pub fn blur_strength(&self) -> f32 {
-        clamp_overlay_blur_strength(self.blur_strength)
-    }
-
-    pub fn set_blur_strength(&mut self, value: f32) {
-        self.blur_strength = clamp_overlay_blur_strength(value);
     }
 }
 
@@ -366,10 +275,6 @@ impl Config {
 
         if let Ok(content) = fs::read_to_string(&config_path) {
             if let Ok(mut cfg) = serde_json::from_str::<Config>(&content) {
-                #[cfg(feature = "panel-ui")]
-                {
-                    cfg.overlay.blur_strength = clamp_overlay_blur_strength(cfg.overlay.blur_strength);
-                }
                 if is_config_file_outdated(&content, &cfg) {
                     if file_io_policy::writes_allowed() {
                         logging::info_message(&format!("[config] Discovered outdated config.json schema; synchronizing BLoader-owned fields without deleting launcher-owned fields at {}", config_path.display()));
@@ -399,9 +304,10 @@ impl Config {
 
     pub fn apply_update(config: &Config) {
         logging::set_archive_retention_days(config.log_archive_days);
-        crate::core::network_hook::update_config(config);
+        crate::game::network_hook::update_config(config);
+        crate::cosmetics::update_config(config);
         logging::info_message(&format!(
-            "Config applied | locale={} | mods={} | redirection={} | network={} | listen={} | archive_days={}",
+            "Config applied (locale={}, mods={}, redirection={}, network={}, listen={}, archive_days={})",
             config.default_locale,
             config.mods.len(),
             config.enable_redirection,
@@ -437,7 +343,7 @@ impl Config {
 }
 
 fn config_path() -> std::path::PathBuf {
-    let loader_dir = crate::utils::get_loader_directory();
+    let loader_dir = crate::platform::utils::get_loader_directory();
     let loader_cfg = loader_dir.join("config.json");
     if loader_cfg.exists() {
         return loader_cfg;
@@ -450,6 +356,12 @@ fn config_path() -> std::path::PathBuf {
     }
 
     loader_cfg
+}
+
+/// config.json 的实际解析路径（供无副作用早期读取，如内置披风的
+/// DllMain 预加载阶段抑制判断）。
+pub fn config_file_path() -> std::path::PathBuf {
+    config_path()
 }
 
 #[cfg(test)]
@@ -483,8 +395,6 @@ mod tests {
             Some(r"C:\BMCBL\skin_packs\custom")
         );
         assert_eq!(config.log_archive_days, DEFAULT_LOG_ARCHIVE_DAYS);
-        #[cfg(feature = "panel-ui")]
-        assert!(!config.enable_dx11);
         assert_eq!(config.file_redirections.len(), 1);
         assert_eq!(config.mods, vec!["mods/example.dll"]);
     }
