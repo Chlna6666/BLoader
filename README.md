@@ -122,6 +122,7 @@ BLoader 会把 XUser/BMCBL 通信状态输出到结构化控制台和正常日�
 - VEH/SEH/顶层异常过滤器和原生预加载崩溃归属；
 - 内置中英文 i18n；
 - 文件重定向；
+- 内置披风模块（详见"内置披风模块"章节）；
 - 默认关闭的 WinSock2/NetherNet 网络 Hook；
 - 可选 ArcUI 和 Minecraft 外部符号子系统。
 
@@ -132,7 +133,7 @@ BLoader 会把 XUser/BMCBL 通信状态输出到结构化控制台和正常日�
 default = []
 ```
 
-`panel-ui`、`mc-symbols` 和 `blgen` 不会进入默认发布 DLL。
+`panel-ui`、`mc-symbols` 和 `blgen` 特性已移除，默认发布 DLL 不含面板渲染与符号包子系统。
 
 ## 结构化运行控制台
 
@@ -267,8 +268,40 @@ BLoader 在 DLL 所在目录读取 `config.json`。常用配置：
 | `network_verbose` | `false` | 逐包详细日志 |
 | `enable_p2p_redirection` | `false` | P2P 重定向开关 |
 | `enable_mc_bug_fix` | `true` | 内置游戏问题修复 |
+| `enable_cosmetics` | `true` | 内置披风模块总开关（详见下文） |
+| `cosmetics_dir` | `mods/Cosmetics` | 披风模块配置目录 |
+| `cosmetics_cape_texture` | `canonical` | 生成 persona 纹理尺寸（详见下文） |
 
 XUser Bridge 不使用 `config.json` 开关。它只由 BMCBL 为当前 Minecraft PID 创建并认证的有效一次性会话激活。
+
+## 内置披风模块
+
+移植自 [Chlna6666/Cosmetics](https://github.com/Chlna6666/Cosmetics)（同作者、GPL-3.0-only），内置于 BLoader.dll，OEP 前安装 WinHTTP 钩子。功能：向更衣室披风页追加本地披风、为本地商品合成 PlayFab 目录响应、从内存下发虚拟 persona ZIP 与缩略图。**默认开启、仅本地披风**——不包含任何 Bedrock-Cosmos 内置数据，目录元数据仅接受本地虚拟资源，不联系任何第三方目录/订阅服务，不改动账号数据与官方缓存。启用后自动抑制独立 `Cosmetics.dll` 加载（BLoader 发现路径），其数据目录转由内置模块使用。
+
+完整实现文档（架构 / WinHTTP 钩子层 / 规则引擎 / 三种披风包格式 / UUID 派生 / persona 生成器 / 扫描根 / 日志 / 部署）见 [docs/COSMETICS.md](docs/COSMETICS.md)。以下为速览。
+
+### 配置
+
+- `enable_cosmetics`（默认 `true`）：总开关。运行时关闭立即停止拦截；重新开启需重启游戏。
+- `cosmetics_dir`（默认 `mods/Cosmetics`）：配置目录，承载 `cosmetics.json`（规则引擎）与 `overrides/`（可选旧工作流）。文件缺失时使用内置默认规则（两条 `local_only` 核心规则，不含任何 Cosmos 条目）。
+- `cosmetics_cape_texture`：`canonical`（默认）| `original`（实验直通），见下文"高分辨率说明"。
+
+### 披风包位置与格式
+
+披风包只从**游戏 com.mojang 数据目录**的 `capes/` 加载（GDK `%APPDATA%\Minecraft Bedrock( Preview)\Users\Shared\games\com.mojang`、`C:\Users\Shared\games\com.mojang`、UWP 零售/预览/教育各包 `LocalState\games\com.mojang`；开启文件重定向时自动跟随重定向位置）。每个根同时接受两种形式，按 item UUID 跨根去重：
+
+- **解包文件夹**（推荐，官方 pack 目录风格）：单披风 `cape.json + cape.png [ + persona.zip ]`；多披风 `pack.json + textures/*.png`。文件夹名参与稳定 UUID 派生（与同名 ZIP 同身份）。
+- **ZIP**：内容与文件夹一致的压缩包。
+
+包内可选原生 `persona.zip` 原样直通；纯 PNG 披风由生成器合成 persona 包（确定性 UUID、内容寻址版本，重启不丢身份，改图自动换版本）。扫描在后台线程完成，改包后重启游戏生效。
+
+### 高分辨率说明
+
+自定义披风样式支持任意分辨率 PNG。但引擎的 persona 合成器为披风固定 64x32 图集槽位（`PersonaTextureComposer`，meta schema 无任何尺寸/UV 字段，HD 源会被客户端裁剪或丢弃——GeyserMC 亦独立确认），鞘翅正常是因为它走资源包几何声明尺寸归一化。因此默认 `canonical` 模式按 alpha 加权块平均降采样到 64x32 官方规格，保证玩家背面与鞘翅都正确显示；`original` 仅作实验对比。
+
+### 日志
+
+默认安静：启动状态与扫描摘要各一行（`discovered / loaded / failed / items`），失败包以 warn 单独输出原因。横幅、逐包注册、规则清单与请求遥测全部为 debug 级——排查时将 `log_level` 调至 `debug`/`trace`，或把 `cosmetics.json` 的 `debug.verbose` 打开。
 
 ## 部署
 

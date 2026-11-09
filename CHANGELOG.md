@@ -1,3 +1,107 @@
+## 0.2.110 (2026-11-07)
+
+- 预加载阶段只做**描述符级** stdio 重定向（`_dup` / `_open_osfhandle` / `_dup2`），不再调用 `setvbuf` 与 `_flushall`，也不碰 Win32 标准句柄：原生加载器在加载期间打印的横幅因此能实时进入捕获管道，不再只能事后从日志文件补。0.2.104/105 的失败来自 CRT 全局 stdio 重配置，不是描述符替换本身。
+- 若该重定向仍导致加载器 DllMain 失败，这条路径会整体回退。
+
+## 0.2.109 (2026-11-07)
+
+- 修复同一行仍重复显示：去重日志从“10 秒窗口”改为“本次会话内一直有效”（上限 16384 条，超出按先进先出淘汰）。实测三条拷贝（控制台 / stdout 管道 / 日志中继）在慢速预加载时能相隔数十秒到达，10 秒窗口拦不住后到的中继副本。
+- 去重键继续做通道装饰归一化（行首同名 `[Name]` 标签、行尾填充空白），三条通道映射到同一条记录。
+
+## 0.2.108 (2026-11-07)
+
+- 修复同一日志块显示三遍：控制台捕获只接受以换行结尾的完整写入，分次 `WriteConsole` 产生的半截片段直接丢弃（完整行由 stdout 管道与日志中继提供），片段不再以原始文本漏到控制台。
+- 去重键归一化：去掉行首与来源同名的 `[Name]` 标签和行尾空白。同一行经控制台/管道/文件三条通道到达时文本装饰不同，此前键不一致导致重复显示。
+- 来源标签不再写死任何 Mod 名：`[Name]` 直接取该行自己打印的标签（跳过级别词与时间戳），新 Mod 无需改代码即可正确归属。
+
+## 0.2.107 (2026-11-07)
+
+- 控制台写入改为**逐次转发**，去掉跨调用的行缓冲：原生加载器分多次 `WriteConsole` 打印一行（彩色前缀 + 正文）时，缓冲会把整行压到换行符到达才输出，表现为整块迟到。现在与上游实现一致，每次写入立即记录，行顺序即发生顺序；重复由去重日志拦掉。
+- 回退 0.2.104 的预加载阶段 stdio 捕获（0.2.105/106 已回退）：仅重定向 CRT 描述符同样会让 PreLoader 的 DllMain 初始化失败（0x8007045A）。
+
+## 0.2.106 (2026-11-07)
+
+- 回退“预加载阶段安装 stdio 捕获”：实测即使只重定向 CRT 描述符（不碰 Win32 标准句柄），PreLoader 的 DllMain 仍会初始化失败（`LoadLibraryW` 0x8007045A）。捕获恢复为 OEP 之后安装，原生加载器行为不受影响。
+- 0.2.104 的其余修复保留：三通道统一去重（行尾空白不参与比较）、披风 `{"name","author"}` 描述符格式支持。
+
+## 0.2.105 (2026-11-07)
+
+- 修复 0.2.104 引入的加载失败（`LoadLibraryW` 0x8007045A，PreLoader/LeviLamina 的 DllMain 初始化失败）：提前安装的捕获在控制台尚未就绪时会替换进程 Win32 标准句柄，原生加载器因此初始化失败。现在预加载阶段只重定向 CRT 描述符，Win32 标准句柄保持宿主原样；控制台就绪后的安装路径行为不变。
+
+## 0.2.104 (2026-11-07)
+
+- 原生 Mod 控制台输出改为**真正的实时捕获**：CRT stdout/stderr 重定向提前到预加载链之前安装。此前重定向发生在 OEP 之后，PreLoader / LeviLamina 在加载期间打印的横幅只能事后从 `latest.log` 中继读到，表现为整块迟到、时间戳乱序。现在这些输出在写出时就进入 BLoader 的管道，按发生顺序显示。
+- 所有捕获通道（控制台钩子、CRT 管道、日志中继）统一走同一个记录与去重路径，去重键忽略行尾填充差异：同一行只显示一次（此前横幅会显示两遍）。
+- 披风文件夹支持 `{"name","author"}` 形式的 `cape.json`（`共享披风` / `我的披风1` 这类手写单披风目录）：包 UUID 由文件夹名派生，显示名取 `cape.json` 的 `name`。
+
+## 0.2.103 (2026-11-07)
+
+- 移除 0.2.102 的 `BedrockLogOut` 抢占：其入口与原始函数取自加载器内部的固定偏移，加载器一升级就会失效，不能作为长期方案。
+- `[XUser] 正在回放 N 条早期 XUser Bridge 诊断` 降为 DEBUG：这是早期缓冲回放的过程说明，不是用户需要的信息。
+
+## 0.2.102 (2026-11-07)
+
+- 删除 LeviLamina 日志桥与其配置项，改为抢占 `BedrockLogOut`：从 LeviLamina 自己的钩子簿记（`_HookTarget` / `_OriginalFunc`）取得入口与原始函数，把入口改为纯转发到原始函数。游戏自身的日志路径恢复执行，现有 OutputDebugString 钩子重新以 `[Minecraft]` 捕获 Bedrock 日志。
+- 接管前逐项校验：钩子计数非零、入口落在游戏模块范围内、原始函数指针可执行、入口当前确实是跳转指令；任一不符即跳过（其它加载器版本不会误 hook）。
+- 代价：该加载器自己的 `[Server]` 日志副本不再产生（其自身日志不受影响）。
+
+## 0.2.101 (2026-11-07)
+
+- LeviLamina 日志桥改为可选：默认关闭，不再默认对特定 Mod 做版本相关处理；需要从该路径获取游戏日志时在 config.json 设置 `log_levilamina_bridge: true`（安装前仍校验函数序言，版本不符自动停用）。
+- 复核结论：PreLoader 本身不触碰调试通道（`OutputDebugString` / `BedrockLogOut` / `ContentLog` 引用数均为 0），日志消失发生在 LeviLamina 的 `BedrockLogOutHook`——其 detour 只把行写进 `ll::serverLogger`，从不调用原始函数。因此“提前 hook”无法恢复这些行：原始函数不再被调用，任何挂在上面的钩子都不会被触发。
+
+## 0.2.100 (2026-11-07)
+
+- 新增 LeviLamina 日志桥：逆向其官方 PDB（26.60.3）确认 `ll::BedrockLogOutHook` 的 detour 只把游戏 Bedrock 日志写进 `ll::serverLogger`、**从不调用原始 `BedrockLogOut`**，因此 LeviLamina 加载后游戏调试通道不再有这些行。现在直接 hook `ll::io::Logger::printStr(LogLevel, std::string&&)`（RVA 0x8DCD0，安装前校验函数序言），在进程内、落盘之前捕获每一行：`ll::serverLogger` 的行按 `[Minecraft]` 输出，其它 logger 按其标题输出 `[Mod名]`。版本不匹配时自动停用，不会 hook 错地址。
+- 该桥接为实时捕获，不依赖文件轮转与轮询，LeviLamina 与游戏日志不再有中继延迟；60s/300s 自检会输出 `seen`/`forwarded` 计数（debug 级）。
+
+## 0.2.99 (2026-11-07)
+
+- 控制台改为单一写线程：生产者只格式化并排队，控制台（ConPTY/终端）阻塞时不再拖住游戏线程、外部日志中继和 BLoader 自身日志；队列顺序即显示顺序，LeviLamina 日志不再延迟/乱序出现。
+- 启动横幅按用途重排：钩子安装数量、水印目标、水印文本、WinHTTP 钩子安装、ODS 钩子安装改为 DEBUG；`完整调试` 标签改为 `日志路径`；移除早已废弃的“面板渲染服务已停用”一行。
+- 修复单披风文件夹（仅 `cape.json` + 纹理、无 `manifest.json`）被拒绝的问题：文件夹名派生稳定 UUID，`共享披风` / `我的披风1` 这类包正常加载。
+
+## 0.2.98 (2026-11-07)
+
+- 修复披风模块 WinHTTP 异步预取导致 libHttpClient 崩溃（0xC0000005，栈 WINHTTP → BLoader bridge → libHttpClient）：异步响应体预取默认关闭，异步请求的响应体改为原生直通；本地披风合成响应与同步改写不受影响。
+- OutputDebugString 钩子提前到原生预加载链之前安装（PreLoader / LeviLamina 加载前），启动阶段 Mod 与游戏的调试通道输出不再因安装顺序丢失。
+- 日志归因：`Server` 来源的行不再捕获；`Runtime Service struct ...` 这类游戏运行时组件内部诊断降为 DEBUG，不再以 `[Minecraft]` INFO 出现。
+
+## 0.2.97 (2026-11-07)
+
+- 修复披风模块 WinHTTP 异步预取与游戏自身读取的并发竞争（21:01 libHttpClient 崩溃根因）：预取期间不再向游戏转发任何 WinHTTP 状态、ReceiveResponse 保持惰性，预取完成后由单点唤醒游戏并全程从重放数据读取；不再出现同一响应的两个读者。
+- 修复 `wuapicore` 等被误标为 Mod：Windows Update 组件实际位于 `C:\Windows\UUS\`（System32 中不存在）；系统目录判定放宽为任何 `\Windows\` 下的路径。
+- 修复 LeviLamina 轮转共享 `latest.log`（rename+重建）后日志中继偏移失效、控制台不再收到原生 Mod / 游戏行的问题：中继现在按文件创建时间+大小识别文件被替换，自动从头重读新文件。
+- 新增中继诊断计数与 60s/300s 自检（`log_level=debug` 可见）：全零说明中继没有看到共享日志的新内容。
+
+## 0.2.96 (2026-11-06)
+
+- 修复原生 Mod 与游戏自身的控制台输出完全未被捕获：控制台写入钩子现在同时覆盖 `kernel32` 与 `kernelbase`。游戏经 `api-ms-win-core-*` API Set、LeviLamina 经 ucrt 最终都落在 kernelbase，此前只挂 kernel32，导致 `[LeviLamina]` 启动横幅与游戏 ContentLog 全部丢失。
+- 捕获行按调用者模块归因：游戏本体、随游戏分发的 DLL 与 Microsoft 游戏运行时（`xgameruntime`、`libHttpClient`）归为 `[Minecraft]`；只有 `mods/` 下的 DLL 使用紫色 Mod 名；Windows 组件（`nlansp_c`、`wuapicore`、`Windows.Media.Speech` 等）归为 `[System]`，默认 info 级不显示。
+- 修复 `[xgameruntime] Runtime Service struct ... Created` 被当成 Mod 的问题：`xgameruntime.dll` 属于游戏自身运行时。
+- 捕获到的原生 Mod / 游戏行现在同时写入 `logs/latest.log` 与归档日志（保留原始时间戳），不再只打印到控制台。
+- 不再在初始化时清空共享的 `logs/latest.log`：LeviLamina 在同一文件写入并负责轮转，清空会破坏它已写好的启动横幅并造成稀疏 NUL 字节。
+- `log_level=debug/trace` 现在同时作用于控制台，此前只作用于文件 Sink。
+- 控制台写入钩子按 hook 单独启用、失败可重试；新增双模块 hook 去重与嵌套调用保护，避免同一行被捕获两次。
+
+## 0.2.95 (2026-11-05)
+
+- 内置披风模块日志收敛（作者自用，去掉独立 DLL 时代的开源研究式遥测）：默认（info 级）只保留启动状态与扫描结果一行摘要（discovered / loaded / failed / items），失败包单独以 warn 输出原因；横幅、逐包注册明细、规则清单与全部请求遥测降为 debug 级（`log_level=debug/trace` 或 `cosmetics.json` 的 `debug.verbose` 才可见）。
+
+## 0.2.93 (2026-11-03)
+
+- 披风包扫描根纠正：移除独立 DLL 时代的 `mods/Cosmetics/capes` 遗留路径，披风只从游戏 com.mojang 数据目录的 `capes/` 加载（GDK/UWP/预览，重定向感知）；原测试包已迁移至 `%APPDATA%\Minecraft Bedrock\Users\Shared\games\com.mojang\capes`。
+
+
+## 0.2.92 (2026-11-03)
+
+- 内置披风模块（Cosmetics 移植，来源 Chlna6666/Cosmetics，GPL-3.0-only），默认开启：bootstrap 阶段（OEP 前）安装 WinHTTP 钩子，向更衣室披风页追加本地披风、为本地商品合成 PlayFab 目录响应并从内存下发虚拟 persona ZIP；启用后自动抑制独立 `Cosmetics.dll`（BLoader 发现路径），避免钩子叠加。
+- 彻底移除 Bedrock-Cosmos 通路：内嵌元数据预设、内嵌默认 `cosmetics.json` 与 Cosmos CDN（`capes.bedrock-cosmos.app`）URL 白名单全部删除，目录元数据仅接受本地虚拟资源；披风分区更名 "Community Capes"；外部覆盖文件缺失时不再注入任何内置条目，默认规则仅含两条 `local_only` 核心规则。
+- 披风包支持解包文件夹形式（单披风 `cape.json + cape.png`、多披风 `pack.json + textures/`，文件夹名参与稳定 UUID 派生），并可扫描游戏 com.mojang 数据目录的 `capes/`：GDK `%APPDATA%\Minecraft Bedrock( Preview)`、`C:\Users\Shared\games\com.mojang`、UWP 零售/预览/教育各包，开启重定向时跟随重定向位置；多根按优先级去重。
+- 修复高像素披风玩家身上不显示（鞘翅正常）：生成 persona 纹理默认按 alpha 加权块平均规范到 64x32 官方规格（游戏角色披风几何按 64x32 采样，高分辨率会采到透明角落）；`cosmetics_cape_texture=original` 可切回原样直通。
+- 新增配置：`enable_cosmetics`（默认 true）、`cosmetics_dir`（默认 `mods/Cosmetics`）、`cosmetics_cape_texture`（默认 `canonical`）；日志经 scope `cosmetics` 写入 latest.log。
+- 新增依赖：`image`（仅 png）、`flate2`、`brotli`、`zip`。
+
 ## 0.2.80 (2026-10-23)
 
 - 修复 BL Mod 后台线程日志的错误来源 `[BLoader/BL]`：优先以注册的 BL 模块名识别原生日志前缀，统一为 `[模块名]`。

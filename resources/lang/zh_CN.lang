@@ -3,7 +3,7 @@
 bootstrap.start=轻量化运行时已启动。
 bootstrap.complete=BLoader 初始化完成
 console.banner.subtitle=我的世界基岩版 Mod 加载器
-console.banner.full_debug=完整调试
+console.banner.log_file=日志路径
 console.banner.file_io=文件 I/O
 console.info.version=版本
 console.info.license=许可证
@@ -29,7 +29,6 @@ console.preloader.detected=检测到 {count} 个 PreLoader 预加载包
 console.preloader.active=PreLoader 已激活，已加载 {count} 个预加载模块
 console.preloader.none=未检测到 PreLoader 包，使用 BLoader 原生预加载链
 console.proxy.route=运行时代理路由：仅拦截 QueryApiImpl，其余接口转发系统 xgameruntime.dll
-ui.pipeline.external=图形就绪信号已启用；面板渲染服务已停用。
 overlay.window_title=BLoader 面板
 overlay.feature.disabled=已禁用
 overlay.feature.enabled=已启用

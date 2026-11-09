@@ -31,3 +31,18 @@ BLoader uses the Rust `minhook` crate and the native MinHook library to intercep
 - Native MinHook: https://github.com/TsudaKageyu/minhook — BSD 2-Clause License
 
 Without an authenticated process-scoped session, no MinHook API is invoked and no XGameRuntime function is modified.
+
+## Chlna6666/Cosmetics (built-in cosmetics module)
+
+The built-in cape module `src/cosmetics/` (BLoader 0.2.91+) is a port of the
+standalone Cosmetics DLL by the same author, integrated into the loader with
+the embedded Bedrock-Cosmos metadata presets removed and local cape pack
+folder support added.
+
+- Project: Cosmetics
+- Upstream: https://github.com/Chlna6666/Cosmetics
+- License: GPL-3.0-only (compatible with BLoader's GPL-3.0-only)
+
+The persona bundle format references the openly documented MerelyCapes layout
+(MIT licensed); no MerelyCapes code is included and no Mojang signing material
+is produced.
