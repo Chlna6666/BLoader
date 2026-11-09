@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Local;
 use tracing::field::{Field, Visit};
@@ -291,11 +291,11 @@ pub fn console_is_ready() -> bool {
 }
 
 pub fn replay_console_message(level: &str, scope: &str, message: &str) {
-    let (_, timestamp_clock) = current_console_timestamp();
-    replay_console_message_at(level, scope, message, &timestamp_clock);
+    let (timestamp_full, _) = current_console_timestamp();
+    replay_console_message_at(level, scope, message, &timestamp_full);
 }
 
-fn replay_console_message_at(level: &str, scope: &str, message: &str, timestamp_clock: &str) {
+fn replay_console_message_at(level: &str, scope: &str, message: &str, timestamp_full: &str) {
     if !console_is_ready() {
         return;
     }
@@ -307,7 +307,7 @@ fn replay_console_message_at(level: &str, scope: &str, message: &str, timestamp_
         _ => Level::INFO,
     };
     if console_should_show(level, scope, message) {
-        write_console_record_at(timestamp_clock, level, scope, message);
+        write_console_record_at(timestamp_full, level, scope, message);
     }
 }
 
@@ -559,8 +559,8 @@ pub fn write_bootstrap_marker(message: &str) {
     write_debug_string(&file_line);
 
     if console_is_ready() && console_should_show(Level::DEBUG, "bootstrap", message) {
-        let (_, clock) = current_console_timestamp();
-        write_console_record_at(&clock, Level::DEBUG, "bootstrap", message);
+        let (timestamp_full, _) = current_console_timestamp();
+        write_console_record_at(&timestamp_full, Level::DEBUG, "bootstrap", message);
     }
 }
 
@@ -715,8 +715,8 @@ fn emergency_log_message(level: Level, scope: &str, message: &str) {
     );
     if console_should_show(level, scope, message) {
         if console_is_ready() {
-            let (_, clock) = current_console_timestamp();
-            write_console_record_at(&clock, level, scope, message);
+            let (timestamp_full, _) = current_console_timestamp();
+            write_console_record_at(&timestamp_full, level, scope, message);
         } else {
             queue_console_backlog(level, scope, message);
         }
@@ -750,7 +750,7 @@ fn mirror_message_at(
 ) {
     if console_should_show(level, scope, message) {
         if console_is_ready() {
-            write_console_record_at(timestamp_clock, level, scope, message);
+            write_console_record_at(timestamp_full, level, scope, message);
         } else {
             queue_console_backlog_at(level, scope, message, timestamp_full, timestamp_clock);
         }
@@ -814,7 +814,7 @@ fn flush_console_backlog() {
     for record in records {
         if console_should_show(record.level, &record.scope, &record.message) {
             write_console_record_at(
-                &record.timestamp_clock, record.level, &record.scope, &record.message,
+                &record.timestamp_full, record.level, &record.scope, &record.message,
             );
         }
     }
@@ -1068,7 +1068,7 @@ fn forward_captured_record(record: CapturedRecord) {
     if console_should_show(record.level, &record.scope, &record.message) {
         if console_is_ready() {
             write_console_record_at(
-                &record.timestamp_clock,
+                &record.timestamp_full,
                 record.level,
                 &record.scope,
                 &record.message,
@@ -1400,7 +1400,8 @@ fn level_rank(level: Level) -> u8 {
 // Preserve millisecond timestamps in events/files but keep the interactive
 // console compact. External log history may also supply fractional seconds.
 fn compact_console_clock(timestamp: &str) -> &str {
-    timestamp.get(..8).unwrap_or(timestamp)
+    let clock = timestamp.split_whitespace().last().unwrap_or(timestamp);
+    clock.get(..8).unwrap_or(clock)
 }
 
 fn format_console_line_at(timestamp: &str, level: Level, scope: &str, message: &str) -> String {
@@ -1739,60 +1740,144 @@ fn write_bytes_to_bootstrap_file(bytes: &[u8]) {
     }
 }
 
-// One dedicated writer owns console output and resize repaint commands.
-// The terminal reflows pixel-art cells when its width changes. Reconstruct
-// the banner and the most recent visible records instead of keeping a broken
-// colour-block logo in the scrollback after a window resize.
+// All console I/O is owned by a single writer. A full queue discards only
+// the live console copy, not the file record, and never blocks game threads.
+struct ConsoleLine {
+    timestamp_full: String,
+    sequence: u64,
+    level: Level,
+    scope: String,
+    message: String,
+}
+
 enum ConsoleCommand {
-    Line(Vec<u8>),
+    Line(ConsoleLine),
     Repaint { columns: usize, rows: usize },
 }
 
-static CONSOLE_SINK: OnceLock<Option<std::sync::mpsc::Sender<ConsoleCommand>>> = OnceLock::new();
-static CONSOLE_PENDING: AtomicUsize = AtomicUsize::new(0);
+static CONSOLE_SINK: OnceLock<Option<std::sync::mpsc::SyncSender<ConsoleCommand>>> = OnceLock::new();
+static CONSOLE_DROPPED: AtomicUsize = AtomicUsize::new(0);
 const CONSOLE_QUEUE_LIMIT: usize = 8192;
 const CONSOLE_HISTORY_LIMIT: usize = 512;
+const CONSOLE_BATCH_LIMIT: usize = 128;
+const CONSOLE_REORDER_WINDOW: Duration = Duration::from_millis(24);
 
-fn console_sink() -> &'static Option<std::sync::mpsc::Sender<ConsoleCommand>> {
+/// A late file-relay record cannot rewind the already rendered console clock.
+/// The true event time is preserved both in its file entry and a late marker.
+fn console_display_time(actual: &str, last: &mut String) -> (String, bool) {
+    let event_second = actual.get(..19).unwrap_or(actual);
+    let last_second = last.get(..19).unwrap_or(last);
+    if !last.is_empty() && event_second < last_second {
+        let (wall, _) = current_console_timestamp();
+        let display = if wall.as_str() > last.as_str() { wall } else { last.clone() };
+        *last = display.clone();
+        (display, true)
+    } else {
+        if actual > last.as_str() {
+            *last = actual.to_string();
+        }
+        (last.clone(), false)
+    }
+}
+
+fn append_console_line(
+    line: ConsoleLine,
+    history: &mut VecDeque<Vec<u8>>,
+    output: &mut Vec<u8>,
+    last_display: &mut String,
+) {
+    let (display_time, late) = console_display_time(&line.timestamp_full, last_display);
+    let rendered = if late {
+        let message = format!("{} [late occurred_at={}]", line.message, line.timestamp_full);
+        format_console_line_at(&display_time, line.level, &line.scope, &message).into_bytes()
+    } else {
+        format_console_line_at(&display_time, line.level, &line.scope, &line.message).into_bytes()
+    };
+    if history.len() == CONSOLE_HISTORY_LIMIT {
+        history.pop_front();
+    }
+    output.extend_from_slice(&rendered);
+    history.push_back(rendered);
+}
+
+fn repaint_console(columns: usize, rows: usize, history: &VecDeque<Vec<u8>>) {
+    if !console_supports_ansi() {
+        return;
+    }
+    let banner = crate::platform::console_branding::render_banner(columns, true);
+    let mut output = Vec::<u8>::new();
+    output.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[3J\x1b[H");
+    for line in &banner {
+        output.extend_from_slice(line.as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
+    let visible_records = rows
+        .saturating_sub(banner.len().saturating_add(1))
+        .saturating_div(2)
+        .min(32);
+    let skip = history.len().saturating_sub(visible_records);
+    for line in history.iter().skip(skip) {
+        output.extend_from_slice(line);
+    }
+    write_bytes_to_console_locked(&output);
+}
+
+fn console_sink() -> &'static Option<std::sync::mpsc::SyncSender<ConsoleCommand>> {
     CONSOLE_SINK.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<ConsoleCommand>();
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<ConsoleCommand>(CONSOLE_QUEUE_LIMIT);
         match thread::Builder::new()
             .name("bloader-console-writer".to_string())
             .spawn(move || {
                 let mut history = VecDeque::<Vec<u8>>::new();
-                while let Ok(command) = receiver.recv() {
-                    match command {
-                        ConsoleCommand::Line(bytes) => {
-                            CONSOLE_PENDING.fetch_sub(1, Ordering::Relaxed);
-                            if history.len() == CONSOLE_HISTORY_LIMIT {
-                                history.pop_front();
+                let mut last_display = String::new();
+                while let Ok(first) = receiver.recv() {
+                    let mut lines = Vec::<ConsoleLine>::with_capacity(CONSOLE_BATCH_LIMIT);
+                    let mut repaint = None;
+                    match first {
+                        ConsoleCommand::Line(line) => lines.push(line),
+                        ConsoleCommand::Repaint { columns, rows } => repaint = Some((columns, rows)),
+                    }
+                    let started = Instant::now();
+                    while lines.len() < CONSOLE_BATCH_LIMIT {
+                        let Some(remaining) = CONSOLE_REORDER_WINDOW.checked_sub(started.elapsed()) else {
+                            break;
+                        };
+                        match receiver.recv_timeout(remaining) {
+                            Ok(ConsoleCommand::Line(line)) => lines.push(line),
+                            Ok(ConsoleCommand::Repaint { columns, rows }) => {
+                                repaint = Some((columns, rows));
                             }
-                            history.push_back(bytes.clone());
-                            write_bytes_to_console_locked(&bytes);
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                         }
-                        ConsoleCommand::Repaint { columns, rows } => {
-                            if !console_supports_ansi() {
-                                continue;
-                            }
-                            let banner = crate::platform::console_branding::render_banner(columns, true);
-                            let mut output = Vec::<u8>::new();
-                            output.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[3J\x1b[H");
-                            for line in &banner {
-                                output.extend_from_slice(line.as_bytes());
-                                output.extend_from_slice(b"\r\n");
-                            }
-                            // Budget extra rows for log messages that wrap. The
-                            // complete history is retained in latest.log.
-                            let visible_records = rows
-                                .saturating_sub(banner.len().saturating_add(1))
-                                .saturating_div(2)
-                                .min(32);
-                            let skip = history.len().saturating_sub(visible_records);
-                            for line in history.iter().skip(skip) {
-                                output.extend_from_slice(line);
-                            }
-                            write_bytes_to_console_locked(&output);
-                        }
+                    }
+                    lines.sort_unstable_by(|a, b| {
+                        a.timestamp_full.cmp(&b.timestamp_full)
+                            .then_with(|| a.sequence.cmp(&b.sequence))
+                    });
+                    let mut output = Vec::<u8>::with_capacity(lines.len() * 160);
+                    for line in lines {
+                        append_console_line(line, &mut history, &mut output, &mut last_display);
+                    }
+                    let skipped = CONSOLE_DROPPED.swap(0, Ordering::Relaxed);
+                    if skipped > 0 {
+                        let (timestamp, _) = current_console_timestamp();
+                        append_console_line(
+                            ConsoleLine {
+                                timestamp_full: timestamp,
+                                sequence: CONSOLE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+                                level: Level::WARN,
+                                scope: "logging".to_string(),
+                                message: format!(
+                                    "console busy: {skipped} live records omitted; full logs are in logs/latest.log"
+                                ),
+                            },
+                            &mut history, &mut output, &mut last_display,
+                        );
+                    }
+                    write_bytes_to_console_locked(&output);
+                    if let Some((columns, rows)) = repaint {
+                        repaint_console(columns, rows, &history);
                     }
                 }
             }) {
@@ -1807,35 +1892,31 @@ fn console_sink() -> &'static Option<std::sync::mpsc::Sender<ConsoleCommand>> {
     })
 }
 
-/// A resize notification is always handled by the same writer that owns log
-/// records, so a repaint cannot interleave ANSI sequences with a live line.
 pub fn request_console_repaint(columns: usize, rows: usize) {
     if !console_is_ready() || columns == 0 || rows == 0 {
         return;
     }
     if let Some(sender) = console_sink() {
-        let _ = sender.send(ConsoleCommand::Repaint { columns, rows });
+        let _ = sender.try_send(ConsoleCommand::Repaint { columns, rows });
     }
 }
 
-fn write_console_record_at(clock: &str, level: Level, scope: &str, message: &str) {
-    let bytes = format_console_line_at(clock, level, scope, message).into_bytes();
-    if let Some(sender) = console_sink() {
-        if CONSOLE_PENDING.load(Ordering::Relaxed) < CONSOLE_QUEUE_LIMIT {
-            CONSOLE_PENDING.fetch_add(1, Ordering::Relaxed);
-            match sender.send(ConsoleCommand::Line(bytes)) {
-                Ok(()) => return,
-                Err(error) => {
-                    CONSOLE_PENDING.fetch_sub(1, Ordering::Relaxed);
-                    if let ConsoleCommand::Line(bytes) = error.0 {
-                        write_bytes_to_console_locked(&bytes);
-                    }
-                    return;
-                }
-            }
-        }
+fn write_console_record_at(timestamp_full: &str, level: Level, scope: &str, message: &str) {
+    let Some(sender) = console_sink() else {
+        CONSOLE_DROPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let line = ConsoleLine {
+        timestamp_full: timestamp_full.to_string(),
+        sequence: CONSOLE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        level,
+        scope: scope.to_string(),
+        message: message.to_string(),
+    };
+    if sender.try_send(ConsoleCommand::Line(line)).is_err() {
+        // Never fall back to synchronous WriteFile from a native hook.
+        CONSOLE_DROPPED.fetch_add(1, Ordering::Relaxed);
     }
-    write_bytes_to_console_locked(&bytes);
 }
 
 fn write_bytes_to_console_locked(bytes: &[u8]) {
