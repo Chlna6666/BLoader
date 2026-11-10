@@ -167,6 +167,7 @@ struct Request {
     /// Set once the async prefetch delivered HEADERS to the game: from then
     /// on the game reads only the replay, and ReceiveResponse is a no-op.
     async_prefetch_done: bool,
+    async_dispatch: Option<mpsc::Sender<AsyncNotice>>,
     synthetic: bool,
     status: u32,
     callback_context: usize,
@@ -188,6 +189,10 @@ enum AsyncReadEvent {
         context: usize,
         payload: Vec<u8>,
     },
+}
+enum AsyncNotice {
+    Read { context: usize, buffer: usize, len: u32 },
+    Available { context: usize, len: u32 },
 }
 struct Replay {
     bytes: Vec<u8>,
@@ -519,6 +524,7 @@ unsafe extern "system" fn on_open_request(
             status: 200,
             callback_context: 0,
             async_prefetch_done: false,
+            async_dispatch: None,
         };
         state.requests.insert(state_key(h), req);
         drop(state);
@@ -1303,21 +1309,27 @@ unsafe fn capture_worker(handle: usize, receiver: mpsc::Receiver<AsyncReadEvent>
         };
         if result.0 == 0 && result.1 != ERROR_IO_PENDING {
             logger(&format!("async cape read failed win32_error={}; original prefix retained", result.1));
-            finish_async(h, false);
+            if let Some(queue) = finish_async(h, false) {
+                dispatch_replay_callbacks(h, queue);
+            }
             return;
         }
         match receiver.recv() {
             Ok(AsyncReadEvent::Chunk) => {}
             Ok(AsyncReadEvent::Eof) => {
                 if !cancelled.load(Ordering::Acquire) {
-                    finish_async(h, true);
+                    if let Some(queue) = finish_async(h, true) {
+                        dispatch_replay_callbacks(h, queue);
+                    }
                 }
                 return;
             }
             Ok(AsyncReadEvent::TooLarge) => {
                 if !cancelled.load(Ordering::Acquire) {
                     logger("async cape response reached capture limit; original stream preserved");
-                    finish_async(h, false);
+                    if let Some(queue) = finish_async(h, false) {
+                        dispatch_replay_callbacks(h, queue);
+                    }
                 }
                 return;
             }
@@ -1346,15 +1358,31 @@ unsafe fn capture_worker(handle: usize, receiver: mpsc::Receiver<AsyncReadEvent>
         }
     }
 }
-unsafe fn finish_async(h: H, completed: bool) {
-    let Some(runtime) = RUNTIME.get() else { return };
+// Reuse the capture worker for asynchronous client notifications as well.
+// WinHttpReadData must return before its READ_COMPLETE callback is delivered:
+// inline replay callbacks recursively entered libHttpClient on prior builds.
+unsafe fn dispatch_replay_callbacks(h: H, receiver: mpsc::Receiver<AsyncNotice>) {
+    while let Ok(event) = receiver.recv() {
+        match event {
+            AsyncNotice::Read { context, buffer, len } => {
+                notify_game(h, context, STATUS_READ, buffer as H, len);
+            }
+            AsyncNotice::Available { context, len } => {
+                let mut count = len;
+                notify_game(h, context, STATUS_AVAILABLE, &mut count as *mut u32 as H, 4);
+            }
+        }
+    }
+}
+unsafe fn finish_async(h: H, completed: bool) -> Option<mpsc::Receiver<AsyncNotice>> {
+    let Some(runtime) = RUNTIME.get() else { return None };
     let taken = {
         let mut state = tables().lock().unwrap_or_else(|e| e.into_inner());
         let Some(req) = state.requests.get_mut(&state_key(h)) else {
-            return;
+            return None;
         };
         let Some(cap) = req.capture.take() else {
-            return;
+            return None;
         };
         // Keep the stable storage alive until WinHTTP has reported completion.
         // There must not be an outstanding read when this path is reached.
@@ -1450,16 +1478,23 @@ unsafe fn finish_async(h: H, completed: bool) {
             }
         }
     }
-    {
+    let (sender, receiver) = mpsc::channel();
+    let attached = {
         let mut state = tables().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(req) = state.requests.get_mut(&state_key(h)) {
             req.replay = Some(replay);
-            // The prefetch consumed the real response; from here the game is
-            // served exclusively from the replay. Receiving must stay inert.
             req.async_prefetch_done = true;
+            req.async_dispatch = Some(sender);
+            true
+        } else {
+            false
         }
+    };
+    if !attached {
+        return None;
     }
     invoke_headers(h, context);
+    Some(receiver)
 }
 unsafe extern "system" fn status_bridge(h: H, context: usize, status: u32, info: H, len: u32) {
     if status == STATUS_HEADERS {
@@ -1570,7 +1605,13 @@ unsafe extern "system" fn status_bridge(h: H, context: usize, status: u32, info:
             .unwrap_or_else(|e| e.into_inner())
             .requests
             .get(&state_key(h))
-            .is_some_and(|r| r.capture.is_some() || r.async_prefetch_done)
+            .is_some_and(|r| {
+                r.capture.is_some()
+                    || (r.async_prefetch_done
+                        && r.replay.as_ref().is_some_and(|rep| {
+                            rep.complete || rep.position < rep.bytes.len()
+                        }))
+            })
     };
     if prefetch_owns && !matches!(status, STATUS_HANDLE_CLOSING) {
         return;
@@ -1818,11 +1859,11 @@ unsafe extern "system" fn on_read(h: H, buffer: H, cap: u32, out: *mut u32) -> B
                     } else {
                         None
                     };
-                Some((length as u32, async_req, ctx, completion))
+                Some((length as u32, async_req, ctx, completion, req.async_dispatch.clone()))
             })
         })
     };
-    if let Some((count, async_req, ctx, completion)) = response {
+    if let Some((count, async_req, ctx, completion, dispatch)) = response {
         if !out.is_null() {
             *out = count;
         }
@@ -1835,7 +1876,16 @@ unsafe extern "system" fn on_read(h: H, buffer: H, cap: u32, out: *mut u32) -> B
             ));
         }
         if async_req {
-            notify_game(h, ctx, STATUS_READ, buffer, count);
+            let queued = dispatch.is_some_and(|sender| {
+                sender.send(AsyncNotice::Read {
+                    context: ctx,
+                    buffer: buffer as usize,
+                    len: count,
+                }).is_ok()
+            });
+            if !queued {
+                notify_game(h, ctx, STATUS_READ, buffer, count);
+            }
         }
         return 1;
     }
@@ -1854,17 +1904,23 @@ unsafe extern "system" fn on_available(h: H, out: *mut u32) -> B {
                     remain.min(u32::MAX as usize) as u32,
                     r.async_session,
                     r.callback_context,
+                    r.async_dispatch.clone(),
                 ))
             })
         })
     };
-    if let Some((count, async_req, ctx)) = replay {
+    if let Some((count, async_req, ctx, dispatch)) = replay {
         if !out.is_null() {
             *out = count;
         }
         if async_req {
-            let mut local = count;
-            notify_game(h, ctx, STATUS_AVAILABLE, &mut local as *mut u32 as H, 4);
+            let queued = dispatch.is_some_and(|sender| {
+                sender.send(AsyncNotice::Available { context: ctx, len: count }).is_ok()
+            });
+            if !queued {
+                let mut local = count;
+                notify_game(h, ctx, STATUS_AVAILABLE, &mut local as *mut u32 as H, 4);
+            }
         }
         return 1;
     }
