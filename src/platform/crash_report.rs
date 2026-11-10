@@ -456,9 +456,25 @@ unsafe fn should_capture_veh_exception(exception: *const EXCEPTION_POINTERS) -> 
     let record = &*(*exception).ExceptionRecord;
     let code = record.ExceptionCode.0 as u32;
     let flags = record.ExceptionFlags;
-    // A continuable access violation in a native allocator may be recovered
-    // by its SEH. Taking a minidump inside its first-chance VEH can trigger a
-    // second allocator fault and Rust fast-fail in the BLoader handler.
+    // Do not capture arbitrary first-chance exceptions: Windows runtimes can
+    // legitimately recover them. The narrowly scoped null-dereference below
+    // is different: the game crashed inside libHttpClient while executing the
+    // callback registered through BLoader's Cosmetics WinHTTP detour. It is
+    // otherwise missed because the faulting instruction is outside BLoader.
+    if code == 0xC0000005
+        && record.NumberParameters >= 2
+        && record.ExceptionInformation[0] == 0
+        && record.ExceptionInformation[1] == 0
+        && crate::cosmetics::inside_game_callback()
+    {
+        let module = module_path_from_address(record.ExceptionAddress as usize)
+            .to_ascii_lowercase();
+        if module.ends_with("libhttpclient.dll") {
+            return true;
+        }
+    }
+    // Never take a dump for a generic continuable first-chance exception;
+    // a native allocator may recover from it via SEH.
     if flags & 0x1 == 0 {
         return false;
     }
@@ -571,6 +587,25 @@ fn determine_attribution(
             ),
             suspect_mods,
             mod_stack_frame: Some(frame_index),
+        };
+    }
+
+    if crate::cosmetics::inside_game_callback() {
+        return CrashAttribution {
+            owner_type: "loader-hook-callback".to_string(),
+            mod_id: None,
+            mod_name: None,
+            mod_version: None,
+            mod_kind: None,
+            mod_path: None,
+            active_phase: Some("cosmetics-winhttp-game-callback".to_string()),
+            confidence: "medium".to_string(),
+            reason: format!(
+                "a native fault in {} occurred while BLoader was invoking a WinHTTP game callback; the hook and caller contract are suspects, not a proven fault owner",
+                exception_module
+            ),
+            suspect_mods,
+            mod_stack_frame: None,
         };
     }
 
