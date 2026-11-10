@@ -1507,7 +1507,11 @@ unsafe extern "system" fn status_bridge(h: H, context: usize, status: u32, info:
             state.requests.get_mut(&state_key(h))
                 .and_then(|req| req.capture.as_mut())
                 .and_then(|capture| {
-                    if info != capture.buffer.as_ptr() as H {
+                    // WinHTTP is permitted to report EOF with a NULL
+                    // status-info pointer. No game read is in flight while
+                    // we withhold HEADERS, so zero-length completion belongs
+                    // to this capture even without the original buffer.
+                    if len != 0 && info != capture.buffer.as_ptr() as H {
                         return None;
                     }
                     let event = if len == 0 {
