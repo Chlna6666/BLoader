@@ -26,6 +26,12 @@ pub mod persona_pack;
 pub mod response;
 mod winhttp;
 
+/// Native WinHTTP callbacks can fault in libHttpClient.dll while BLoader is
+/// still on the stack. The crash handler uses this context for attribution.
+pub(crate) fn inside_game_callback() -> bool {
+    winhttp::inside_game_callback()
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
