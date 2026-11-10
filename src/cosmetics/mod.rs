@@ -294,7 +294,7 @@ mod tests {
     fn default_rules_are_local_only_without_cosmos_entries() {
         let rules = default_rules();
         assert!(rules.enabled);
-        assert_eq!(rules.rules.len(), 2);
+        assert_eq!(rules.rules.len(), 3);
         for rule in &rules.rules {
             assert!(rule.local_only, "{} must be local_only", rule.name);
         }
