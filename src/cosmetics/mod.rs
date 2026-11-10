@@ -95,7 +95,28 @@ pub(crate) fn cosmetics_root(config: &Config, game_dir: &Path) -> PathBuf {
 fn load_rules(root: &Path) -> (response::Config, &'static str) {
     match std::fs::read(root.join("cosmetics.json")) {
         Ok(bytes) => match serde_json::from_slice::<response::Config>(&bytes) {
-            Ok(cfg) => (cfg, "external_cosmetics_json"),
+            Ok(mut cfg) => {
+                // Existing installations may carry a two-rule cosmetics.json
+                // from the first BLoader integration. Preserve their rules,
+                // but restore the locally imported cape navigation endpoint
+                // when it was omitted altogether. Explicitly disabled
+                // PersonaProfile rules are respected.
+                let has_profile = cfg.rules.iter().any(|rule| {
+                    rule.path == "/api/v2.0/layout/pages/DressingRoom_PersonaProfile"
+                });
+                if !has_profile {
+                    if let Some(rule) = default_rules().rules.into_iter().find(|rule| {
+                        rule.name == "local_persona_profile"
+                    }) {
+                        cfg.rules.push(rule);
+                        logging::scoped_info_message(
+                            "cosmetics",
+                            "restored missing local PersonaProfile navigation rule from default configuration",
+                        );
+                    }
+                }
+                (cfg, "external_cosmetics_json")
+            },
             Err(error) => {
                 logging::scoped_warn_message(
                     "cosmetics",
@@ -256,6 +277,17 @@ mod tests {
             cosmetics_root(&config, game_dir),
             PathBuf::from(r"D:\Data\Cosmetics")
         );
+    }
+
+    #[test]
+    fn built_in_local_cape_navigation_is_enabled() {
+        let rules = default_rules();
+        let profile = rules.rules.iter().find(|rule| {
+            rule.path == "/api/v2.0/layout/pages/DressingRoom_PersonaProfile"
+        }).expect("PersonaProfile local navigation rule");
+        assert!(profile.local_only);
+        assert!(profile.enabled);
+        assert!(matches!(profile.mode, response::Mode::PersonaProfile));
     }
 
     #[test]
