@@ -102,11 +102,11 @@ struct HotMod {
 
 #[derive(Default)]
 struct DiscoveredMods {
-    preload: Vec<PreloadMod>,
     hot: Vec<HotMod>,
 }
 
-const MOD_TYPE_BLOADER_NATIVE: &str = "bloader-native";
+const MOD_TYPE_MOD_PRELOAD: &str = "mod-preload";
+const MOD_TYPE_MOD_NATIVE: &str = "mod-native";
 const MOD_TYPE_HOT_NATIVE: &str = "hot-native";
 const MOD_TYPE_HOT_INJECT: &str = "hot-inject";
 
@@ -226,7 +226,7 @@ pub unsafe fn load_native_preloads_in_dllmain(game_dir: &Path) -> NativePreloadS
             }
         };
 
-        if manifest.mod_type != MOD_TYPE_BLOADER_NATIVE {
+        if manifest.mod_type != MOD_TYPE_MOD_PRELOAD {
             continue;
         }
 
@@ -955,19 +955,16 @@ pub fn native_success_notification_message() -> Option<String> {
     Some(lines.join("\n"))
 }
 
-pub unsafe fn load_mods(game_dir: &Path) -> bool {
+/// Schedule ordinary BLoader native mods after the Minecraft OEP release.
+/// The separate mod-preload phase has already run on the gated startup thread.
+pub unsafe fn load_mods(game_dir: &Path) {
     let mods_dir = ensure_mods_dir(game_dir);
-    let mut discovered = discover_mods(&mods_dir);
-
-    if discovered.preload.is_empty() && discovered.hot.is_empty() {
-        logging::info_message("No mods found to load.");
-        return false;
+    let discovered = discover_mods(&mods_dir);
+    if discovered.hot.is_empty() {
+        logging::info_message("No BLoader startup or delayed mods found.");
+        return;
     }
-
-    let preloader_activated = load_preload_mods(&mut discovered.preload);
     spawn_hot_mod_loader(discovered.hot);
-
-    preloader_activated
 }
 
 fn bloader_mods_dir(game_dir: &Path) -> PathBuf {
@@ -1038,13 +1035,16 @@ fn discover_packaged_mod(entry_path: &Path, discovered: &mut DiscoveredMods) {
     let mod_type = manifest.mod_type.as_str();
     if !matches!(
         mod_type,
-        MOD_TYPE_BLOADER_NATIVE | MOD_TYPE_HOT_NATIVE | MOD_TYPE_HOT_INJECT
+        MOD_TYPE_MOD_PRELOAD | MOD_TYPE_MOD_NATIVE | MOD_TYPE_HOT_NATIVE | MOD_TYPE_HOT_INJECT
     ) {
         // PreLoader and LeviLamina are the sole owners of preload-native and
         // native respectively; do not retry their DLLs even after failure.
         logging::scoped_warn_message(
             "native-loader",
-            &format!("SKIP_FOREIGN_MOD_TYPE | name={} type={}", manifest.name, mod_type),
+            &format!(
+                "SKIP_FOREIGN_MOD_TYPE | name={} type={} | BLoader types=mod-preload|mod-native|hot-native|hot-inject; LeviLamina native and PreLoader preload-native are external",
+                manifest.name, mod_type
+            ),
         );
         return;
     }
@@ -1085,52 +1085,44 @@ fn discover_packaged_mod(entry_path: &Path, discovered: &mut DiscoveredMods) {
     let id = manifest.id.clone().unwrap_or_else(|| manifest.name.clone());
     let kind = manifest.mod_type.clone();
 
-    match manifest.mod_type.as_str() {
-        MOD_TYPE_HOT_NATIVE | MOD_TYPE_HOT_INJECT => {
-            let ready_level = resolve_hot_ready_level(&manifest);
-            if let Some(frames) = manifest.inject_min_frames {
-                logging::scoped_warn_message(
-                    "runtime-ready",
-                    &format!(
-                        "mod={} deprecated inject_min_frames={} ignored; readiness={} graphics_hooks=disabled",
-                        manifest.name,
-                        frames,
-                        ready_level.as_str()
-                    ),
-                );
-            }
-            discovered.hot.push(HotMod {
-                id,
-                name: manifest.name,
-                dependencies: manifest.bloader_dependencies,
-                version: manifest.version,
-                kind,
-                dll_path,
-                log_aliases: manifest.log_aliases,
-                inject_delay_ms: manifest
-                    .inject_delay_ms
-                    .unwrap_or(HOT_INJECT_DEFAULT_DELAY_MS),
-                ready_level,
-                required: manifest.required,
-                verify_exports: manifest.verify_exports,
-                verify_modules: manifest.verify_modules,
-                notify_success: manifest.notify_success,
-            });
-        }
-        _ => discovered.preload.push(PreloadMod {
-            id,
-            name: manifest.name,
-            dependencies: manifest.bloader_dependencies,
-            version: manifest.version,
-            kind,
-            dll_path,
-            log_aliases: manifest.log_aliases,
-            required: manifest.required,
-            verify_exports: manifest.verify_exports,
-            verify_modules: manifest.verify_modules,
-            notify_success: manifest.notify_success,
-        }),
+    // The mod-preload manifest was handled during prepare_premain_preloads
+    // (before Minecraft OEP) and must never be loaded a second time here.
+    if manifest.mod_type == MOD_TYPE_MOD_PRELOAD {
+        return;
     }
+
+    let (ready_level, delay_ms) = if manifest.mod_type == MOD_TYPE_MOD_NATIVE {
+        (ReadyLevel::Process, 0)
+    } else {
+        (resolve_hot_ready_level(&manifest),
+         manifest.inject_delay_ms.unwrap_or(HOT_INJECT_DEFAULT_DELAY_MS))
+    };
+    if let Some(frames) = manifest.inject_min_frames {
+        logging::scoped_warn_message(
+            "runtime-ready",
+            &format!(
+                "mod={} ignored inject_min_frames={} readiness={} graphics_hooks=disabled",
+                manifest.name,
+                frames,
+                ready_level.as_str(),
+            ),
+        );
+    }
+    discovered.hot.push(HotMod {
+        id,
+        name: manifest.name,
+        dependencies: manifest.bloader_dependencies,
+        version: manifest.version,
+        kind,
+        dll_path,
+        log_aliases: manifest.log_aliases,
+        inject_delay_ms: delay_ms,
+        ready_level,
+        required: manifest.required,
+        verify_exports: manifest.verify_exports,
+        verify_modules: manifest.verify_modules,
+        notify_success: manifest.notify_success,
+    });
 }
 
 fn resolve_hot_ready_level(manifest: &ModManifest) -> ReadyLevel {
@@ -1181,12 +1173,25 @@ fn discover_loose_dll(mods_dir: &Path, entry_path: &Path, discovered: &mut Disco
         );
         return;
     }
-
-    let Some(packaged) = package_loose_dll(mods_dir, entry_path) else {
-        return;
-    };
-
-    discovered.preload.push(packaged);
+    // Unmanifested DLLs are packaged as mod-native, never as early mod-preload.
+    // Do not load them inside the game bootstrap before OEP.
+    if let Some(packaged) = package_loose_dll(mods_dir, entry_path) {
+        discovered.hot.push(HotMod {
+            id: packaged.id,
+            name: packaged.name,
+            dependencies: packaged.dependencies,
+            version: packaged.version,
+            kind: MOD_TYPE_MOD_NATIVE.to_string(),
+            dll_path: packaged.dll_path,
+            log_aliases: packaged.log_aliases,
+            inject_delay_ms: 0,
+            ready_level: ReadyLevel::Process,
+            required: packaged.required,
+            verify_exports: packaged.verify_exports,
+            verify_modules: packaged.verify_modules,
+            notify_success: packaged.notify_success,
+        });
+    }
 }
 
 fn package_loose_dll(mods_dir: &Path, entry_path: &Path) -> Option<PreloadMod> {
@@ -1234,7 +1239,7 @@ fn package_loose_dll(mods_dir: &Path, entry_path: &Path) -> Option<PreloadMod> {
             version: None,
             author: None,
             description: None,
-            mod_type: MOD_TYPE_BLOADER_NATIVE.to_string(),
+            mod_type: MOD_TYPE_MOD_NATIVE.to_string(),
             api_version: None,
             inject_delay_ms: None,
             inject_min_frames: None,
@@ -1270,7 +1275,7 @@ fn package_loose_dll(mods_dir: &Path, entry_path: &Path) -> Option<PreloadMod> {
         name: file_stem,
         dependencies: Vec::new(),
         version: None,
-        kind: MOD_TYPE_BLOADER_NATIVE.to_string(),
+        kind: MOD_TYPE_MOD_NATIVE.to_string(),
         dll_path: target_dll,
         log_aliases: Vec::new(),
         required: false,
@@ -1278,44 +1283,6 @@ fn package_loose_dll(mods_dir: &Path, entry_path: &Path) -> Option<PreloadMod> {
         verify_modules: Vec::new(),
         notify_success: false,
     })
-}
-
-fn load_preload_mods(preload_mods: &mut Vec<PreloadMod>) -> bool {
-    preload_mods.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
-    let mut ready = ready_mod_ids();
-    let plan = plan_preload_mods(preload_mods, &ready);
-    for (index, reason) in plan.rejected {
-        record_dependency_failure(&preload_mods[index], "preload_native", reason);
-    }
-
-    let mut preloader_activated = false;
-    for index in plan.order {
-        let preload = &preload_mods[index];
-        if let Some(dependency) = dependency_not_ready(&preload.dependencies, &ready) {
-            record_dependency_failure(
-                preload,
-                "preload_native",
-                format!("required dependency {dependency} did not load successfully"),
-            );
-            continue;
-        }
-        let is_preloader = preload.name == "PreLoader";
-        logging::info_message(&format!(
-            "Loading Mod: {} <{}>",
-            preload.name,
-            preload.dll_path.file_name().unwrap_or_default().to_string_lossy(),
-        ));
-        let loaded = unsafe { load_library(preload, "preload_native", is_preloader) };
-        if loaded {
-            ready.insert(preload.id.to_ascii_lowercase());
-            ready.insert(preload.name.to_ascii_lowercase());
-        }
-        if is_preloader && loaded {
-            preloader_activated = true;
-            break;
-        }
-    }
-    preloader_activated
 }
 
 fn hot_as_native(hot: &HotMod) -> PreloadMod {
@@ -1511,7 +1478,10 @@ unsafe fn load_library(preload: &PreloadMod, phase: &str, silent_success: bool) 
 
 #[cfg(test)]
 mod tests {
-    use super::{bloader_mods_dir, parse_manifest_json, resolve_hot_ready_level};
+    use super::{
+        bloader_mods_dir, parse_manifest_json, resolve_hot_ready_level,
+        MOD_TYPE_MOD_NATIVE, MOD_TYPE_MOD_PRELOAD,
+    };
     use crate::bootstrap::runtime_ready::ReadyLevel;
 
     #[test]
@@ -1522,9 +1492,17 @@ mod tests {
     }
 
     #[test]
+    fn distinct_bloader_types_do_not_overlap_external_loaders() {
+        assert_eq!(MOD_TYPE_MOD_NATIVE, "mod-native");
+        assert_eq!(MOD_TYPE_MOD_PRELOAD, "mod-preload");
+        assert_ne!(MOD_TYPE_MOD_NATIVE, "native");
+        assert_ne!(MOD_TYPE_MOD_PRELOAD, "preload-native");
+    }
+
+    #[test]
     fn parses_native_load_verification_contract() {
         let manifest = parse_manifest_json(
-            r#"{"name":"NativeProbe","entry":"native_probe.dll","type":"bloader-native","required":true,"notify_success":true,"verify_exports":["ProbeInitialize"],"verify_modules":["kernel32.dll"]}"#,
+            r#"{"name":"NativeProbe","entry":"native_probe.dll","type":"mod-native","required":true,"notify_success":true,"verify_exports":["ProbeInitialize"],"verify_modules":["kernel32.dll"]}"#,
         )
         .expect("native verification fields must parse");
 
