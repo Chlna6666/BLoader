@@ -590,6 +590,36 @@ fn determine_attribution(
         };
     }
 
+    // A native library can crash while processing a pointer or callback passed
+    // through the loader. Preserve BLoader frames as suspects even when RIP is
+    // in libHttpClient, the game, or another native dependency.
+    let loader_frame = stack_frames.iter().enumerate().find_map(|(index, address)| {
+        let module = module_path_from_address(*address).to_ascii_lowercase();
+        module.ends_with("bloader.dll").then_some(index)
+    });
+    if let Some(frame_index) = loader_frame {
+        return CrashAttribution {
+            owner_type: "loader-in-native-stack".to_string(),
+            mod_id: None,
+            mod_name: None,
+            mod_version: None,
+            mod_kind: None,
+            mod_path: None,
+            active_phase: Some(if crate::cosmetics::inside_game_callback() {
+                "cosmetics-winhttp-game-callback".to_string()
+            } else {
+                "native-interop".to_string()
+            }),
+            confidence: "medium".to_string(),
+            reason: format!(
+                "native exception in {} with BLoader frame #{}; inspect hook callbacks and handle lifetime (stack presence does not prove causality)",
+                exception_module, frame_index
+            ),
+            suspect_mods,
+            mod_stack_frame: None,
+        };
+    }
+
     if crate::cosmetics::inside_game_callback() {
         return CrashAttribution {
             owner_type: "loader-hook-callback".to_string(),
