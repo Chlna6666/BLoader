@@ -62,6 +62,39 @@ fn prototype_row(rows: &[Value]) -> Option<Value> {
                 })
                 .cloned()
         })
+        // Modern Bedrock layouts can use StoreRow without a GridList header.
+        // Clone its native row structure instead of stuffing local capes into
+        // the owned item list, which loses the dedicated local cape section.
+        .or_else(|| {
+            rows.iter()
+                .filter(|row| {
+                    row.get("controlId").and_then(Value::as_str) == Some("StoreRow")
+                        && item_components(row).is_some_and(|components| {
+                            components.iter().any(|c| {
+                                c.get("type").and_then(Value::as_str) == Some("itemListComp")
+                                    && c.get("items").and_then(Value::as_array).is_some()
+                            })
+                        })
+                })
+                .find(|row| {
+                    item_components(row).is_some_and(|components| {
+                        components.iter().any(|c| {
+                            c.get("type").and_then(Value::as_str) == Some("itemListComp")
+                                && c.get("linksTo").is_none()
+                        })
+                    })
+                })
+                .or_else(|| rows.iter().find(|row| {
+                    row.get("controlId").and_then(Value::as_str) == Some("StoreRow")
+                        && item_components(row).is_some_and(|components| {
+                            components.iter().any(|c| {
+                                c.get("type").and_then(Value::as_str) == Some("itemListComp")
+                                    && c.get("items").and_then(Value::as_array).is_some()
+                            })
+                        })
+                }))
+                .cloned()
+        })
 }
 fn build_row(prototype: &Value, title: &str, items: Vec<Value>) -> Result<Value, String> {
     let mut row = prototype.clone();
@@ -76,6 +109,14 @@ fn build_row(prototype: &Value, title: &str, items: Vec<Value>) -> Result<Value,
             Some("headerComp" | "itemListComp" | "dispPreviewPieceComp")
         )
     });
+    // StoreRow often provides only itemListComp. Add a native-style header
+    // to the cloned row so the user can find the local imports distinctly.
+    if !components.iter().any(|c| c.get("type").and_then(Value::as_str) == Some("headerComp")) {
+        components.insert(0, json!({
+            "type": "headerComp",
+            "text": {"value": title, "replacements": []}
+        }));
+    }
     let n = items.len();
     for c in components {
         match c.get("type").and_then(Value::as_str) {
@@ -238,13 +279,8 @@ pub fn inject(
         .find(|row| row.get("controlId").and_then(Value::as_str) == Some("VerticalLineDivider"))
         .cloned();
     let anchor = rows.iter()
-        .position(|row| {
-            row.get("controlId").and_then(Value::as_str) == Some("GridList")
-                && item_components(row).is_some_and(|components| components.iter().any(|component| {
-                    component.get("type").and_then(Value::as_str) == Some("itemListComp")
-                }))
-        })
-        .ok_or("cape page has no GridList")? + 1;
+        .position(|row| row == &template)
+        .ok_or("cape section template disappeared during injection")? + 1;
     let categories = [
         ("Official Capes - Catalog Only", official_new),
         ("Community Capes", community_new),
@@ -362,12 +398,19 @@ mod tests {
             "pieceType":"persona_capes"});
         let stats = inject(&mut root, &[], &[local], &HashSet::new(), "id").unwrap();
         assert_eq!(stats.local, 1);
-        let component = &root["result"]["layout"][0]["rows"][0]["components"][0];
-        assert_eq!(component["items"].as_array().unwrap().len(), 2);
-        assert_eq!(component["items"][0]["receipt"], "real");
-        assert_eq!(component["items"][1]["id"], "local-import");
-        assert_eq!(component["totalItems"], 2);
-        assert_eq!(component["customStoreRowConfiguration"]["maxOffers"], 2);
+        let rows = root["result"]["layout"][0]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "local capes need a distinct StoreRow");
+        let original = &rows[0]["components"][0];
+        assert_eq!(original["items"].as_array().unwrap().len(), 1);
+        assert_eq!(original["items"][0]["receipt"], "real");
+        let components = rows[1]["components"].as_array().unwrap();
+        let header = components.iter().find(|c| c["type"] == "headerComp").unwrap();
+        assert!(header["text"]["value"].as_str().unwrap().contains("My Local ZIP Capes"));
+        let local_list = components.iter().find(|c| c["type"] == "itemListComp").unwrap();
+        assert_eq!(local_list["items"].as_array().unwrap().len(), 1);
+        assert_eq!(local_list["items"][0]["id"], "local-import");
+        assert_eq!(local_list["totalItems"], 1);
+        assert_eq!(local_list["customStoreRowConfiguration"]["maxOffers"], 1);
         let repeat = inject(&mut root, &[], &[json!({"id":"local-import"})], &HashSet::new(), "id").unwrap();
         assert!(!repeat.changed());
     }
