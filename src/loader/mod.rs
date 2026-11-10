@@ -568,7 +568,7 @@ unsafe fn load_and_verify_native(
                 })
             }
         };
-        crash_report::rearm_unhandled_filter(&format!("after-native-load:{}", preload.id));
+        // Preserve the newly loaded Runtime's own exception filter.
         match load_result {
             Ok((module, loader_api)) => (module, loader_api, false),
             Err(detail) => {

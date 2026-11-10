@@ -148,16 +148,18 @@ fn run_bootstrap_sequence(execution_mode: &'static str) -> bool {
 
     crate::platform::crash_report::install();
 
-    // Install the OutputDebugString hooks BEFORE any native Mod is loaded.
-    // PreLoader/LeviLamina are loaded in prepare_premain_preloads below, and
-    // anything they (or the game during their init) write to the debug channel
-    // before this point would be lost forever. Hook creation is cheap and does
-    // not need the console or the tracing subscriber.
-    crate::platform::logging::write_bootstrap_marker(&format!(
-        "bootstrap.game_log.premain.install execution={execution_mode}"
-    ));
-    unsafe {
-        crate::game::game_log::install();
+    // LeviLamina owns its own async logger and exception/crash hooks.
+    // Avoid process-wide OutputDebugString interception when delegating to
+    // PreLoader; standalone BLoader loading retains the compatibility hook.
+    let preloader_present = crate::bootstrap::preloader_proxy::has_priority_preloader(
+        &crate::platform::utils::get_exe_directory(),
+    );
+    if !preloader_present {
+        unsafe { crate::game::game_log::install(); }
+    } else {
+        crate::platform::logging::write_bootstrap_marker(
+            "bootstrap.game_log.delegated owner=PreLoader transport=file-relay",
+        );
     }
 
     let premain_result = panic::catch_unwind(|| unsafe { prepare_premain_preloads(execution_mode, &config) });
@@ -280,12 +282,8 @@ unsafe fn bootstrap(
     }
 
     crate::platform::native_stdio::flush_pending();
-    // The OutputDebugString hooks were already installed before the native
-    // preload chain ran (run_bootstrap_sequence), so the whole startup
-    // sequence including Mod init is captured. This call is a no-op when the
-    // hooks are live.
-    unsafe {
-        crate::game::game_log::install();
+    if !preloader_summary.active() {
+        unsafe { crate::game::game_log::install(); }
     }
     crate::bootstrap::xuser_bridge::publish_pending_logs();
     setup_panic_hook();
@@ -466,10 +464,8 @@ fn schedule_post_oep_runtime_io(enable_debug_console: bool) {
 
             unsafe { crate::platform::native_stdio::install_process_capture(); }
             crate::platform::native_stdio::flush_pending();
-            // The game or its CRT may replace the top-level exception filter
-            // while initializing; retake it now that OEP is well behind us so
-            // late crashes still produce a full BLoader report.
-            crate::platform::crash_report::rearm_unhandled_filter("post-oep");
+            // Leave third-party CrashLogger/LeviLamina exception ownership in
+            // place. Force-rearming the BLoader top-level filter hijacks it.
             crate::platform::logging::write_bootstrap_marker(&format!(
                 "post-oep.runtime_io.ready delay_ms={} console={} stdio=process-crt",
                 POST_OEP_RUNTIME_IO_DELAY_MS, enable_debug_console,

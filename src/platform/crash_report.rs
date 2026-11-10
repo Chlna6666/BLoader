@@ -456,9 +456,14 @@ unsafe fn should_capture_veh_exception(exception: *const EXCEPTION_POINTERS) -> 
     let record = &*(*exception).ExceptionRecord;
     let code = record.ExceptionCode.0 as u32;
     let flags = record.ExceptionFlags;
+    // A continuable access violation in a native allocator may be recovered
+    // by its SEH. Taking a minidump inside its first-chance VEH can trigger a
+    // second allocator fault and Rust fast-fail in the BLoader handler.
+    if flags & 0x1 == 0 {
+        return false;
+    }
     let address = record.ExceptionAddress as usize;
     let module = module_path_from_address(address).to_ascii_lowercase();
-    let active_mod = mod_diagnostics::active_scope_for_thread(GetCurrentThreadId()).is_some();
 
     if matches!(code, 0xE0000001 | 0xE06D7363) {
         return false;
@@ -483,16 +488,11 @@ unsafe fn should_capture_veh_exception(exception: *const EXCEPTION_POINTERS) -> 
         return false;
     }
 
-    if active_mod {
-        return true;
-    }
-
-    if flags & 0x1 != 0 {
-        return is_loader_or_mod_module(&module)
-            || mod_diagnostics::identify_address(address).is_some();
-    }
-
-    is_loader_or_mod_module(&module) || mod_diagnostics::identify_address(address).is_some()
+    // Do not preempt external CrashLogger for faults in LeviLamina or
+    // Minecraft. The BLoader handler only snapshots its own noncontinuable
+    // failures; native runtime faults belong to the runtime's last-chance
+    // exception filter.
+    module.ends_with("bloader.dll")
 }
 
 fn crash_signature(code: u32, address: usize, thread_id: u32) -> u64 {

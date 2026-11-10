@@ -179,10 +179,9 @@ pub unsafe fn activate_console_logging() {
     // i18n is not configured during the priority native preload stage.
     // Attach the log sink now; publish localized host identity after OEP.
     logging::set_console_handle(h_conout);
-    // The console device is the only channel native DLLs and the game use for
-    // their own log output; hook it as soon as the sink exists so lines written
-    // during the native preload stage are captured too.
-    crate::platform::console_capture::install();
+    // Do not install process-global WriteConsole/WriteFile detours before
+    // deciding whether native PreLoader owns this console. In delegated mode
+    // the shared file relay is the only LeviLamina logging integration.
     logging::scoped_debug_message(
         "console",
         &format!(

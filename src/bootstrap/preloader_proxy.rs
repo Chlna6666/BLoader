@@ -7,7 +7,7 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows::core::PCWSTR;
 
-use crate::platform::{crash_report, logging, mod_diagnostics};
+use crate::platform::{logging, mod_diagnostics};
 
 const PRELOAD_TYPE: &str = "preload";
 const LEVILAMINA_PRELOAD_TYPE: &str = "preload-native";
@@ -64,6 +64,10 @@ struct ManifestBundle {
     manifest: Manifest,
 }
 
+pub fn has_priority_preloader(game_dir: &Path) -> bool {
+    !discover_candidates(&game_dir.join("mods")).is_empty()
+}
+
 pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
     if crate::platform::console::early_console_requested() {
         crate::platform::console::init_console_window_early();
@@ -71,7 +75,6 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
         // The bridge initialized before third-party preloads. Publish its
         // bounded early records now, before native DLL output can overtake it.
         crate::bootstrap::xuser_bridge::publish_pending_logs();
-        crate::platform::console_capture::install();
     }
 
     let started = Instant::now();
@@ -79,6 +82,9 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
     candidates.sort_by(|a, b| a.path.cmp(&b.path));
 
     if candidates.is_empty() {
+        if logging::console_is_ready() {
+            crate::platform::console_capture::install();
+        }
         logging::write_bootstrap_marker("preloader.early.not_found");
         return PreloaderProxySummary {
             discovered: 0,
@@ -177,7 +183,8 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
         let wide = wide_null(expected.as_os_str());
         LoadLibraryW(PCWSTR(wide.as_ptr()))
     };
-    crash_report::rearm_unhandled_filter("after-preloader-priority-early-load");
+    // Preserve the runtime-owned unhandled exception filter installed by
+    // PreLoader/LeviLamina/CrashLogger rather than overriding it here.
 
     match load_result {
         Ok(module) => {
