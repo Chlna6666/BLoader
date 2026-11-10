@@ -272,13 +272,15 @@ unsafe fn bootstrap(
     );
 
     if execution_mode == "oep-gated-startup-thread" {
-        schedule_post_oep_runtime_io(config.enable_debug_console);
+        schedule_post_oep_runtime_io(config.enable_debug_console, preloader_summary.active());
     } else {
         if config.enable_debug_console {
             unsafe { crate::platform::console::init_console(); }
             crate::platform::logging::write_bootstrap_marker("bootstrap.console.ready");
         }
-        crate::platform::native_stdio::install_process_capture();
+        if !preloader_summary.active() {
+            crate::platform::native_stdio::install_process_capture();
+        }
     }
 
     crate::platform::native_stdio::flush_pending();
@@ -434,7 +436,7 @@ unsafe fn bootstrap(
 
 const POST_OEP_RUNTIME_IO_DELAY_MS: u64 = 1_500;
 
-fn schedule_post_oep_runtime_io(enable_debug_console: bool) {
+fn schedule_post_oep_runtime_io(enable_debug_console: bool, preloader_active: bool) {
     crate::platform::logging::write_bootstrap_marker(&format!(
         "bootstrap.runtime_io.deferred console=after-oep-immediate stdio=oep+{}ms console_enabled={}",
         POST_OEP_RUNTIME_IO_DELAY_MS, enable_debug_console,
@@ -462,13 +464,20 @@ fn schedule_post_oep_runtime_io(enable_debug_console: bool) {
 
             crate::bootstrap::runtime_ready::wait_until_oep_delay(POST_OEP_RUNTIME_IO_DELAY_MS);
 
-            unsafe { crate::platform::native_stdio::install_process_capture(); }
-            crate::platform::native_stdio::flush_pending();
+            // LeviLamina/PreLoader owns its own CRT stdout and stderr. The
+            // process-wide _dup2/_setvbuf/_flushall binding can race with
+            // asynchronous native logger threads and corrupt their streams.
+            // Use the external latest.log relay instead in delegated mode.
+            if !preloader_active {
+                unsafe { crate::platform::native_stdio::install_process_capture(); }
+                crate::platform::native_stdio::flush_pending();
+            }
             // Leave third-party CrashLogger/LeviLamina exception ownership in
             // place. Force-rearming the BLoader top-level filter hijacks it.
             crate::platform::logging::write_bootstrap_marker(&format!(
-                "post-oep.runtime_io.ready delay_ms={} console={} stdio=process-crt",
+                "post-oep.runtime_io.ready delay_ms={} console={} stdio={}",
                 POST_OEP_RUNTIME_IO_DELAY_MS, enable_debug_console,
+                if preloader_active { "delegated-to-PreLoader" } else { "process-crt" },
             ));
         }) {
         Ok(_) => crate::platform::logging::write_bootstrap_marker(
