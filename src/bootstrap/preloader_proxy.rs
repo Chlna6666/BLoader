@@ -1,4 +1,3 @@
-use serde::Deserialize;
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -9,8 +8,7 @@ use windows::core::PCWSTR;
 
 use crate::platform::{logging, mod_diagnostics, native_stdio};
 
-const PRELOAD_TYPE: &str = "preload";
-const LEVILAMINA_PRELOAD_TYPE: &str = "preload-native";
+const PRELOAD_TYPE: &str = "preloader-bootstrap";
 const PRELOADER_DLL: &str = "PreLoader.dll";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,27 +43,8 @@ struct Candidate {
     log_aliases: Vec<String>,
 }
 
-#[derive(Deserialize)]
-struct Manifest {
-    #[serde(default)]
-    id: Option<String>,
-    name: String,
-    entry: String,
-    #[serde(default)]
-    version: Option<String>,
-    #[serde(rename = "type", default)]
-    mod_type: String,
-    #[serde(default)]
-    log_aliases: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct ManifestBundle {
-    manifest: Manifest,
-}
-
 pub fn has_priority_preloader(game_dir: &Path) -> bool {
-    !discover_candidates(&game_dir.join("mods")).is_empty()
+    !discover_candidates(game_dir).is_empty()
 }
 
 pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
@@ -78,10 +57,17 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
     }
 
     let started = Instant::now();
-    let mut candidates = discover_candidates(&game_dir.join("mods"));
+    let mut candidates = discover_candidates(game_dir);
     candidates.sort_by(|a, b| a.path.cmp(&b.path));
 
     if candidates.is_empty() {
+        let legacy_dir = game_dir.join("mods").join("PreLoader");
+        if legacy_dir.join(PRELOADER_DLL).is_file() {
+            logging::scoped_error_message(
+                "preloader",
+                "Legacy mods/PreLoader/PreLoader.dll is unsafe: it may be scanned as a preload-native Mod by PreLoader itself. Move the whole package to BLoader/PreLoader/.",
+            );
+        }
         if logging::console_is_ready() {
             crate::platform::console_capture::install();
         }
@@ -90,22 +76,6 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
             discovered: 0,
             state: PreloaderProxyState::NotFound,
         };
-    }
-
-    if candidates.len() > 1 {
-        logging::write_bootstrap_marker(&format!(
-            "preloader.early.multiple count={} selected={}",
-            candidates.len(),
-            candidates[0].path.display()
-        ));
-        logging::scoped_warn_message(
-            "preloader",
-            &format!(
-                "Multiple priority PreLoader packages found; using first deterministic candidate | count={} | selected={}",
-                candidates.len(),
-                candidates[0].path.display()
-            ),
-        );
     }
 
     let discovered = candidates.len();
@@ -261,59 +231,28 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
     }
 }
 
-fn discover_candidates(mods_dir: &Path) -> Vec<Candidate> {
-    let Ok(entries) = fs::read_dir(mods_dir) else {
+/// Bootstrap is not a Mod. Keep PreLoader itself outside mods/, because
+/// PreLoader scans that directory for preload-native entries (including
+/// LeviLamina), and would otherwise see its own DLL.
+fn discover_candidates(game_dir: &Path) -> Vec<Candidate> {
+    let dir = game_dir.join("BLoader").join("PreLoader");
+    let path = dir.join(PRELOADER_DLL);
+    if !path.is_file() {
         return Vec::new();
-    };
-
-    let mut candidates = Vec::new();
-    for entry in entries.flatten() {
-        let package_dir = entry.path();
-        if !package_dir.is_dir() {
-            continue;
-        }
-
-        let manifest_path = package_dir.join("manifest.json");
-        let Ok(text) = fs::read_to_string(&manifest_path) else {
-            continue;
-        };
-        let Ok(manifest) = parse_manifest(&text) else {
-            continue;
-        };
-        // Current LeviLamina manifests use preload-native, while older
-        // BMCBL installs used the loader-specific type=preload spelling.
-        if !manifest.mod_type.eq_ignore_ascii_case(PRELOAD_TYPE)
-            && !manifest.mod_type.eq_ignore_ascii_case(LEVILAMINA_PRELOAD_TYPE)
-        {
-            continue;
-        }
-
-        let path = package_dir.join(&manifest.entry);
-        let is_preloader = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case(PRELOADER_DLL));
-        if !is_preloader || !path.is_file() {
-            continue;
-        }
-
-        let name = manifest.name;
-        candidates.push(Candidate {
-            id: manifest.id.unwrap_or_else(|| name.clone()),
-            name,
-            version: manifest.version,
-            path,
-            log_aliases: manifest.log_aliases,
-        });
     }
-    candidates
-}
-
-fn parse_manifest(text: &str) -> Result<Manifest, serde_json::Error> {
-    match serde_json::from_str(text) {
-        Ok(manifest) => Ok(manifest),
-        Err(_) => serde_json::from_str::<ManifestBundle>(text).map(|bundle| bundle.manifest),
-    }
+    let version = fs::read_to_string(dir.join("manifest.json"))
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .and_then(|manifest| manifest.get("version")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned));
+    vec![Candidate {
+        id: "PreLoader".to_string(),
+        name: "PreLoader".to_string(),
+        version,
+        path,
+        log_aliases: Vec::new(),
+    }]
 }
 
 fn module_by_name(name: &str) -> Option<HMODULE> {
