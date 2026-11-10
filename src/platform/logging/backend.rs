@@ -1287,15 +1287,17 @@ fn parse_external_structured_line(line: &str) -> Option<ExternalStructuredLine> 
 /// without native hooks, and preserves the source's original event time.
 fn parse_levilamina_console_line(line: &str) -> Option<ExternalStructuredLine> {
     let (time, remainder) = line.trim_start().split_once(' ')?;
-    let valid_time = time.len() >= 8
-        && time.as_bytes().get(2) == Some(&b':')
-        && time.as_bytes().get(5) == Some(&b':')
-        && time[..2].bytes().all(|c| c.is_ascii_digit())
-        && time[3..5].bytes().all(|c| c.is_ascii_digit())
-        && time[6..8].bytes().all(|c| c.is_ascii_digit())
-        && (time.len() == 8
-            || (time.as_bytes().get(8) == Some(&b'.')
-                && time[9..].bytes().all(|c| c.is_ascii_digit())));
+    let bytes = time.as_bytes();
+    let valid_time = bytes.len() >= 8
+        && bytes.get(2) == Some(&b':')
+        && bytes.get(5) == Some(&b':')
+        && bytes[0..2].iter().all(u8::is_ascii_digit)
+        && bytes[3..5].iter().all(u8::is_ascii_digit)
+        && bytes[6..8].iter().all(u8::is_ascii_digit)
+        && (bytes.len() == 8
+            || (bytes.get(8) == Some(&b'.')
+                && bytes.len() > 9
+                && bytes[9..].iter().all(u8::is_ascii_digit)));
     if !valid_time {
         return None;
     }
@@ -2229,6 +2231,8 @@ mod external_line_tests {
         assert!(record.timestamp_full.ends_with(" 19:03:25.123"));
         assert!(parse_levilamina_console_line("Minecraft generic console output").is_none());
         assert!(parse_levilamina_console_line("19:03:25.123 BOGUS LeviLamina something").is_none());
+        assert!(parse_levilamina_console_line("中19:03:25 INFO LeviLamina x").is_none());
+        assert!(parse_levilamina_console_line("19:03:25. INFO LeviLamina x").is_none());
     }
 
     #[test]
