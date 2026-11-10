@@ -17,7 +17,7 @@ use windows::core::{PCSTR, PCWSTR};
 
 use crate::bootstrap::runtime_ready::{self, ReadyLevel};
 use crate::platform::{
-    crash_report, file_io_policy, logging, mod_diagnostics, native_stdio,
+    file_io_policy, logging, mod_diagnostics, native_stdio,
 };
 
 #[derive(Serialize, Deserialize)]

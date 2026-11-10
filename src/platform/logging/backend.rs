@@ -1108,13 +1108,9 @@ fn write_captured_file_record(record: &CapturedRecord) {
         record.scope,
         record.message
     );
-    if record.channel == CaptureChannel::FileRelay {
-        // The original already exists in the shared latest.log; writing it
-        // back there creates duplicate bytes, extra tailer work and disorder.
-        enqueue_file_write(FileWrite::Archive(line.into_bytes()));
-    } else {
-        enqueue_file_write(FileWrite::Main(line.into_bytes()));
-    }
+    // The relay source is LeviLamina's logs/latest.log, while BLoader's
+    // unified file is logs/bloader/latest.log; this cannot feed back.
+    enqueue_file_write(FileWrite::Main(line.into_bytes()));
 }
 
 /// Maps a parsed external line's source tag to a console scope. The game's
@@ -1704,25 +1700,17 @@ fn archive_log_path() -> PathBuf {
 }
 
 fn prepare_latest_log_path() -> PathBuf {
-    let log_dir = PathBuf::from("logs");
+    // Do not share LeviLamina's rotating logs/latest.log. Its FileSink may
+    // replace the file while BLoader's tracing appender still has it open.
+    let log_dir = PathBuf::from("logs").join("bloader");
     let _ = fs::create_dir_all(&log_dir);
     let path = log_dir.join("latest.log");
     if LATEST_PREPARED.set(()).is_ok() {
-        // Never truncate: LeviLamina owns the same `latest.log` and has
-        // already written its startup banner into it by the time BLoader
-        // initializes logging. Truncating destroyed those lines and left the
-        // other writer appending at a stale offset (sparse NUL bytes).
-        // Append a separator only when the previous writer left a partial
-        // line behind, so the next record starts cleanly.
-        if let Ok(bytes) = fs::read(&path)
-            && !bytes.is_empty()
-            && !bytes.ends_with(b"\n")
-        {
-            let _ = OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .and_then(|mut file| file.write_all(b"\r\n"));
-        }
+        let _ = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path);
     }
     path
 }
@@ -1755,7 +1743,6 @@ fn write_bytes_to_bootstrap_file(bytes: &[u8]) {
 // to use the synchronous emergency file path.
 enum FileWrite {
     Main(Vec<u8>),
-    Archive(Vec<u8>),
     Mod(PathBuf, Vec<u8>),
 }
 
@@ -1780,20 +1767,15 @@ fn write_mod_file(path: &Path, bytes: &[u8]) {
 
 fn write_file_batch(commands: Vec<FileWrite>) {
     let mut main = Vec::<u8>::new();
-    let mut archive = Vec::<u8>::new();
     let mut mod_files = HashMap::<PathBuf, Vec<u8>>::new();
     for command in commands {
         match command {
             FileWrite::Main(bytes) => main.extend_from_slice(&bytes),
-            FileWrite::Archive(bytes) => archive.extend_from_slice(&bytes),
             FileWrite::Mod(path, bytes) => mod_files.entry(path).or_default().extend_from_slice(&bytes),
         }
     }
     if !main.is_empty() {
         write_bytes_to_bootstrap_file(&main);
-    }
-    if !archive.is_empty() {
-        write_mod_file(&archive_log_path(), &archive);
     }
     for (path, bytes) in mod_files {
         write_mod_file(&path, &bytes);
@@ -1988,7 +1970,7 @@ fn console_sink() -> &'static Option<std::sync::mpsc::SyncSender<ConsoleCommand>
                                 message: format!(
                                     "console busy: {skipped} live records omitted; {}",
                                     if file_io_policy::writes_allowed() {
-                                        "full logs are in logs/latest.log"
+                                        "full logs are in logs/bloader/latest.log"
                                     } else {
                                         "legacy UWP file logging is disabled"
                                     }
