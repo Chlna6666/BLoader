@@ -153,7 +153,7 @@ struct NativeLoadReport {
     elapsed_ms: u128,
 }
 
-pub unsafe fn load_native_preloads_in_dllmain(game_dir: &Path) -> NativePreloadSummary {
+pub unsafe fn load_mod_preloads_before_oep(game_dir: &Path) -> NativePreloadSummary {
     let mods_dir = bloader_mods_dir(game_dir);
     let mut summary = NativePreloadSummary::default();
 
@@ -183,7 +183,7 @@ pub unsafe fn load_native_preloads_in_dllmain(game_dir: &Path) -> NativePreloadS
             Err(error) => {
                 record_native_report(NativeLoadReport {
                     name: package_display_name(&package_dir),
-                    phase: "dllmain_preload".to_string(),
+                    phase: "mod_preload".to_string(),
                     required: false,
                     notify_success: false,
                     expected_path: manifest_path.display().to_string(),
@@ -207,7 +207,7 @@ pub unsafe fn load_native_preloads_in_dllmain(game_dir: &Path) -> NativePreloadS
             Err(error) => {
                 record_native_report(NativeLoadReport {
                     name: package_display_name(&package_dir),
-                    phase: "dllmain_preload".to_string(),
+                    phase: "mod_preload".to_string(),
                     required: false,
                     notify_success: false,
                     expected_path: manifest_path.display().to_string(),
@@ -283,7 +283,7 @@ pub unsafe fn load_native_preloads_in_dllmain(game_dir: &Path) -> NativePreloadS
     let plan = plan_preload_mods(&native_preloads, &ready);
     for (index, reason) in plan.rejected {
         let preload = &native_preloads[index];
-        record_dependency_failure(preload, "dllmain_preload", reason);
+        record_dependency_failure(preload, "mod_preload", reason);
         summary.failed += 1;
         if preload.required {
             summary.required_failed += 1;
@@ -294,7 +294,7 @@ pub unsafe fn load_native_preloads_in_dllmain(game_dir: &Path) -> NativePreloadS
         if let Some(dependency) = dependency_not_ready(&preload.dependencies, &ready) {
             record_dependency_failure(
                 preload,
-                "dllmain_preload",
+                "mod_preload",
                 format!("required dependency {dependency} did not load successfully"),
             );
             summary.failed += 1;
@@ -304,7 +304,7 @@ pub unsafe fn load_native_preloads_in_dllmain(game_dir: &Path) -> NativePreloadS
             continue;
         }
         summary.attempted += 1;
-        let report = unsafe { load_and_verify_native(preload, "dllmain_preload", true) };
+        let report = unsafe { load_and_verify_native(preload, "mod_preload", true) };
         match report.state {
             NativeLoadState::Verified | NativeLoadState::AlreadyVerified => {
                 ready.insert(preload.id.to_ascii_lowercase());
@@ -1325,15 +1325,25 @@ fn spawn_hot_mod_loader(mut hot_mods: Vec<HotMod>) {
                 &format!("hot Mod queue={} dependency_ordered=true", hot_mods.len()),
             );
             for (index, reason) in plan.rejected {
-                record_dependency_failure(&hot_as_native(&hot_mods[index]), "hot_inject", reason);
+                let mod_phase = if hot_mods[index].kind == MOD_TYPE_MOD_NATIVE {
+                    "mod_native"
+                } else {
+                    "hot_inject"
+                };
+                record_dependency_failure(&hot_as_native(&hot_mods[index]), mod_phase, reason);
             }
             for index in plan.order {
                 let hot_mod = &hot_mods[index];
                 let native_mod = hot_as_native(hot_mod);
+                let mod_phase = if hot_mod.kind == MOD_TYPE_MOD_NATIVE {
+                    "mod_native"
+                } else {
+                    "hot_inject"
+                };
                 if let Some(dependency) = dependency_not_ready(&hot_mod.dependencies, &ready) {
                     record_dependency_failure(
                         &native_mod,
-                        "hot_inject",
+                        mod_phase,
                         format!("required dependency {dependency} did not load successfully"),
                     );
                     continue;
@@ -1344,7 +1354,7 @@ fn spawn_hot_mod_loader(mut hot_mods: Vec<HotMod>) {
                 if !readiness_reached {
                     record_dependency_failure(
                         &native_mod,
-                        "hot_inject",
+                        mod_phase,
                         format!(
                             "runtime readiness {} timed out; refusing unsafe load",
                             hot_mod.ready_level.as_str()
@@ -1354,13 +1364,14 @@ fn spawn_hot_mod_loader(mut hot_mods: Vec<HotMod>) {
                 }
                 runtime_ready::wait_until_oep_delay(hot_mod.inject_delay_ms);
                 logging::info_message(&format!(
-                    "Hot Loading Mod: {} <{}> readiness={} delay_from_oep={}ms",
+                    "Loading {} Mod: {} <{}> readiness={} delay_from_oep={}ms",
+                    if hot_mod.kind == MOD_TYPE_MOD_NATIVE { "Native" } else { "Delayed" },
                     hot_mod.name,
                     hot_mod.dll_path.file_name().unwrap_or_default().to_string_lossy(),
                     hot_mod.ready_level.as_str(),
                     hot_mod.inject_delay_ms,
                 ));
-                if unsafe { load_library(&native_mod, "hot_inject", false) } {
+                if unsafe { load_library(&native_mod, mod_phase, false) } {
                     ready.insert(hot_mod.id.to_ascii_lowercase());
                     ready.insert(hot_mod.name.to_ascii_lowercase());
                 }
