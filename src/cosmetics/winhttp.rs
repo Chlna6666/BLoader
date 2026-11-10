@@ -106,6 +106,7 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 /// config.json 的 enable_cosmetics 总开关（热重载可关闭；重新开启需重启游戏）。
 static MASTER_ENABLED: AtomicBool = AtomicBool::new(false);
+static ASYNC_LOCAL_PAGE_WARNING_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// BLoader 移植：日志统一走 BLoader logging（scope=cosmetics）。
 /// 默认日志保持安静——`logger()` 承载的全部遥测明细都落在 debug 级
@@ -1450,6 +1451,15 @@ unsafe extern "system" fn status_bridge(h: H, context: usize, status: u32, info:
             })
         };
         if let Some((id, route, asynchronous)) = note {
+            if asynchronous && !ASYNC_PREFETCH_ENABLED
+                && (route.starts_with("dressing_room_capes")
+                    || route.starts_with("local_persona_profile"))
+                && !ASYNC_LOCAL_PAGE_WARNING_LOGGED.swap(true, Ordering::Relaxed)
+            {
+                warn_log(
+                    "Local capes were scanned, but the Minecraft dressing-room page uses async WinHTTP. Response rewriting is disabled for this path after libHttpClient crashes; navigation/entries may not appear. Native response integration is still required.",
+                );
+            }
             let code = query_number(h, QUERY_STATUS_CODE);
             let content_length = query_number(h, QUERY_CONTENT_LENGTH);
             let encoding = query_string(h, QUERY_CONTENT_ENCODING)
