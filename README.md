@@ -115,7 +115,7 @@ BLoader 会把 XUser/BMCBL 通信状态输出到结构化控制台和正常日�
 
 ## 主要功能
 
-- 原生 `native` / `preload-native` / `hot-native` / `hot-inject` Mod 装载；
+- BLoader 自有 `mod-preload`（OEP 前）与 `mod-native`（OEP 后）原生 Mod 装载，以及可选的 `hot-native` / `hot-inject` 延迟装载；
 - Native Mod 注册、预加载与延迟加载、状态归属和依赖验证（原 BL Mod ABI 已从 Core 移除）；
 - 进程 stdio 捕获，支持 `puts`、`printf`、`fprintf`、`std::cout`、Rust stdout/stderr 与 Win32 stdout；
 - 每个 Mod 的加载生命周期、stdout/stderr、BL Host `log()` 和崩溃归属统一输出到控制台；
@@ -135,32 +135,52 @@ default = []
 
 `panel-ui`、`mc-symbols` 和 `blgen` 特性已移除，默认发布 DLL 不含面板渲染与符号包子系统。
 
-## Native Mod 与 LeviLamina 加载归属
+## BLoader 与 LeviLamina 的独立 Mod 类型
 
-BLoader 仍负责 BMCBL 需要的内建 Cosmetics、文件重定向及 XUser Bridge。移除的是 BLoader Core 内的 BL Mod ABI，而不是这些启动器集成能力。旧 `bl-sdk/` 和 `templates/bl_mod/` 仅作为历史代码保留，不能直接用来生成新 Core 支持的 Mod。
+BLoader 的 BMCBL 内建集成（Cosmetics、文件重定向、XUser Bridge）仍由 Core 负责，不会被迁移到第三方 Mod。
 
-Manifest 支持 `native`、`preload-native`、`hot-native`、`hot-inject`。BLoader 识别旧 `type=preload` 和官方 `type=preload-native` 的 `PreLoader.dll` 优先入口；未知类型不再被错误地按原生 DLL 装载。
+运行时拥有严格独立的加载根目录和类型：
 
-当检测到有效 LeviLamina PreLoader 时，默认将其管理的 `native` / `preload-native` 包标记为 *delegated*，由 LeviLamina 自己执行原生 Mod 依赖排序和初始化。BLoader 特有的热加载仍由 BLoader 调度。若某个原生 DLL 明确属于 BLoader 而非 LeviLamina，可在它的 Manifest 中指定 `"bloader_managed": true`。
+| 类型 | 负责方 | 加载阶段 | 目录 |
+| --- | --- | --- | --- |
+| `preloader-bootstrap` | BLoader 引导器 | Minecraft OEP 之前，优先装载 PreLoader.dll | `BLoader/PreLoader/` |
+| `preload-native` | 官方 PreLoader | PreLoader 扫描期间、LeviLamina 初始化前 | `mods/` |
+| `native` | LeviLamina ModRegistrar | LeviLamina 初始化期间 | `mods/` |
+| `mod-preload` | BLoader Native Loader | Minecraft OEP 之前 | `BLoader/mods/` |
+| `mod-native` | BLoader Native Loader | Minecraft OEP 释放后（process ready） | `BLoader/mods/` |
+| `hot-native` / `hot-inject` | BLoader Native Loader | 按窗口就绪条件及延迟注入 | `BLoader/mods/` |
 
-仅对 BLoader 管理的原生 DLL，可使用 `bloader_dependencies` 声明依赖 ID，支持拓扑排序、缺失依赖、重复 ID、循环依赖与上游加载失败后的阻止装载。例如：
+其中 `preloader-bootstrap` 是 BMCBL 安装在 `BLoader/PreLoader/manifest.json` 的引导**元数据**，不是由 PreLoader 或 LeviLamina 注册的 Mod 类型。不要将 PreLoader 自身置于 `mods/PreLoader` 并赋予 `preload-native`，否则在某些实现中可能被 PreLoader 再次扫描。BLoader 只执行一次 PreLoader 的 `LoadLibraryW`，由 PreLoader 扫描 `mods/` 并装载 LeviLamina，然后 LeviLamina 加载其所属 Mod。
+
+BLoader 的 `mod-preload` 可在游戏执行 OEP 前安装需要的启动期 Hook；`mod-native` 在 OEP 已释放后自动加载，适合普通本地原生扩展。**不会**将 BLoader 的新类型注册到 LeviLamina，也不再识别旧的 `bloader-native` 作为别名。Loose DLL 默认自动打包为 `mod-native`，不会悄悄提前执行。
+
+使用 `mod-preload`：
+
+```json
+{
+  "id": "example.graphics",
+  "name": "ExampleGraphics",
+  "type": "mod-preload",
+  "entry": "ExampleGraphics.dll",
+  "bloader_dependencies": [],
+  "required": false
+}
+```
+
+普通启动期 Mod 使用 `mod-native`：
 
 ```json
 {
   "id": "example.native",
   "name": "ExampleNative",
-  "type": "hot-native",
+  "type": "mod-native",
   "entry": "ExampleNative.dll",
-  "bloader_managed": true,
-  "bloader_dependencies": ["example.runtime"],
-  "inject_ready": "stable-window",
-  "required": true
+  "bloader_dependencies": [],
+  "required": false
 }
 ```
 
-BLoader 不解释 LeviLamina 的 `dependencies` / `optionalDependencies` / `loadBefore` 等专用字段；它们继续由 LeviLamina 的 Registrar 解释。特别注意：被委托的 Mod 不会被 BLoader 伪报为已完成初始化，尚不能用其 *delegated* 状态满足 BLoader 自身的强依赖。
-
-对于安装在 `mods/PreLoader/` 的 LeviLamina PreLoader，推荐 Manifest 的 `name` 为 `PreLoader`、`type` 为 `preload-native`、`entry` 为 `PreLoader.dll`，以符合 LeviLamina 的目录名称校验。新版 BMCBL 负责生成并迁移这一 Manifest。
+两个类型只使用 BLoader 的 `bloader_dependencies`（ID 数组）构建自己的依赖图，不能直接解析 LeviLamina 的 `dependencies`、`optionalDependencies` 或 `loadBefore`。如果某 Mod 必须依赖 LeviLamina，应该使用 LeviLamina 自己的 `native` Mod 类型，而不是让 BLoader 直接加载。
 
 ## 结构化运行控制台
 
