@@ -116,8 +116,11 @@ impl Config {
 /// cape. No remote Cosmetics/Cosmos preview item, entitlement, or receipt is
 /// created. The thumbnail URL is the existing local item asset.
 fn local_capes_navigation_items(items: &[Value]) -> Vec<Value> {
-    let Some(first) = items.first() else { return Vec::new() };
-    let Some(thumbnail) = first.get("thumbnail").cloned() else {
+    // A pack without a usable preview should not hide every other local
+    // cape's navigation entry; prefer the first registered thumbnail.
+    let Some((first, thumbnail)) = items.iter().find_map(|item| {
+        item.get("thumbnail").cloned().map(|thumbnail| (item, thumbnail))
+    }) else {
         return Vec::new();
     };
     vec![json!({
