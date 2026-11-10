@@ -222,21 +222,12 @@ unsafe fn prepare_premain_preloads(
     crate::platform::logging::write_bootstrap_marker(&format!(
         "bootstrap.native_preload.premain.begin execution={execution_mode}"
     ));
-    let loaded_summary = if preloader_summary.discovered > 0 {
-        // Either LeviLamina owns this chain, or its initialization failed.
-        // Re-loading the same PreLoader/LeviLamina DLLs after failure is unsafe
-        // and obscures the original HRESULT with misleading 0x8007007E errors.
-        crate::platform::logging::write_bootstrap_marker(
-            if preloader_summary.active() {
-                "bootstrap.native_preload.premain.delegated owner=PreLoader"
-            } else {
-                "bootstrap.native_preload.premain.skipped reason=preloader-init-failed"
-            },
-        );
-        crate::loader::NativePreloadSummary::default()
-    } else {
-        crate::loader::load_native_preloads_in_dllmain(&game_dir)
-    };
+    // The two independent owners have separate roots:
+    // PreLoader boots LeviLamina from mods/; BLoader's own mod-preload DLLs
+    // live in BLoader/mods/. A PreLoader failure must not prevent independent
+    // BLoader mod-preload initialization, and must never trigger a fallback
+    // direct LoadLibrary of LeviLamina or one of its mods.
+    let loaded_summary = crate::loader::load_native_preloads_in_dllmain(&game_dir);
     crate::platform::logging::write_bootstrap_marker(&format!(
         "bootstrap.native_preload.premain.done discovered={} attempted={} verified={} failed={} required_failed={} execution={execution_mode}",
         loaded_summary.discovered,
