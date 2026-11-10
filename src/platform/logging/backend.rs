@@ -357,7 +357,9 @@ pub fn captured_mod_output(mod_name: &str, mod_id: &str, stream: &str, message: 
 
 pub fn captured_process_output(stream: &str, message: &str) {
     let sanitized = sanitize_terminal_text(message);
-    if let Some(external) = parse_external_structured_line(&sanitized) {
+    if let Some(external) = parse_external_structured_line(&sanitized)
+        .or_else(|| parse_levilamina_console_line(&sanitized))
+    {
         forward_captured_record(CapturedRecord {
             timestamp_full: external.timestamp_full,
             timestamp_clock: external.timestamp_clock,
@@ -1278,6 +1280,46 @@ fn parse_external_structured_line(line: &str) -> Option<ExternalStructuredLine> 
     })
 }
 
+/// LeviLamina's native ConsoleSink defaults to
+/// "{3:.3%T.} {2} {1} {0}" (local clock, level, logger, text).
+/// Its file sink uses "[date time LEVEL][source] text", parsed separately.
+/// Recognizing the console format allows preloaded stdout to be attributed
+/// without native hooks, and preserves the source's original event time.
+fn parse_levilamina_console_line(line: &str) -> Option<ExternalStructuredLine> {
+    let (time, remainder) = line.trim_start().split_once(' ')?;
+    let valid_time = time.len() >= 8
+        && time.as_bytes().get(2) == Some(&b':')
+        && time.as_bytes().get(5) == Some(&b':')
+        && time[..2].bytes().all(|c| c.is_ascii_digit())
+        && time[3..5].bytes().all(|c| c.is_ascii_digit())
+        && time[6..8].bytes().all(|c| c.is_ascii_digit())
+        && (time.len() == 8
+            || (time.as_bytes().get(8) == Some(&b'.')
+                && time[9..].bytes().all(|c| c.is_ascii_digit())));
+    if !valid_time {
+        return None;
+    }
+    let (level_label, remainder) = remainder.trim_start().split_once(' ')?;
+    let level = external_level(level_label)?;
+    let (source, message) = remainder.trim_start().split_once(' ')?;
+    if source.is_empty()
+        || source.len() > 64
+        || !source.bytes().all(|c|
+            c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.')
+        )
+    {
+        return None;
+    }
+    let timestamp_full = format!("{} {time}", Local::now().format("%Y-%m-%d"));
+    Some(ExternalStructuredLine {
+        timestamp_clock: time.to_string(),
+        timestamp_full,
+        level,
+        source: source.to_string(),
+        message: message.trim_start().to_string(),
+    })
+}
+
 fn external_level(value: &str) -> Option<Level> {
     match value.trim().to_ascii_uppercase().as_str() {
         // Standard level names used by BLoader and most loggers.
@@ -2174,6 +2216,19 @@ mod external_line_tests {
         assert_eq!(external_level("INFO"), Some(Level::INFO));
         assert_eq!(external_level("WARNING"), Some(Level::WARN));
         assert_eq!(external_level("bogus"), None);
+    }
+
+    #[test]
+    fn parses_native_levilamina_console_sink_without_win32_detours() {
+        let raw = "19:03:25.123 INFO LeviLamina Loading BedrockSceneCapture v0.2.0";
+        let record = parse_levilamina_console_line(raw).expect("LeviLamina console");
+        assert_eq!(record.source, "LeviLamina");
+        assert_eq!(record.timestamp_clock, "19:03:25.123");
+        assert_eq!(record.level, Level::INFO);
+        assert_eq!(record.message, "Loading BedrockSceneCapture v0.2.0");
+        assert!(record.timestamp_full.ends_with(" 19:03:25.123"));
+        assert!(parse_levilamina_console_line("Minecraft generic console output").is_none());
+        assert!(parse_levilamina_console_line("19:03:25.123 BOGUS LeviLamina something").is_none());
     }
 
     #[test]

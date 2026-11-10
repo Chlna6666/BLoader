@@ -172,9 +172,15 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
         };
     }
 
+    // Capture the native preload chain through CRT pipes, not process-global
+    // WriteConsole/WriteFile/OutputDebugString detours. Install once before
+    // LoadLibraryW creates LeviLamina's asynchronous logging threads.
+    if logging::console_is_ready() {
+        unsafe { crate::platform::native_stdio::install_preloader_capture(); }
+    }
     mod_diagnostics::mark_loading(&identity, "preloader_priority_early");
     logging::write_bootstrap_marker(&format!(
-        "preloader.priority.load.begin path={} capture=disabled-preloader-compat",
+        "preloader.priority.load.begin path={} capture=early-crt-pipe-no-detours",
         expected.display()
     ));
 
