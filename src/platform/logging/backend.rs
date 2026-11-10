@@ -342,9 +342,9 @@ pub fn captured_mod_output(mod_name: &str, mod_id: &str, stream: &str, message: 
 
     let scope = format!("mod:{mod_name}");
     let console_message = if stream.eq_ignore_ascii_case("stderr") {
-        format!("[stderr] {message}")
+        format!("[stderr] {sanitized}")
     } else {
-        message.to_string()
+        sanitized
     };
     let (timestamp_full, timestamp_clock) = current_console_timestamp();
     if forward_captured_record(CapturedRecord {
