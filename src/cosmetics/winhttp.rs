@@ -180,12 +180,14 @@ struct AsyncCapture {
     io_guard: Arc<Mutex<()>>,
     cancelled: Arc<AtomicBool>,
 }
-#[derive(Clone, Copy)]
 enum AsyncReadEvent {
     Chunk,
     Eof,
     TooLarge,
-    Failed,
+    Failed {
+        context: usize,
+        payload: Vec<u8>,
+    },
 }
 struct Replay {
     bytes: Vec<u8>,
@@ -1319,16 +1321,28 @@ unsafe fn capture_worker(handle: usize, receiver: mpsc::Receiver<AsyncReadEvent>
                 }
                 return;
             }
-            Ok(AsyncReadEvent::Failed) | Err(_) => {
-                // The original request-error callback has already been
-                // delivered. No synthetic HEADERS may follow a failed read.
+            Ok(AsyncReadEvent::Failed { context, mut payload }) => {
+                // A native WinHTTP callback can run inline during ReadData.
+                // Forward the error only from this worker *after* ReadData
+                // releases io_guard; the game may close the handle in its
+                // error callback and must not deadlock against that guard.
                 if let Some(req) = tables().lock().unwrap_or_else(|e| e.into_inner())
                     .requests.get_mut(&state_key(h))
                 {
                     req.capture = None;
                 }
+                if !cancelled.load(Ordering::Acquire) {
+                    notify_game(
+                        h,
+                        context,
+                        STATUS_REQUEST_ERROR,
+                        if payload.is_empty() { ptr::null_mut() } else { payload.as_mut_ptr() as H },
+                        payload.len() as u32,
+                    );
+                }
                 return;
             }
+            Err(_) => return,
         }
     }
 }
@@ -1499,7 +1513,7 @@ unsafe extern "system" fn status_bridge(h: H, context: usize, status: u32, info:
                     let event = if len == 0 {
                         AsyncReadEvent::Eof
                     } else if len as usize > READ_CHUNK {
-                        AsyncReadEvent::Failed
+                        AsyncReadEvent::TooLarge
                     } else {
                         // Preserve the entire last read on overflow. If a
                         // response cannot be rewritten, it is replayed
@@ -1528,10 +1542,15 @@ unsafe extern "system" fn status_bridge(h: H, context: usize, status: u32, info:
                 .map(|capture| capture.events.clone())
         };
         if let Some(sender) = signal {
-            let _ = sender.send(AsyncReadEvent::Failed);
-            // Forward the real WinHTTP failure rather than inventing a
-            // successful HEADERS notification for an incomplete response.
-            notify_game(h, context, status, info, len);
+            // Copy the WinHTTP_ASYNC_RESULT bytes before returning from the
+            // native callback. The worker forwards this exact error payload
+            // after its guarded WinHttpReadData call unwinds.
+            let payload = if !info.is_null() && len > 0 && len <= 64 {
+                std::slice::from_raw_parts(info as *const u8, len as usize).to_vec()
+            } else {
+                Vec::new()
+            };
+            let _ = sender.send(AsyncReadEvent::Failed { context, payload });
             return;
         }
     }
