@@ -2,7 +2,7 @@
 
 [![Windows build and release](https://github.com/Chlna6666/BLoader/actions/workflows/windows-release.yml/badge.svg)](https://github.com/Chlna6666/BLoader/actions/workflows/windows-release.yml)
 
-BLoader 是面向 Minecraft Bedrock 的开源 Rust Mod 加载器，以 `BLoader.dll` 进入游戏进程，负责原生 Mod/BL Mod 装载、日志捕获、崩溃诊断、文件重定向，以及与 BMCBL 配套的按需 GDK XUser 登录桥。
+BLoader 是面向 Minecraft Bedrock 的开源 Rust Mod 加载器，以 `BLoader.dll` 进入游戏进程，负责原生 Mod 装载、日志捕获、崩溃诊断、文件重定向，以及与 BMCBL 配套的按需 GDK XUser 登录桥。
 
 - 目标平台：Windows 10/11 x64
 - 编译目标：`x86_64-pc-windows-msvc`

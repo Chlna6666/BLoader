@@ -99,8 +99,14 @@ jobs:
           Write-Host "Using dumpbin: $dumpbinPath"
           $exports = & $dumpbinPath /exports $dll | Out-String
           if ($LASTEXITCODE -ne 0) { throw "dumpbin failed with exit code $LASTEXITCODE" }
-          foreach ($name in @("DllMain", "bl_i18n_current_locale", "bl_register_d3d12_render_callback")) {
-            if ($exports -notmatch [regex]::Escape($name)) { throw "Missing export: $name" }
+          $names = @(
+            $exports -split "`r?`n" | ForEach-Object {
+              if ($_ -match '^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)') { $Matches[1] }
+            }
+          )
+          if ("DllMain" -notin $names) { throw "Missing DLL entry export: DllMain" }
+          foreach ($forbidden in @("bl_i18n_current_locale", "bl_register_d3d12_render_callback")) {
+            if ($forbidden -in $names) { throw "Removed legacy BL ABI export reappeared: $forbidden" }
           }
           $exports | Set-Content "target\x86_64-pc-windows-msvc\release\exports.txt"
 

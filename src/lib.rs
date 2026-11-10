@@ -85,27 +85,6 @@ pub unsafe extern "system" fn DllMain(
     1
 }
 
-// Legacy ABI compatibility exports. Older BL Mods resolve these symbols at load
-// time; keep them even though the panel renderer and BL host were removed.
-#[unsafe(export_name = "bl_i18n_current_locale")]
-pub unsafe extern "system" fn bl_i18n_current_locale(out_buf: *mut u8, out_len: usize) -> usize {
-    let value = crate::platform::i18n::current_locale();
-    let bytes = value.as_bytes();
-    if !out_buf.is_null() && out_len > 0 {
-        let copy_len = bytes.len().min(out_len - 1);
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, copy_len);
-            *out_buf.add(copy_len) = 0;
-        }
-    }
-    bytes.len()
-}
-
-#[unsafe(export_name = "bl_register_d3d12_render_callback")]
-pub unsafe extern "system" fn bl_register_d3d12_render_callback(_callback: *const c_void) {
-    // Renderer service is not compiled in the lightweight build.
-}
-
 pub(crate) fn run_bootstrap_on_startup_thread() -> bool {
     crate::platform::logging::write_bootstrap_marker(
         "bootstrap.inline.start execution=minecraft-startup-thread",
@@ -384,11 +363,6 @@ unsafe fn bootstrap(
             });
     }
 
-    logging::scoped_info_message(
-        "runtime-ready",
-        "Delayed Mod readiness uses OEP/process/window stability only; no D3D/DXGI device, swapchain, Present, or dummy HWND hook is installed.",
-    );
-
     logging::info_message(&format!(
         "{} v{} initialized. {}",
         PKG_NAME, VERSION, crate::platform::i18n::tr("bootstrap.start")
@@ -410,10 +384,6 @@ unsafe fn bootstrap(
     // 内置披风（Cosmetics 移植）：OEP 前安装 WinHTTP 钩子，
     // 覆盖启动期 marketplace 请求；内部按 enable_cosmetics 门控。
     crate::cosmetics::install(&config, &game_dir);
-
-    crate::platform::logging::write_bootstrap_marker(
-        "bootstrap.queue_hook.skipped_for_hudhook",
-    );
 
     if config.disable_mod_loading {
         logging::info_message("Mod loading disabled by config.");
