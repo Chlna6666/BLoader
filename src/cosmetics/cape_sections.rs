@@ -195,17 +195,56 @@ pub fn inject(
     if stats.official + stats.community + stats.local == 0 {
         return Ok(stats);
     }
-    let template = prototype_row(rows)
-        .ok_or("cape page lacks a compatible GridList/headerComp/itemListComp template")?;
+    // The game's cape UI can change between a GridList and a plain
+    // StoreRow/itemListComp layout. Do not discard already-scanned local capes
+    // solely because the row wrapper does not match an older Cosmos fixture.
+    // In that case, append the new entries to an existing item list in place,
+    // keeping every original item, receipt, and ownership field unchanged.
+    let Some(template) = prototype_row(rows) else {
+        let new_count = official_new.len() + community_new.len() + local_new.len();
+        let Some(component) = rows.iter_mut()
+            .filter_map(|row| row.get_mut("components").and_then(Value::as_array_mut))
+            .flat_map(|components| components.iter_mut())
+            .find(|component| {
+                component.get("type").and_then(Value::as_str) == Some("itemListComp")
+                    && component.get("items").and_then(Value::as_array).is_some()
+            })
+        else {
+            return Err("cape page has no compatible itemListComp; local items not injected".into());
+        };
+        let Some(component_map) = component.as_object_mut() else {
+            return Err("cape itemListComp is not an object".into());
+        };
+        let Some(items) = component_map.get_mut("items").and_then(Value::as_array_mut) else {
+            return Err("cape itemListComp items is not an array".into());
+        };
+        items.extend(official_new);
+        items.extend(community_new);
+        items.extend(local_new);
+        let total = items.len();
+        let previous = component_map.get("totalItems").and_then(Value::as_u64).unwrap_or(0);
+        component_map.insert("totalItems".into(), Value::from(previous.max(total as u64)));
+        if let Some(options) = component_map.get_mut("customStoreRowConfiguration")
+            .and_then(Value::as_object_mut)
+        {
+            let max = options.get("maxOffers").and_then(Value::as_u64).unwrap_or(0);
+            options.insert("maxOffers".into(), Value::from(max.max(total as u64)));
+        }
+        debug_assert!(new_count > 0);
+        return Ok(stats);
+    };
     let divider = rows
         .iter()
         .find(|row| row.get("controlId").and_then(Value::as_str) == Some("VerticalLineDivider"))
         .cloned();
-    let anchor = rows
-        .iter()
-        .position(|row| row.get("controlId").and_then(Value::as_str) == Some("GridList"))
-        .ok_or("cape page has no GridList")?
-        + 1;
+    let anchor = rows.iter()
+        .position(|row| {
+            row.get("controlId").and_then(Value::as_str) == Some("GridList")
+                && item_components(row).is_some_and(|components| components.iter().any(|component| {
+                    component.get("type").and_then(Value::as_str) == Some("itemListComp")
+                }))
+        })
+        .ok_or("cape page has no GridList")? + 1;
     let categories = [
         ("Official Capes - Catalog Only", official_new),
         ("Community Capes", community_new),
@@ -311,6 +350,28 @@ mod tests {
         .unwrap();
         assert!(!second.changed());
     }
+    #[test]
+    fn local_capes_still_appear_when_game_uses_store_row_instead_of_grid_list() {
+        let mut root = json!({"result":{"layout":[{"rows":[
+            {"controlId":"StoreRow","components":[
+                {"type":"itemListComp","items":[{"id":"owned","ownership":"Purchased","receipt":"real"}],
+                 "totalItems":1,"customStoreRowConfiguration":{"maxOffers":1}}
+            ]}
+        ]}]}});
+        let local = json!({"id":"local-import","creatorName":"Local","ownership":"NotOwned",
+            "pieceType":"persona_capes"});
+        let stats = inject(&mut root, &[], &[local], &HashSet::new(), "id").unwrap();
+        assert_eq!(stats.local, 1);
+        let component = &root["result"]["layout"][0]["rows"][0]["components"][0];
+        assert_eq!(component["items"].as_array().unwrap().len(), 2);
+        assert_eq!(component["items"][0]["receipt"], "real");
+        assert_eq!(component["items"][1]["id"], "local-import");
+        assert_eq!(component["totalItems"], 2);
+        assert_eq!(component["customStoreRowConfiguration"]["maxOffers"], 2);
+        let repeat = inject(&mut root, &[], &[json!({"id":"local-import"})], &HashSet::new(), "id").unwrap();
+        assert!(!repeat.changed());
+    }
+
     #[test]
     fn only_explicit_allowlist_can_project_official_purchased() {
         let mut root = fixture();
