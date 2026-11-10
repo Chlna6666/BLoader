@@ -291,10 +291,10 @@ pub fn set_master_enabled(enabled: bool) {
     }
 }
 
-/// 后台扫描线程入口：解析披风根并输出扫描摘要。
+/// 同步准备本地披风注册表；在任何 WinHTTP Hook 启用前调用一次。
 /// 默认日志只保留一行结果摘要（info）与失败包警告（warn）；
 /// 横幅、逐包注册、规则清单等明细全部为 debug 级遥测。
-pub fn worker_startup() {
+pub fn prepare_local_resources() {
     let Some(runtime) = RUNTIME.get() else { return };
     let texture_mode = runtime.texture_mode;
     let roots = runtime.cape_roots.clone();
@@ -1309,15 +1309,9 @@ unsafe fn begin_async_capture(h: H, context: usize) -> bool {
 
 unsafe fn capture_worker(handle: usize, receiver: mpsc::Receiver<AsyncReadEvent>) {
     let h = handle as H;
-    // The initial wardrobe request may beat the background cape scanner.
-    // Wait only on this worker; no filesystem scan runs in the game callback.
-    if let Some(runtime) = RUNTIME.get() {
-        let _ = local_capes::initialize(
-            &runtime.cape_roots,
-            runtime.texture_mode,
-            &runtime.locale,
-        );
-    }
+    // Local assets were loaded before installing WinHTTP hooks. No filesystem
+    // work, ZIP decoding or thumbnail generation is allowed in this callback
+    // delivery path.
     loop {
         let read = {
             let state = tables().lock().unwrap_or_else(|e| e.into_inner());
