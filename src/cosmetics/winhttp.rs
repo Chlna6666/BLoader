@@ -1394,42 +1394,72 @@ unsafe fn capture_worker(handle: usize, receiver: mpsc::Receiver<AsyncReadEvent>
 // Reuse the capture worker for asynchronous client notifications as well.
 // WinHttpReadData must return before its READ_COMPLETE callback is delivered:
 // inline replay callbacks recursively entered libHttpClient on prior builds.
-// Each synthetic response uses only a callback dispatcher: it never starts a
-// second native WinHTTP read or changes the game's asynchronous session mode.
-// Dispatching on a separate thread prevents reentry into libHttpClient from
-// WinHttpSendRequest / ReceiveResponse / ReadData detours.
-fn queue_synthetic_notice(h: H, notice: AsyncNotice) -> bool {
-    let key = state_key(h);
-    let request_id;
-    let mut receiver = None;
-    let sender = {
-        let mut state = tables().lock().unwrap_or_else(|e| e.into_inner());
-        let Some(req) = state.requests.get_mut(&key) else { return false };
+// Synthetic local ZIP, thumbnail and catalog replies never trigger a second
+// network read. Their WinHTTP completion callbacks are dispatched by one shared
+// worker, rather than recursively calling libHttpClient from our detours or
+// allocating one OS thread per thumbnail request.
+struct SyntheticNotice {
+    handle: usize,
+    request_id: u64,
+    event: AsyncNotice,
+}
+static SYNTHETIC_DISPATCH: OnceLock<Option<mpsc::Sender<SyntheticNotice>>> = OnceLock::new();
+
+fn queue_synthetic_notice(h: H, event: AsyncNotice) -> bool {
+    let handle = state_key(h);
+    let request_id = {
+        let state = tables().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(req) = state.requests.get(&handle) else { return false };
         if !req.synthetic || req.closing || !req.async_session { return false; }
-        request_id = req.id;
-        if req.async_dispatch.is_none() {
-            let (tx, rx) = mpsc::channel();
-            req.async_dispatch = Some(tx);
-            receiver = Some(rx);
-        }
-        req.async_dispatch.as_ref().cloned()
+        req.id
     };
-    if let Some(receiver) = receiver {
-        let handle = key;
-        if let Err(error) = std::thread::Builder::new()
-            .name("bloader-cape-callback".into())
-            .spawn(move || unsafe { dispatch_replay_callbacks(handle as H, request_id, receiver) })
+    let dispatcher = SYNTHETIC_DISPATCH.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel();
+        match std::thread::Builder::new()
+            .name("bloader-cape-callbacks".into())
+            .spawn(move || unsafe { synthetic_callback_worker(receiver) })
         {
-            warn_log(&format!("synthetic cape callback dispatcher unavailable: {error}"));
-            let mut state = tables().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(req) = state.requests.get_mut(&key).filter(|r| r.id == request_id) {
-                req.async_dispatch = None;
+            Ok(_) => Some(sender),
+            Err(error) => {
+                warn_log(&format!("synthetic cape callback dispatcher unavailable: {error}"));
+                None
             }
-            return false;
+        }
+    });
+    dispatcher.as_ref().is_some_and(|sender| {
+        sender.send(SyntheticNotice { handle, request_id, event }).is_ok()
+    })
+}
+
+unsafe fn synthetic_callback_worker(receiver: mpsc::Receiver<SyntheticNotice>) {
+    while let Ok(SyntheticNotice { handle, request_id, event }) = receiver.recv() {
+        let active = tables().lock().unwrap_or_else(|e| e.into_inner())
+            .requests.get(&handle)
+            .is_some_and(|req| req.id == request_id && req.synthetic && !req.closing);
+        if active {
+            deliver_replay_notice(handle as H, event);
         }
     }
-    sender.is_some_and(|queue| queue.send(notice).is_ok())
 }
+
+unsafe fn deliver_replay_notice(h: H, event: AsyncNotice) {
+    match event {
+        AsyncNotice::SendComplete { context } => {
+            notify_game(h, context, STATUS_SEND_COMPLETE, ptr::null_mut(), 0);
+        }
+        AsyncNotice::Headers { context } => {
+            invoke_headers(h, context);
+        }
+        AsyncNotice::Read { context, buffer, len } => {
+            notify_game(h, context, STATUS_READ, buffer as H, len);
+        }
+        AsyncNotice::Available { context, len } => {
+            let mut count = len;
+            notify_game(h, context, STATUS_AVAILABLE, &mut count as *mut u32 as H, 4);
+        }
+    }
+}
+
 unsafe fn dispatch_replay_callbacks(h: H, request_id: u64, receiver: mpsc::Receiver<AsyncNotice>) {
     while let Ok(event) = receiver.recv() {
         // A WinHTTP handle may be closed and its numerical value reused. Never
@@ -1438,21 +1468,7 @@ unsafe fn dispatch_replay_callbacks(h: H, request_id: u64, receiver: mpsc::Recei
             .requests.get(&state_key(h))
             .is_some_and(|r| r.id == request_id && !r.closing && r.async_dispatch.is_some());
         if !active { break; }
-        match event {
-            AsyncNotice::SendComplete { context } => {
-                notify_game(h, context, STATUS_SEND_COMPLETE, ptr::null_mut(), 0);
-            }
-            AsyncNotice::Headers { context } => {
-                invoke_headers(h, context);
-            }
-            AsyncNotice::Read { context, buffer, len } => {
-                notify_game(h, context, STATUS_READ, buffer as H, len);
-            }
-            AsyncNotice::Available { context, len } => {
-                let mut count = len;
-                notify_game(h, context, STATUS_AVAILABLE, &mut count as *mut u32 as H, 4);
-            }
-        }
+        deliver_replay_notice(h, event);
     }
 }
 unsafe fn finish_async(h: H, completed: bool) -> Option<(u64, mpsc::Receiver<AsyncNotice>)> {
