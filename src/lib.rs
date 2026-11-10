@@ -430,7 +430,7 @@ unsafe fn bootstrap(
         crate::platform::logging::write_bootstrap_marker(&format!(
             "bootstrap.mods.load.begin execution={execution_mode} serial=true"
         ));
-        crate::loader::load_mods(&game_dir, preloader_summary.active(), preloader_summary.failed());
+        crate::loader::load_mods(&game_dir);
         crate::platform::logging::write_bootstrap_marker(&format!(
             "bootstrap.mods.load.done execution={execution_mode} serial=true"
         ));
