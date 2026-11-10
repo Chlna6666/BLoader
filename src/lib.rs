@@ -188,6 +188,10 @@ unsafe fn prepare_premain_preloads(
         );
     }
     let game_dir = crate::platform::utils::get_exe_directory();
+    // Only normalize BLoader's JSON descriptors. This must happen before
+    // PreLoader loads LeviLamina, which scans manifest.json in mods/.
+    // No DLL or directory is moved/deleted.
+    crate::loader::normalize_shared_mod_manifests(&game_dir);
     crate::platform::logging::write_bootstrap_marker(&format!(
         "bootstrap.preloader.premain.begin phase={execution_mode}"
     ));
@@ -201,11 +205,10 @@ unsafe fn prepare_premain_preloads(
     crate::platform::logging::write_bootstrap_marker(&format!(
         "bootstrap.native_preload.premain.begin execution={execution_mode}"
     ));
-    // The two independent owners have separate roots:
-    // PreLoader boots LeviLamina from mods/; BLoader's own mod-preload DLLs
-    // live in BLoader/mods/. A PreLoader failure must not prevent independent
-    // BLoader mod-preload initialization, and must never trigger a fallback
-    // direct LoadLibrary of LeviLamina or one of its mods.
+    // Two independent manifest namespaces: BLoader's own mod-preload DLLs
+    // may live under BLoader/mods/ or share mods/ with a bloader.json
+    // sidecar. PreLoader/LeviLamina remain sole owners of their DLLs; no
+    // fallback loads their native/preload-native modules directly.
     let loaded_summary = crate::loader::load_mod_preloads_before_oep(&game_dir);
     crate::platform::logging::write_bootstrap_marker(&format!(
         "bootstrap.native_preload.premain.done discovered={} attempted={} verified={} failed={} required_failed={} execution={execution_mode}",

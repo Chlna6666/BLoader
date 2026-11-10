@@ -65,7 +65,7 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
         if dir.join(PRELOADER_DLL).is_file() {
             logging::scoped_warn_message(
                 "preloader",
-                "PreLoader.dll exists but bootstrap manifest is missing/invalid: expected mods/PreLoader/manifest.json type=preloader-bootstrap. Reinstall PreLoader from BMCBL; the DLL is not deleted or moved.",
+                "PreLoader.dll exists but BLoader metadata is missing/invalid: expected mods/PreLoader/bloader.json type=preloader-bootstrap. DLL untouched.",
             );
         }
         if logging::console_is_ready() {
@@ -232,16 +232,24 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
 }
 
 /// BLoader directly owns the bootstrap at mods/PreLoader/PreLoader.dll.
-/// Its manifest type is *preloader-bootstrap*, which the PreLoader Mod
-/// scanner does not consider preload-native. Never move or delete this
-/// directory while Minecraft is starting.
+/// Its BLoader-only metadata type is *preloader-bootstrap*. The descriptor
+/// lives in bloader.json, invisible to PreLoader/LeviLamina's manifest.json
+/// scanners. Never move or delete PreLoader.dll during startup.
 fn discover_candidates(game_dir: &Path) -> Vec<Candidate> {
     let dir = game_dir.join("mods").join("PreLoader");
     let path = dir.join(PRELOADER_DLL);
     if !path.is_file() {
         return Vec::new();
     }
-    let manifest = fs::read_to_string(dir.join("manifest.json"))
+    // BLoader-owned metadata lives in bloader.json, outside LeviLamina's
+    // manifest.json scanner. Retain legacy read-only fallback for old installs.
+    let sidecar = dir.join("bloader.json");
+    let manifest_path = if sidecar.is_file() {
+        sidecar
+    } else {
+        dir.join("manifest.json")
+    };
+    let manifest = fs::read_to_string(&manifest_path)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
     let is_bootstrap = manifest
