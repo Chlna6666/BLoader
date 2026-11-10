@@ -1591,8 +1591,9 @@ unsafe fn load_library(preload: &PreloadMod, phase: &str, silent_success: bool) 
 #[cfg(test)]
 mod tests {
     use super::{
-        bloader_mods_dir, checked_mod_entry, is_reserved_runtime_dll, parse_manifest_json,
-        resolve_hot_ready_level, MOD_TYPE_MOD_NATIVE, MOD_TYPE_MOD_PRELOAD,
+        bloader_mods_dir, checked_mod_entry, is_reserved_runtime_dll, normalize_shared_mod_manifests,
+        packaged_manifest_path, parse_manifest_json, resolve_hot_ready_level, MOD_TYPE_MOD_NATIVE,
+        MOD_TYPE_MOD_PRELOAD,
     };
     use crate::bootstrap::runtime_ready::ReadyLevel;
 
