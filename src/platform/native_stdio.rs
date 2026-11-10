@@ -115,28 +115,9 @@ pub unsafe fn capture_library_load<T>(
     result
 }
 
-/// Bind the already-loaded CRT stdout/stderr to anonymous capture pipes
-/// BEFORE PreLoader/LeviLamina starts any logger threads. Unlike the old
-/// post-OEP rebinding this never races their stdio writers, and does not
-/// detour system APIs or take over their exception handlers.
-pub unsafe fn install_preloader_capture() {
-    if !logging::console_is_ready() {
-        return;
-    }
-    unsafe { install_capture(CapturePhase::BeforePreLoader); }
-}
-
+/// Standalone BLoader capture only. Do not rebind CRT stdout/stderr before
+/// or after loading LeviLamina/PreLoader: the runtime owns its FILE* streams.
 pub unsafe fn install_process_capture() {
-    unsafe { install_capture(CapturePhase::AfterOep); }
-}
-
-#[derive(Clone, Copy)]
-enum CapturePhase {
-    BeforePreLoader,
-    AfterOep,
-}
-
-unsafe fn install_capture(phase: CapturePhase) {
     if PROCESS_CAPTURE_INSTALLED.set(()).is_err() {
         return;
     }
@@ -160,16 +141,7 @@ unsafe fn install_capture(phase: CapturePhase) {
         let _ = SetStdHandle(STD_ERROR_HANDLE, stderr_handle);
     }
 
-    // PreLoader only: configure the CRT before it produces output. Never
-    // flush global FILE* streams during initial native runtime loading.
-    // The normal standalone post-OEP mode keeps its existing behavior.
-    let redirect = unsafe {
-        CrtRedirect::install(
-            stdout_handle,
-            stderr_handle,
-            matches!(phase, CapturePhase::BeforePreLoader),
-        )
-    };
+    let redirect = unsafe { CrtRedirect::install(stdout_handle, stderr_handle) };
     std::mem::forget(redirect);
 
     spawn_pipe_reader(stdout_read, None, "stdout");
@@ -184,12 +156,7 @@ unsafe fn install_capture(phase: CapturePhase) {
 
     logging::scoped_info_message(
         "stdio-capture",
-        match phase {
-            CapturePhase::BeforePreLoader =>
-                "early native stdio capture active before PreLoader (transport=memory-pipe, CRT stdout/stderr only, Win32 console and crash handlers untouched)",
-            CapturePhase::AfterOep =>
-                "process stdio capture installed (transport=anonymous-memory-pipe, disk_files=none, supports=Win32+ucrt+msvcrt stdout/stderr)",
-        },
+        "standalone process stdio capture installed (transport=anonymous-memory-pipe, disk_files=none)",
     );
 }
 
@@ -383,21 +350,15 @@ pub fn active_capture_output(thread_id: u32, _max_bytes: usize) -> String {
 }
 
 impl CrtRedirect {
-    unsafe fn install(stdout: HANDLE, stderr: HANDLE, before_preloader: bool) -> Self {
+    unsafe fn install(stdout: HANDLE, stderr: HANDLE) -> Self {
         let mut bindings = Vec::new();
         for (module_name, api) in resolve_crt_apis() {
             let saved_stdout = (api.dup)(STDOUT_FILENO);
             let saved_stderr = (api.dup)(STDERR_FILENO);
             bind_crt_fd(api, stdout, STDOUT_FILENO);
             bind_crt_fd(api, stderr, STDERR_FILENO);
-            // The native console uses fwrite() when stdout is a pipe. Set
-            // nonbuffered mode before PreLoader's own logger is initialized
-            // so records are forwarded promptly. Do not flush every global
-            // CRT FILE* after hooking during preload: this was unsafe.
             configure_unbuffered_stdio(api);
-            if !before_preloader {
-                let _ = (api.flushall)();
-            }
+            let _ = (api.flushall)();
             bindings.push(CrtBinding {
                 _module_name: module_name,
                 api,

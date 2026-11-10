@@ -962,9 +962,13 @@ pub fn native_success_notification_message() -> Option<String> {
     Some(lines.join("\n"))
 }
 
-pub unsafe fn load_mods(game_dir: &Path, preloader_active: bool) -> bool {
+pub unsafe fn load_mods(
+    game_dir: &Path,
+    preloader_active: bool,
+    preloader_failed: bool,
+) -> bool {
     let mods_dir = ensure_mods_dir(game_dir);
-    let mut discovered = discover_mods(&mods_dir, preloader_active);
+    let mut discovered = discover_mods(&mods_dir, preloader_active, preloader_failed);
 
     if discovered.preload.is_empty() && discovered.hot.is_empty() {
         logging::info_message("No mods found to load.");
@@ -992,7 +996,11 @@ fn ensure_mods_dir(game_dir: &Path) -> PathBuf {
     mods_dir
 }
 
-fn discover_mods(mods_dir: &Path, preloader_active: bool) -> DiscoveredMods {
+fn discover_mods(
+    mods_dir: &Path,
+    preloader_active: bool,
+    preloader_failed: bool,
+) -> DiscoveredMods {
     let mut discovered = DiscoveredMods::default();
     let entries: Vec<_> = fs::read_dir(mods_dir)
         .ok()
@@ -1004,7 +1012,7 @@ fn discover_mods(mods_dir: &Path, preloader_active: bool) -> DiscoveredMods {
     for entry in entries {
         let entry_path = entry.path();
         if entry_path.is_dir() {
-            discover_packaged_mod(&entry_path, preloader_active, &mut discovered);
+            discover_packaged_mod(&entry_path, preloader_active, preloader_failed, &mut discovered);
             continue;
         }
 
@@ -1019,6 +1027,7 @@ fn discover_mods(mods_dir: &Path, preloader_active: bool) -> DiscoveredMods {
 fn discover_packaged_mod(
     entry_path: &Path,
     preloader_active: bool,
+    preloader_failed: bool,
     discovered: &mut DiscoveredMods,
 ) {
     let manifest_path = entry_path.join("manifest.json");
@@ -1105,7 +1114,7 @@ fn discover_packaged_mod(
     // LoadLibrary again in BLoader bypasses its dependency planner and can
     // misreport already loaded modules as BLoader-owned. Opt in explicitly
     // with bloader_managed=true for native mods intended for both runtimes.
-    if preloader_active
+    if (preloader_active || preloader_failed)
         && !manifest.bloader_managed
         && matches!(mod_type, "native" | "preload-native")
     {
@@ -1113,7 +1122,15 @@ fn discover_packaged_mod(
             id, manifest.name, manifest.version, kind, &dll_path,
             manifest.log_aliases,
         );
-        mod_diagnostics::mark_delegated(&identity, "LeviLamina/PreLoader");
+        if preloader_failed {
+            mod_diagnostics::mark_failed(
+                &identity,
+                "blocked_preloader_init",
+                "PreLoader failed initialization; owned native runtime Mod is not retried directly",
+            );
+        } else {
+            mod_diagnostics::mark_delegated(&identity, "LeviLamina/PreLoader");
+        }
         return;
     }
     match manifest.mod_type.as_str() {

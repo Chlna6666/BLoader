@@ -222,17 +222,19 @@ unsafe fn prepare_premain_preloads(
     crate::platform::logging::write_bootstrap_marker(&format!(
         "bootstrap.native_preload.premain.begin execution={execution_mode}"
     ));
-    let loaded_summary = if preloader_summary.active() {
+    let loaded_summary = if preloader_summary.discovered > 0 {
+        // Either LeviLamina owns this chain, or its initialization failed.
+        // Re-loading the same PreLoader/LeviLamina DLLs after failure is unsafe
+        // and obscures the original HRESULT with misleading 0x8007007E errors.
         crate::platform::logging::write_bootstrap_marker(
-            "bootstrap.native_preload.premain.delegated owner=PreLoader",
+            if preloader_summary.active() {
+                "bootstrap.native_preload.premain.delegated owner=PreLoader"
+            } else {
+                "bootstrap.native_preload.premain.skipped reason=preloader-init-failed"
+            },
         );
         crate::loader::NativePreloadSummary::default()
     } else {
-        if preloader_summary.failed() {
-            crate::platform::logging::write_bootstrap_marker(
-                "bootstrap.native_preload.premain.fallback reason=preloader-failed",
-            );
-        }
         crate::loader::load_native_preloads_in_dllmain(&game_dir)
     };
     crate::platform::logging::write_bootstrap_marker(&format!(
@@ -325,7 +327,7 @@ unsafe fn bootstrap(
         ),
         crate::bootstrap::preloader_proxy::PreloaderProxyState::Failed => logging::scoped_warn_message(
             "preloader",
-            "Priority PreLoader failed; BLoader completed the legacy native preload fallback before Minecraft OEP execution.",
+            "Priority PreLoader initialization failed; native runtime chain was NOT retried. Check the first LoadLibraryW error.",
         ),
         crate::bootstrap::preloader_proxy::PreloaderProxyState::NotFound => logging::scoped_debug_message(
             "preloader",
@@ -416,7 +418,7 @@ unsafe fn bootstrap(
         crate::platform::logging::write_bootstrap_marker(&format!(
             "bootstrap.mods.load.begin execution={execution_mode} serial=true"
         ));
-        crate::loader::load_mods(&game_dir, preloader_summary.active());
+        crate::loader::load_mods(&game_dir, preloader_summary.active(), preloader_summary.failed());
         crate::platform::logging::write_bootstrap_marker(&format!(
             "bootstrap.mods.load.done execution={execution_mode} serial=true"
         ));
