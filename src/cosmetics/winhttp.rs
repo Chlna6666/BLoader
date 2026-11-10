@@ -9,7 +9,7 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use crate::platform::logging;
 use minhook::MinHook;
@@ -42,10 +42,8 @@ const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const REQUEST_BODY_MAX: usize = 128 * 1024;
 const READ_CHUNK: usize = 16 * 1024;
 
-/// Async response-body prefetch switch. Off: libHttpClient dereferences null
-/// when a prefetch read races its own read loop. Synthetic local assets and
-/// sync rewrites are unaffected.
-const ASYNC_PREFETCH_ENABLED: bool = false;
+// Async responses are captured by a dedicated, single-reader worker.
+// Never issue WinHttpReadData recursively inside the game's WinHTTP callback.
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -106,7 +104,6 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 /// config.json 的 enable_cosmetics 总开关（热重载可关闭；重新开启需重启游戏）。
 static MASTER_ENABLED: AtomicBool = AtomicBool::new(false);
-static ASYNC_LOCAL_PAGE_WARNING_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// BLoader 移植：日志统一走 BLoader logging（scope=cosmetics）。
 /// 默认日志保持安静——`logger()` 承载的全部遥测明细都落在 debug 级
@@ -179,8 +176,16 @@ struct AsyncCapture {
     buffer: Box<[u8; READ_CHUNK]>,
     limit: usize,
     encoding: codec::Encoding,
-    pumping: bool,
-    needs_read: bool,
+    events: mpsc::Sender<AsyncReadEvent>,
+    io_guard: Arc<Mutex<()>>,
+    cancelled: Arc<AtomicBool>,
+}
+#[derive(Clone, Copy)]
+enum AsyncReadEvent {
+    Chunk,
+    Eof,
+    TooLarge,
+    Failed,
 }
 struct Replay {
     bytes: Vec<u8>,
@@ -1189,59 +1194,47 @@ unsafe fn query_string(h: H, code: u32) -> Option<String> {
     Some(String::from_utf16_lossy(&wide[..end]))
 }
 
+// Async wardrobe pages are rewritten exactly once, before the game sees
+// HEADERS. A native callback may arrive reentrantly, so it only signals the
+// worker; neither JSON processing nor another WinHttpReadData runs inside it.
 unsafe fn begin_async_capture(h: H, context: usize) -> bool {
-    let Some(runtime) = RUNTIME.get() else {
-        return false;
-    };
+    let Some(runtime) = RUNTIME.get() else { return false };
     let rule = {
         let state = tables().lock().unwrap_or_else(|e| e.into_inner());
-        let Some(req) = state.requests.get(&state_key(h)) else {
-            return false;
-        };
-        if !req.async_session {
+        let Some(req) = state.requests.get(&state_key(h)) else { return false };
+        if !req.async_session || !req.bridge_installed {
             return false;
         }
         let Some(rule) = runtime.cfg.match_rule(&req.host, &req.path, &req.method) else {
             return false;
         };
-        if !matches!(
-            rule.mode,
-            Mode::AppendArray | Mode::PersonaProfile | Mode::InventoryProbe
-        ) {
+        if !matches!(rule.mode, Mode::AppendArray | Mode::PersonaProfile | Mode::InventoryProbe) {
             return false;
         }
         rule
     };
-    let status = query_number(h, QUERY_STATUS_CODE);
-    if status != Some(200) {
-        logger(&format!(
-            "{}: async headers status={status:?}; passthrough",
-            rule.name
-        ));
+    if query_number(h, QUERY_STATUS_CODE) != Some(200) {
+        logger(&format!("{}: unexpected status; passthrough", rule.name));
         return false;
     }
     let encoding = match codec::Encoding::parse(
         &query_string(h, QUERY_CONTENT_ENCODING).unwrap_or_default(),
     ) {
-        Ok(c) => c,
-        Err(e) => {
-            logger(&format!("{}: {e}; passthrough", rule.name));
+        Ok(encoding) => encoding,
+        Err(error) => {
+            logger(&format!("{}: {error}; passthrough", rule.name));
             return false;
         }
     };
-    let max = runtime.cfg.max_capture_bytes.clamp(1024, 16 * 1024 * 1024);
-    if query_number(h, QUERY_CONTENT_LENGTH).is_some_and(|n| n as usize > max) {
-        logger(&format!(
-            "{}: response larger than capture limit",
-            rule.name
-        ));
+    let limit = runtime.cfg.max_capture_bytes.clamp(1024, 16 * 1024 * 1024);
+    if query_number(h, QUERY_CONTENT_LENGTH).is_some_and(|size| size as usize > limit) {
+        logger(&format!("{}: response larger than capture limit; passthrough", rule.name));
         return false;
     }
+    let (sender, receiver) = mpsc::channel();
     {
         let mut state = tables().lock().unwrap_or_else(|e| e.into_inner());
-        let Some(req) = state.requests.get_mut(&state_key(h)) else {
-            return false;
-        };
+        let Some(req) = state.requests.get_mut(&state_key(h)) else { return false };
         if req.capture.is_some() || req.replay.is_some() {
             return false;
         }
@@ -1249,79 +1242,93 @@ unsafe fn begin_async_capture(h: H, context: usize) -> bool {
         req.capture = Some(AsyncCapture {
             bytes: Vec::new(),
             buffer: Box::new([0; READ_CHUNK]),
-            limit: max,
+            limit,
             encoding,
-            pumping: false,
-            needs_read: true,
+            events: sender,
+            io_guard: Arc::new(Mutex::new(())),
+            cancelled: Arc::new(AtomicBool::new(false)),
         });
     }
-    let route_name = rule.name.clone();
-    logger(&format!("route={route_name}: async prefetch started"));
-
-    pump_async(h);
+    let handle = h as usize;
+    if let Err(error) = std::thread::Builder::new()
+        .name("bloader-cape-response".to_string())
+        .spawn(move || unsafe { capture_worker(handle, receiver) })
+    {
+        if let Some(req) = tables().lock().unwrap_or_else(|e| e.into_inner())
+            .requests.get_mut(&state_key(h))
+        {
+            req.capture = None;
+        }
+        warn_log(&format!("cape response worker unavailable ({error}); passthrough"));
+        return false;
+    }
+    logger(&format!("route={}: async response capture scheduled", rule.name));
     true
 }
-unsafe fn pump_async(h: H) {
-    {
-        let mut state = tables().lock().unwrap_or_else(|e| e.into_inner());
-        let Some(cap) = state
-            .requests
-            .get_mut(&state_key(h))
-            .and_then(|r| r.capture.as_mut())
-        else {
-            return;
-        };
-        if cap.pumping {
-            return;
-        }
-        cap.pumping = true;
+
+unsafe fn capture_worker(handle: usize, receiver: mpsc::Receiver<AsyncReadEvent>) {
+    let h = handle as H;
+    // The initial wardrobe request may beat the background cape scanner.
+    // Wait only on this worker; no filesystem scan runs in the game callback.
+    if let Some(runtime) = RUNTIME.get() {
+        let _ = local_capes::initialize(
+            &runtime.cape_roots,
+            runtime.texture_mode,
+            &runtime.locale,
+        );
     }
     loop {
-        let buf = {
-            let mut state = tables().lock().unwrap_or_else(|e| e.into_inner());
-            let Some(cap) = state
-                .requests
-                .get_mut(&state_key(h))
-                .and_then(|r| r.capture.as_mut())
-            else {
-                return;
-            };
-            if !cap.needs_read {
-                cap.pumping = false;
-                return;
-            }
-            cap.needs_read = false;
-            cap.buffer.as_mut_ptr()
+        let read = {
+            let state = tables().lock().unwrap_or_else(|e| e.into_inner());
+            state.requests.get(&state_key(h))
+                .and_then(|req| req.capture.as_ref())
+                .map(|capture| (
+                    capture.buffer.as_ptr() as H,
+                    Arc::clone(&capture.io_guard),
+                    Arc::clone(&capture.cancelled),
+                ))
         };
-        // The stable Box owns the buffer until HANDLE_CLOSING. This call may
-        // complete inline (reentrant callback) or later on a WinHTTP thread.
-        let success = original!(READ, ReadFn)(h, buf as H, READ_CHUNK as u32, ptr::null_mut());
-        if success == 0 {
-            let error = GetLastError();
-            if error != ERROR_IO_PENDING {
-                logger("asynchronous WinHttpReadData failed; replay buffered original bytes");
-                finish_async(h, false);
+        let Some((buffer, guard, cancelled)) = read else { return };
+        // Serialize native reads against WinHttpCloseHandle so cancellation
+        // cannot free a request handle while a new read is being issued.
+        let result = {
+            let _guard = guard.lock().unwrap_or_else(|e| e.into_inner());
+            if cancelled.load(Ordering::Acquire) {
                 return;
             }
-        }
-        let continue_now = {
-            let mut state = tables().lock().unwrap_or_else(|e| e.into_inner());
-            let Some(cap) = state
-                .requests
-                .get_mut(&state_key(h))
-                .and_then(|r| r.capture.as_mut())
-            else {
-                return;
-            };
-            if cap.needs_read {
-                true
-            } else {
-                cap.pumping = false;
-                false
-            }
+            let ok = original!(READ, ReadFn)(h, buffer, READ_CHUNK as u32, ptr::null_mut());
+            (ok, if ok == 0 { GetLastError() } else { 0 })
         };
-        if !continue_now {
+        if result.0 == 0 && result.1 != ERROR_IO_PENDING {
+            logger(&format!("async cape read failed win32_error={}; original prefix retained", result.1));
+            finish_async(h, false);
             return;
+        }
+        match receiver.recv() {
+            Ok(AsyncReadEvent::Chunk) => {}
+            Ok(AsyncReadEvent::Eof) => {
+                if !cancelled.load(Ordering::Acquire) {
+                    finish_async(h, true);
+                }
+                return;
+            }
+            Ok(AsyncReadEvent::TooLarge) => {
+                if !cancelled.load(Ordering::Acquire) {
+                    logger("async cape response reached capture limit; original stream preserved");
+                    finish_async(h, false);
+                }
+                return;
+            }
+            Ok(AsyncReadEvent::Failed) | Err(_) => {
+                // The original request-error callback has already been
+                // delivered. No synthetic HEADERS may follow a failed read.
+                if let Some(req) = tables().lock().unwrap_or_else(|e| e.into_inner())
+                    .requests.get_mut(&state_key(h))
+                {
+                    req.capture = None;
+                }
+                return;
+            }
         }
     }
 }
@@ -1451,15 +1458,6 @@ unsafe extern "system" fn status_bridge(h: H, context: usize, status: u32, info:
             })
         };
         if let Some((id, route, asynchronous)) = note {
-            if asynchronous && !ASYNC_PREFETCH_ENABLED
-                && (route.starts_with("dressing_room_capes")
-                    || route.starts_with("local_persona_profile"))
-                && !ASYNC_LOCAL_PAGE_WARNING_LOGGED.swap(true, Ordering::Relaxed)
-            {
-                warn_log(
-                    "Local capes were scanned, but the Minecraft dressing-room page uses async WinHTTP. Response rewriting is disabled for this path after libHttpClient crashes; navigation/entries may not appear. Native response integration is still required.",
-                );
-            }
             let code = query_number(h, QUERY_STATUS_CODE);
             let content_length = query_number(h, QUERY_CONTENT_LENGTH);
             let encoding = query_string(h, QUERY_CONTENT_ENCODING)
@@ -1484,71 +1482,56 @@ unsafe extern "system" fn status_bridge(h: H, context: usize, status: u32, info:
             invoke_headers(h, context);
             return;
         }
-        // Async body prefetch is disabled: on libHttpClient requests it raced
-        // with the game's own read loop and crashed with 0xC0000005 inside
-        // libHttpClient (WINHTTP -> bridge -> libHttpClient with a null
-        // internal pointer). Async responses now stream natively; only
-        // synthetic local assets are still served by BLoader.
-        if ASYNC_PREFETCH_ENABLED && begin_async_capture(h, context) {
+        // Withhold HEADERS until a single worker has captured and rewritten
+        // the body. The game's own reads cannot overlap the native prefetch.
+        if begin_async_capture(h, context) {
             return;
         }
     } else if status == STATUS_READ {
-        let action = {
+        let captured = {
             let mut state = tables().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(cap) = state
-                .requests
-                .get_mut(&state_key(h))
-                .and_then(|r| r.capture.as_mut())
-            {
-                if info == cap.buffer.as_mut_ptr() as H {
-                    if len == 0 {
-                        Some(0)
-                    } else if len as usize > READ_CHUNK
-                        || cap.bytes.len().saturating_add(len as usize) > cap.limit
-                    {
-                        Some(2)
-                    } else {
-                        cap.bytes.extend_from_slice(std::slice::from_raw_parts(
-                            info as *const u8,
-                            len as usize,
-                        ));
-                        cap.needs_read = true;
-                        Some(1)
+            state.requests.get_mut(&state_key(h))
+                .and_then(|req| req.capture.as_mut())
+                .and_then(|capture| {
+                    if info != capture.buffer.as_ptr() as H {
+                        return None;
                     }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+                    let event = if len == 0 {
+                        AsyncReadEvent::Eof
+                    } else if len as usize > READ_CHUNK {
+                        AsyncReadEvent::Failed
+                    } else {
+                        // Preserve the entire last read on overflow. If a
+                        // response cannot be rewritten, it is replayed
+                        // byte-for-byte before native reads resume.
+                        capture.bytes.extend_from_slice(
+                            std::slice::from_raw_parts(info as *const u8, len as usize),
+                        );
+                        if capture.bytes.len() > capture.limit {
+                            AsyncReadEvent::TooLarge
+                        } else {
+                            AsyncReadEvent::Chunk
+                        }
+                    };
+                    Some((capture.events.clone(), event))
+                })
         };
-        match action {
-            Some(0) => {
-                finish_async(h, true);
-                return;
-            }
-            Some(1) => {
-                pump_async(h);
-                return;
-            }
-            Some(2) => {
-                logger("async response exceeded size limit");
-                finish_async(h, false);
-                return;
-            }
-            _ => {}
+        if let Some((sender, event)) = captured {
+            let _ = sender.send(event);
+            return;
         }
     } else if status == STATUS_REQUEST_ERROR {
-        let active = {
-            tables()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .requests
-                .get(&state_key(h))
-                .is_some_and(|r| r.capture.is_some())
+        let signal = {
+            let state = tables().lock().unwrap_or_else(|e| e.into_inner());
+            state.requests.get(&state_key(h))
+                .and_then(|req| req.capture.as_ref())
+                .map(|capture| capture.events.clone())
         };
-        if active {
-            finish_async(h, false);
+        if let Some(sender) = signal {
+            let _ = sender.send(AsyncReadEvent::Failed);
+            // Forward the real WinHTTP failure rather than inventing a
+            // successful HEADERS notification for an incomplete response.
+            notify_game(h, context, status, info, len);
             return;
         }
     }
@@ -2042,7 +2025,21 @@ unsafe extern "system" fn on_close(h: H) -> B {
         state.sessions.remove(&state_key(h));
         state.callbacks.remove(&state_key(h));
     }
-    original!(CLOSE, CloseFn)(h)
+    let gate = {
+        let state = tables().lock().unwrap_or_else(|e| e.into_inner());
+        state.requests.get(&state_key(h))
+            .and_then(|req| req.capture.as_ref())
+            .map(|capture| {
+                capture.cancelled.store(true, Ordering::Release);
+                Arc::clone(&capture.io_guard)
+            })
+    };
+    if let Some(gate) = gate {
+        let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        original!(CLOSE, CloseFn)(h)
+    } else {
+        original!(CLOSE, CloseFn)(h)
+    }
 }
 
 #[cfg(test)]
