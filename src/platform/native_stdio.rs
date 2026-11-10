@@ -296,7 +296,11 @@ fn queue_or_emit(identity: Option<ModIdentity>, stream: &str, line: &str) {
         let active = active_captures().try_lock().ok()?;
         (active.len() == 1).then(|| active[0].identity.clone())
     });
-    if logging::is_ready() {
+    // The visible console is attached before PreLoader's LoadLibrary chain.
+    // Emit to its nonblocking writer as soon as that sink exists instead of
+    // holding all native startup lines until Config::load/logging::init (which
+    // used to replay 19:03:25 after later BLoader 19:03:26 messages).
+    if logging::is_ready() || logging::console_is_ready() {
         emit_line(identity, stream, line);
     } else {
         let mut pending = pending_lines()
