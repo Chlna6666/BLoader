@@ -4,6 +4,7 @@
 //! crate 安装，运行时装配由 `super::mod` 在 bootstrap 阶段完成。
 use super::response::{Config, Mode};
 use super::{TextureMode, codec, debug, diagnostics, local_capes, persona};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -102,6 +103,29 @@ struct Runtime {
 }
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    // Used by crash capture to recognize a fault inside the game's native
+    // libHttpClient callback, even when the fault instruction is not in BLoader.
+    static GAME_CALLBACK_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+pub(super) fn inside_game_callback() -> bool {
+    GAME_CALLBACK_DEPTH.with(|depth| depth.get() != 0)
+}
+
+struct GameCallbackScope;
+impl GameCallbackScope {
+    fn enter() -> Self {
+        GAME_CALLBACK_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Self
+    }
+}
+impl Drop for GameCallbackScope {
+    fn drop(&mut self) {
+        GAME_CALLBACK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
 /// config.json 的 enable_cosmetics 总开关（热重载可关闭；重新开启需重启游戏）。
 static MASTER_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -601,6 +625,7 @@ unsafe fn notify_game(h: H, context: usize, status: u32, info: H, len: u32) {
     if let Some(reg) = reg {
         if reg.address != 0 && reg.flags & status != 0 {
             let f: StatusCallback = std::mem::transmute(reg.address);
+            let _scope = GameCallbackScope::enter();
             f(h, context, status, info, len);
         }
     }
