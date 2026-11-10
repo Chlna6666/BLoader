@@ -57,10 +57,6 @@ struct ModManifest {
     notify_success: bool,
     #[serde(default)]
     log_aliases: Vec<String>,
-    /// Explicit BLoader ownership when LeviLamina is also active.
-    /// Ordinary LeviLamina native mods remain owned by LeviLamina.
-    #[serde(default)]
-    bloader_managed: bool,
     /// BLoader's own dependency IDs; do not reinterpret LeviLamina's
     /// versioned 'dependencies' field (it has a different schema).
     #[serde(default)]
@@ -110,12 +106,9 @@ struct DiscoveredMods {
     hot: Vec<HotMod>,
 }
 
-const MOD_TYPE_PRELOAD_NATIVE: &str = "preload-native";
+const MOD_TYPE_BLOADER_NATIVE: &str = "bloader-native";
 const MOD_TYPE_HOT_NATIVE: &str = "hot-native";
 const MOD_TYPE_HOT_INJECT: &str = "hot-inject";
-/// Removed mod type: kept as a match target so legacy `type=BL` manifests are
-/// skipped with a clear warning instead of being loaded as preload natives.
-const MOD_TYPE_BL: &str = "BL";
 
 const HOT_INJECT_DEFAULT_DELAY_MS: u64 = 15_000;
 const HOT_INJECT_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
@@ -161,7 +154,7 @@ struct NativeLoadReport {
 }
 
 pub unsafe fn load_native_preloads_in_dllmain(game_dir: &Path) -> NativePreloadSummary {
-    let mods_dir = game_dir.join("mods");
+    let mods_dir = bloader_mods_dir(game_dir);
     let mut summary = NativePreloadSummary::default();
 
     let Ok(entries) = fs::read_dir(&mods_dir) else {
@@ -233,7 +226,7 @@ pub unsafe fn load_native_preloads_in_dllmain(game_dir: &Path) -> NativePreloadS
             }
         };
 
-        if manifest.mod_type != "native" && manifest.mod_type != MOD_TYPE_PRELOAD_NATIVE {
+        if manifest.mod_type != MOD_TYPE_BLOADER_NATIVE {
             continue;
         }
 
@@ -962,13 +955,9 @@ pub fn native_success_notification_message() -> Option<String> {
     Some(lines.join("\n"))
 }
 
-pub unsafe fn load_mods(
-    game_dir: &Path,
-    preloader_active: bool,
-    preloader_failed: bool,
-) -> bool {
+pub unsafe fn load_mods(game_dir: &Path) -> bool {
     let mods_dir = ensure_mods_dir(game_dir);
-    let mut discovered = discover_mods(&mods_dir, preloader_active, preloader_failed);
+    let mut discovered = discover_mods(&mods_dir);
 
     if discovered.preload.is_empty() && discovered.hot.is_empty() {
         logging::info_message("No mods found to load.");
@@ -981,8 +970,12 @@ pub unsafe fn load_mods(
     preloader_activated
 }
 
+fn bloader_mods_dir(game_dir: &Path) -> PathBuf {
+    game_dir.join("BLoader").join("mods")
+}
+
 fn ensure_mods_dir(game_dir: &Path) -> PathBuf {
-    let mods_dir = game_dir.join("mods");
+    let mods_dir = bloader_mods_dir(game_dir);
     if !mods_dir.exists() {
         if file_io_policy::writes_allowed() {
             let _ = fs::create_dir_all(&mods_dir);
@@ -996,11 +989,7 @@ fn ensure_mods_dir(game_dir: &Path) -> PathBuf {
     mods_dir
 }
 
-fn discover_mods(
-    mods_dir: &Path,
-    preloader_active: bool,
-    preloader_failed: bool,
-) -> DiscoveredMods {
+fn discover_mods(mods_dir: &Path) -> DiscoveredMods {
     let mut discovered = DiscoveredMods::default();
     let entries: Vec<_> = fs::read_dir(mods_dir)
         .ok()
@@ -1012,7 +1001,7 @@ fn discover_mods(
     for entry in entries {
         let entry_path = entry.path();
         if entry_path.is_dir() {
-            discover_packaged_mod(&entry_path, preloader_active, preloader_failed, &mut discovered);
+            discover_packaged_mod(&entry_path, &mut discovered);
             continue;
         }
 
@@ -1024,12 +1013,7 @@ fn discover_mods(
     discovered
 }
 
-fn discover_packaged_mod(
-    entry_path: &Path,
-    preloader_active: bool,
-    preloader_failed: bool,
-    discovered: &mut DiscoveredMods,
-) {
+fn discover_packaged_mod(entry_path: &Path, discovered: &mut DiscoveredMods) {
     let manifest_path = entry_path.join("manifest.json");
     if !manifest_path.exists() {
         return;
@@ -1052,24 +1036,15 @@ fn discover_packaged_mod(
     };
 
     let mod_type = manifest.mod_type.as_str();
-    if mod_type.eq_ignore_ascii_case(MOD_TYPE_BL) {
+    if !matches!(
+        mod_type,
+        MOD_TYPE_BLOADER_NATIVE | MOD_TYPE_HOT_NATIVE | MOD_TYPE_HOT_INJECT
+    ) {
+        // PreLoader and LeviLamina are the sole owners of preload-native and
+        // native respectively; do not retry their DLLs even after failure.
         logging::scoped_warn_message(
             "native-loader",
-            &format!("SKIP_BL_MOD_TYPE | {} | install the separate BLRuntime to use BL mods", manifest.name),
-        );
-        return;
-    }
-    if mod_type == "preload" {
-        // Handled exclusively by the priority PreLoader discovery path.
-        return;
-    }
-    if !matches!(mod_type, "native" | "preload-native" | "hot-native" | "hot-inject") {
-        logging::scoped_warn_message(
-            "native-loader",
-            &format!(
-                "SKIP_UNSUPPORTED_MOD_TYPE | {} | type={} | external runtime owns its own types",
-                manifest.name, mod_type,
-            ),
+            &format!("SKIP_FOREIGN_MOD_TYPE | name={} type={}", manifest.name, mod_type),
         );
         return;
     }
@@ -1110,39 +1085,7 @@ fn discover_packaged_mod(
     let id = manifest.id.clone().unwrap_or_else(|| manifest.name.clone());
     let kind = manifest.mod_type.clone();
 
-    // LeviLamina's registrar loads and orders its 'native' mods. Running
-    // LoadLibrary again in BLoader bypasses its dependency planner and can
-    // misreport already loaded modules as BLoader-owned. Opt in explicitly
-    // with bloader_managed=true for native mods intended for both runtimes.
-    if (preloader_active || preloader_failed)
-        && !manifest.bloader_managed
-        && matches!(mod_type, "native" | "preload-native")
-    {
-        let identity = mod_diagnostics::register_discovered(
-            id, manifest.name, manifest.version, kind, &dll_path,
-            manifest.log_aliases,
-        );
-        if preloader_failed {
-            mod_diagnostics::mark_failed(
-                &identity,
-                "blocked_preloader_init",
-                "PreLoader failed initialization; owned native runtime Mod is not retried directly",
-            );
-        } else {
-            mod_diagnostics::mark_delegated(&identity, "LeviLamina/PreLoader");
-        }
-        return;
-    }
     match manifest.mod_type.as_str() {
-        MOD_TYPE_BL => {
-            logging::scoped_warn_message(
-                "native-loader",
-                &format!(
-                    "SKIP_BL_MOD_TYPE | {} | the BL mod type was removed from BLoader",
-                    manifest.name
-                ),
-            );
-        }
         MOD_TYPE_HOT_NATIVE | MOD_TYPE_HOT_INJECT => {
             let ready_level = resolve_hot_ready_level(&manifest);
             if let Some(frames) = manifest.inject_min_frames {
@@ -1291,7 +1234,7 @@ fn package_loose_dll(mods_dir: &Path, entry_path: &Path) -> Option<PreloadMod> {
             version: None,
             author: None,
             description: None,
-            mod_type: MOD_TYPE_PRELOAD_NATIVE.to_string(),
+            mod_type: MOD_TYPE_BLOADER_NATIVE.to_string(),
             api_version: None,
             inject_delay_ms: None,
             inject_min_frames: None,
@@ -1303,7 +1246,6 @@ fn package_loose_dll(mods_dir: &Path, entry_path: &Path) -> Option<PreloadMod> {
             verify_modules: Vec::new(),
             notify_success: false,
             log_aliases: Vec::new(),
-            bloader_managed: true,
             bloader_dependencies: Vec::new(),
         };
 
@@ -1328,7 +1270,7 @@ fn package_loose_dll(mods_dir: &Path, entry_path: &Path) -> Option<PreloadMod> {
         name: file_stem,
         dependencies: Vec::new(),
         version: None,
-        kind: MOD_TYPE_PRELOAD_NATIVE.to_string(),
+        kind: MOD_TYPE_BLOADER_NATIVE.to_string(),
         dll_path: target_dll,
         log_aliases: Vec::new(),
         required: false,
@@ -1569,13 +1511,20 @@ unsafe fn load_library(preload: &PreloadMod, phase: &str, silent_success: bool) 
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_manifest_json, resolve_hot_ready_level};
+    use super::{bloader_mods_dir, parse_manifest_json, resolve_hot_ready_level};
     use crate::bootstrap::runtime_ready::ReadyLevel;
+
+    #[test]
+    fn bloader_mods_are_outside_levilamina_mod_root() {
+        let root = std::path::Path::new("C:/Minecraft");
+        assert_eq!(bloader_mods_dir(root), root.join("BLoader").join("mods"));
+        assert_ne!(bloader_mods_dir(root), root.join("mods"));
+    }
 
     #[test]
     fn parses_native_load_verification_contract() {
         let manifest = parse_manifest_json(
-            r#"{"name":"NativeProbe","entry":"native_probe.dll","type":"native","required":true,"notify_success":true,"verify_exports":["ProbeInitialize"],"verify_modules":["kernel32.dll"]}"#,
+            r#"{"name":"NativeProbe","entry":"native_probe.dll","type":"bloader-native","required":true,"notify_success":true,"verify_exports":["ProbeInitialize"],"verify_modules":["kernel32.dll"]}"#,
         )
         .expect("native verification fields must parse");
 
