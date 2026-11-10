@@ -2,7 +2,7 @@
 //! Never replace the user's original inventory: append-only, identity deduplicated,
 //! and skip on an unrecognized schema. PlayFab item overrides are opt-in by item ID.
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -112,6 +112,44 @@ impl Config {
     }
 }
 
+/// Builds the PersonaProfile navigation tile from an actual locally imported
+/// cape. No remote Cosmetics/Cosmos preview item, entitlement, or receipt is
+/// created. The thumbnail URL is the existing local item asset.
+fn local_capes_navigation_items(items: &[Value]) -> Vec<Value> {
+    let Some(first) = items.first() else { return Vec::new() };
+    let Some(thumbnail) = first.get("thumbnail").cloned() else {
+        return Vec::new();
+    };
+    vec![json!({
+        "id": "00000000-0000-0000-0000-00000000cace",
+        "linksTo": "DressingRoom_Capes",
+        "linksToInfo": {
+            "linksTo": "DressingRoom_Capes",
+            "linkType": "pageId",
+            "displayType": "store_layout.character_creator_screen",
+            "navigateInPlace": false
+        },
+        "thumbnailPreviewOnly": true,
+        "contentType": "PersonaDurable",
+        "title": "My Local Capes",
+        "creatorName": "BLoader Cosmetics",
+        "pieceType": "persona_capes",
+        "rarity": "common",
+        "ownership": "NotOwned",
+        "packType": "Persona",
+        "thumbnail": thumbnail,
+        "packIdentity": first.get("packIdentity").cloned().unwrap_or_else(|| json!([])),
+        "namedLinksToInfoMap": {
+            "dr.persona_creator_page": {
+                "linksTo": "DressingRoom_Capes",
+                "linkType": "external",
+                "displayType": "store_layout.character_creator_screen",
+                "navigateInPlace": false
+            }
+        }
+    })]
+}
+
 fn guarded_path(base: &Path, child: &str) -> Result<PathBuf, String> {
     let relative = Path::new(child);
     if relative.is_absolute()
@@ -171,17 +209,25 @@ pub fn overlay(
                 .map_err(|e| e.to_string())
         }
         Mode::PersonaProfile => {
-            let path = guarded_path(base, &rule.file)?;
-            let additions: Value = serde_json::from_slice(
-                &fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?,
-            )
-            .map_err(|e| format!("persona profile additions invalid: {e}"))?;
-            let add = additions
-                .as_array()
-                .ok_or("persona profile items must be array")?;
-            if add.is_empty() {
+            // A local-only PersonaProfile links to the user's registered cape
+            // packs. Do not depend on an external Cosmetics overrides JSON:
+            // that historical preview entry disappeared after integration.
+            let additions: Vec<Value> = if rule.local_only {
+                local_capes_navigation_items(super::local_capes::items())
+            } else {
+                let path = guarded_path(base, &rule.file)?;
+                let bytes = fs::read(&path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                let parsed: Value = serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("persona profile additions invalid: {e}"))?;
+                parsed.as_array()
+                    .ok_or("persona profile items must be array")?
+                    .clone()
+            };
+            if additions.is_empty() {
                 return Ok(None);
             }
+            let add = &additions;
             let mut root: Value = serde_json::from_slice(original_body)
                 .map_err(|e| format!("original PersonaProfile invalid: {e}"))?;
             let rows = root
@@ -517,6 +563,22 @@ mod tests {
             local_only: false,
         }
     }
+    #[test]
+    fn local_navigation_only_uses_registered_cape_thumbnail() {
+        let capes = vec![json!({
+            "id": "local-cape",
+            "thumbnail": {"url": "https://cosmetics.invalid/asset/local-thumbnail.png"},
+            "packIdentity": [{"type": "persona_piece", "uuid": "abcd"}]
+        })];
+        let tile = local_capes_navigation_items(&capes);
+        assert_eq!(tile.len(), 1);
+        assert_eq!(tile[0]["linksTo"], "DressingRoom_Capes");
+        assert_eq!(tile[0]["thumbnail"], capes[0]["thumbnail"]);
+        assert_eq!(tile[0]["ownership"], "NotOwned");
+        assert!(tile[0].get("receipt").is_none());
+        assert!(local_capes_navigation_items(&[]).is_empty());
+    }
+
     #[test]
     fn preserves_original_entitlements_and_deduplicates() {
         let dir = std::env::temp_dir().join(format!("cosmetics_test_{}", std::process::id()));

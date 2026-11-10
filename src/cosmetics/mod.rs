@@ -39,8 +39,9 @@ static INSTALL_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) const DEFAULT_COSMETICS_DIR: &str = "mods/Cosmetics";
 
-/// 内置默认规则：只保留本地披风所需的两条核心规则且 local_only=true，
-/// 不引用任何 Cosmos 目录/条目。外部 cosmetics.json 存在时完全以它为准。
+/// 内置默认规则：恢复本地披风的 PersonaProfile 入口，
+/// 同时保留更衣室本地披风与目录接口，全部 local_only，不包含 Cosmos 商品条目。
+/// 外部 cosmetics.json 存在时仍以用户配置为准。
 const DEFAULT_RULES_JSON: &str = r#"{
   "enabled": true,
   "max_capture_bytes": 4194304,
@@ -53,6 +54,15 @@ const DEFAULT_RULES_JSON: &str = r#"{
       "method": "GET,POST",
       "mode": "append_array",
       "file": "overrides/capes_items.json",
+      "local_only": true
+    },
+    {
+      "name": "local_persona_profile",
+      "host": "store.mktpl.minecraft-services.net",
+      "path": "/api/v2.0/layout/pages/DressingRoom_PersonaProfile",
+      "method": "GET,POST",
+      "mode": "persona_profile",
+      "file": "overrides/persona_profile_items.json",
       "local_only": true
     },
     {
