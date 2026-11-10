@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::{self};
 use std::os::windows::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -230,8 +230,14 @@ pub unsafe fn load_mod_preloads_before_oep(game_dir: &Path) -> NativePreloadSumm
             continue;
         }
 
-        let dll_path = package_dir.join(&manifest.entry);
-        if is_reserved_system_runtime(&dll_path) {
+        let Some(dll_path) = checked_mod_entry(&package_dir, &manifest.entry) else {
+            logging::write_bootstrap_marker(&format!(
+                "mod-preload ignored invalid or escaping entry package={} entry={}",
+                package_dir.display(), manifest.entry
+            ));
+            continue;
+        };
+        if is_reserved_runtime_dll(&dll_path) {
             logging::write_bootstrap_marker(&format!(
                 "native-load skipped phase=dllmain reason=system_runtime_owned_by_host path={}",
                 dll_path.display()
@@ -343,10 +349,40 @@ fn package_display_name(path: &Path) -> String {
         .unwrap_or_else(|| "<unknown-package>".to_string())
 }
 
-fn is_reserved_system_runtime(path: &Path) -> bool {
+/// Never confuse a BLoader-owned Mod with an external runtime/bootstrap or
+/// LeviLamina-owned addon, even when the manifest type is forged.
+fn is_reserved_runtime_dll(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case("xgameruntime.dll"))
+        .is_some_and(|name| {
+            ["xgameruntime.dll", "preloader.dll", "levilamina.dll", "bedrockscenecapture.dll"]
+                .iter()
+                .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        })
+}
+
+/// Manifest entries cannot escape a single BLoader Mod package, including by
+/// ../ traversal, absolute paths, Win32 device prefixes, or directory links.
+fn checked_mod_entry(package_dir: &Path, entry: &str) -> Option<PathBuf> {
+    let relative = Path::new(entry);
+    if entry.is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    let root = package_dir.parent()?.canonicalize().ok()?;
+    let dir = package_dir.canonicalize().ok()?;
+    let dll = package_dir.join(relative).canonicalize().ok()?;
+    if !dir.starts_with(&root) || !dll.starts_with(&dir) || !is_dll_path(&dll) {
+        return None;
+    }
+    Some(dll)
 }
 
 fn diagnostics_identity(preload: &PreloadMod) -> mod_diagnostics::ModIdentity {
@@ -1049,11 +1085,17 @@ fn discover_packaged_mod(entry_path: &Path, discovered: &mut DiscoveredMods) {
         return;
     }
 
-    let dll_path = entry_path.join(&manifest.entry);
-    if !is_dll_path(&dll_path) {
+    let Some(dll_path) = checked_mod_entry(entry_path, &manifest.entry) else {
+        logging::scoped_error_message(
+            "native-loader",
+            &format!(
+                "SKIP_INVALID_MOD_ENTRY | name={} entry={} | absolute paths, traversal, and symlink escapes are forbidden",
+                manifest.name, manifest.entry,
+            ),
+        );
         return;
-    }
-    if is_reserved_system_runtime(&dll_path) {
+    };
+    if is_reserved_runtime_dll(&dll_path) {
         logging::scoped_info_message(
             "native-loader",
             &format!(
@@ -1163,7 +1205,7 @@ fn discover_loose_dll(mods_dir: &Path, entry_path: &Path, discovered: &mut Disco
     if !is_dll_path(entry_path) {
         return;
     }
-    if is_reserved_system_runtime(entry_path) {
+    if is_reserved_runtime_dll(entry_path) {
         logging::scoped_info_message(
             "native-loader",
             &format!(
@@ -1490,8 +1532,8 @@ unsafe fn load_library(preload: &PreloadMod, phase: &str, silent_success: bool) 
 #[cfg(test)]
 mod tests {
     use super::{
-        bloader_mods_dir, parse_manifest_json, resolve_hot_ready_level,
-        MOD_TYPE_MOD_NATIVE, MOD_TYPE_MOD_PRELOAD,
+        bloader_mods_dir, checked_mod_entry, is_reserved_runtime_dll, parse_manifest_json,
+        resolve_hot_ready_level, MOD_TYPE_MOD_NATIVE, MOD_TYPE_MOD_PRELOAD,
     };
     use crate::bootstrap::runtime_ready::ReadyLevel;
 
@@ -1500,6 +1542,29 @@ mod tests {
         let root = std::path::Path::new("C:/Minecraft");
         assert_eq!(bloader_mods_dir(root), root.join("BLoader").join("mods"));
         assert_ne!(bloader_mods_dir(root), root.join("mods"));
+    }
+
+    #[test]
+    fn rejects_foreign_runtime_modules() {
+        assert!(is_reserved_runtime_dll(std::path::Path::new("LeviLamina.dll")));
+        assert!(is_reserved_runtime_dll(std::path::Path::new("PreLoader.dll")));
+        assert!(is_reserved_runtime_dll(std::path::Path::new("BedrockSceneCapture.dll")));
+        assert!(!is_reserved_runtime_dll(std::path::Path::new("Example.dll")));
+    }
+
+    #[test]
+    fn rejects_mod_entry_path_traversal() {
+        let root = std::env::temp_dir().join(format!(
+            "bloader-entry-test-{}", std::process::id()
+        ));
+        let package = root.join("Example");
+        std::fs::create_dir_all(&package).unwrap();
+        let allowed = package.join("example.dll");
+        std::fs::write(&allowed, b"fake").unwrap();
+        assert_eq!(checked_mod_entry(&package, "example.dll").as_deref(), Some(allowed.canonicalize().unwrap().as_path()));
+        assert!(checked_mod_entry(&package, "../outside.dll").is_none());
+        assert!(checked_mod_entry(&package, "C:\\Windows\\System32\\kernel32.dll").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
