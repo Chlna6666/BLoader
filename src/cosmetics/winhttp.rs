@@ -169,6 +169,7 @@ struct Request {
     async_prefetch_done: bool,
     async_dispatch: Option<mpsc::Sender<AsyncNotice>>,
     synthetic: bool,
+    closing: bool,
     status: u32,
     callback_context: usize,
 }
@@ -191,6 +192,8 @@ enum AsyncReadEvent {
     },
 }
 enum AsyncNotice {
+    SendComplete { context: usize },
+    Headers { context: usize },
     Read { context: usize, buffer: usize, len: u32 },
     Available { context: usize, len: u32 },
 }
@@ -525,6 +528,7 @@ unsafe extern "system" fn on_open_request(
             callback_context: 0,
             async_prefetch_done: false,
             async_dispatch: None,
+            closing: false,
         };
         state.requests.insert(state_key(h), req);
         drop(state);
@@ -978,8 +982,10 @@ unsafe extern "system" fn on_send(
         logger(&format!(
             "LOCAL_ASSET_RESPONSE_READY method={method} status={status} bytes={body_bytes} content_length={declared_bytes} async={async_request} (game acceptance unverified)"
         ));
-        if async_request {
-            notify_game(h, ctx, STATUS_SEND_COMPLETE, ptr::null_mut(), 0);
+        if async_request && !queue_synthetic_notice(h, AsyncNotice::SendComplete { context: ctx }) {
+            warn_log("local asset callback could not be dispatched; aborting synthetic response");
+            SetLastError(8); // ERROR_NOT_ENOUGH_MEMORY
+            return 0;
         }
         return 1;
     }
@@ -1045,8 +1051,10 @@ unsafe extern "system" fn on_send(
                 logger(&format!(
                     "request #{request_id}: LOCAL_CATALOG_SYNTHETIC item_uuid={known_id} status=200 bytes={byte_count} upstream_request=skipped async={async_request}"
                 ));
-                if async_request {
-                    notify_game(h, ctx, STATUS_SEND_COMPLETE, ptr::null_mut(), 0);
+                if async_request && !queue_synthetic_notice(h, AsyncNotice::SendComplete { context: ctx }) {
+                    warn_log("local catalog callback could not be dispatched; aborting synthetic response");
+                    SetLastError(8); // ERROR_NOT_ENOUGH_MEMORY
+                    return 0;
                 }
                 return 1;
             }
@@ -1309,8 +1317,8 @@ unsafe fn capture_worker(handle: usize, receiver: mpsc::Receiver<AsyncReadEvent>
         };
         if result.0 == 0 && result.1 != ERROR_IO_PENDING {
             logger(&format!("async cape read failed win32_error={}; original prefix retained", result.1));
-            if let Some(queue) = finish_async(h, false) {
-                dispatch_replay_callbacks(h, queue);
+            if let Some((request_id, queue)) = finish_async(h, false) {
+                dispatch_replay_callbacks(h, request_id, queue);
             }
             return;
         }
@@ -1318,8 +1326,8 @@ unsafe fn capture_worker(handle: usize, receiver: mpsc::Receiver<AsyncReadEvent>
             Ok(AsyncReadEvent::Chunk) => {}
             Ok(AsyncReadEvent::Eof) => {
                 if !cancelled.load(Ordering::Acquire) {
-                    if let Some(queue) = finish_async(h, true) {
-                        dispatch_replay_callbacks(h, queue);
+                    if let Some((request_id, queue)) = finish_async(h, true) {
+                        dispatch_replay_callbacks(h, request_id, queue);
                     }
                 }
                 return;
@@ -1327,8 +1335,8 @@ unsafe fn capture_worker(handle: usize, receiver: mpsc::Receiver<AsyncReadEvent>
             Ok(AsyncReadEvent::TooLarge) => {
                 if !cancelled.load(Ordering::Acquire) {
                     logger("async cape response reached capture limit; original stream preserved");
-                    if let Some(queue) = finish_async(h, false) {
-                        dispatch_replay_callbacks(h, queue);
+                    if let Some((request_id, queue)) = finish_async(h, false) {
+                        dispatch_replay_callbacks(h, request_id, queue);
                     }
                 }
                 return;
@@ -1361,9 +1369,57 @@ unsafe fn capture_worker(handle: usize, receiver: mpsc::Receiver<AsyncReadEvent>
 // Reuse the capture worker for asynchronous client notifications as well.
 // WinHttpReadData must return before its READ_COMPLETE callback is delivered:
 // inline replay callbacks recursively entered libHttpClient on prior builds.
-unsafe fn dispatch_replay_callbacks(h: H, receiver: mpsc::Receiver<AsyncNotice>) {
+// Each synthetic response uses only a callback dispatcher: it never starts a
+// second native WinHTTP read or changes the game's asynchronous session mode.
+// Dispatching on a separate thread prevents reentry into libHttpClient from
+// WinHttpSendRequest / ReceiveResponse / ReadData detours.
+fn queue_synthetic_notice(h: H, notice: AsyncNotice) -> bool {
+    let key = state_key(h);
+    let request_id;
+    let mut receiver = None;
+    let sender = {
+        let mut state = tables().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(req) = state.requests.get_mut(&key) else { return false };
+        if !req.synthetic || req.closing || !req.async_session { return false; }
+        request_id = req.id;
+        if req.async_dispatch.is_none() {
+            let (tx, rx) = mpsc::channel();
+            req.async_dispatch = Some(tx);
+            receiver = Some(rx);
+        }
+        req.async_dispatch.as_ref().cloned()
+    };
+    if let Some(receiver) = receiver {
+        let handle = key;
+        if let Err(error) = std::thread::Builder::new()
+            .name("bloader-cape-callback".into())
+            .spawn(move || unsafe { dispatch_replay_callbacks(handle as H, request_id, receiver) })
+        {
+            warn_log(&format!("synthetic cape callback dispatcher unavailable: {error}"));
+            let mut state = tables().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(req) = state.requests.get_mut(&key).filter(|r| r.id == request_id) {
+                req.async_dispatch = None;
+            }
+            return false;
+        }
+    }
+    sender.is_some_and(|queue| queue.send(notice).is_ok())
+}
+unsafe fn dispatch_replay_callbacks(h: H, request_id: u64, receiver: mpsc::Receiver<AsyncNotice>) {
     while let Ok(event) = receiver.recv() {
+        // A WinHTTP handle may be closed and its numerical value reused. Never
+        // call an old callback on a closed or subsequently recycled handle.
+        let active = tables().lock().unwrap_or_else(|e| e.into_inner())
+            .requests.get(&state_key(h))
+            .is_some_and(|r| r.id == request_id && !r.closing && r.async_dispatch.is_some());
+        if !active { break; }
         match event {
+            AsyncNotice::SendComplete { context } => {
+                notify_game(h, context, STATUS_SEND_COMPLETE, ptr::null_mut(), 0);
+            }
+            AsyncNotice::Headers { context } => {
+                invoke_headers(h, context);
+            }
             AsyncNotice::Read { context, buffer, len } => {
                 notify_game(h, context, STATUS_READ, buffer as H, len);
             }
@@ -1374,7 +1430,7 @@ unsafe fn dispatch_replay_callbacks(h: H, receiver: mpsc::Receiver<AsyncNotice>)
         }
     }
 }
-unsafe fn finish_async(h: H, completed: bool) -> Option<mpsc::Receiver<AsyncNotice>> {
+unsafe fn finish_async(h: H, completed: bool) -> Option<(u64, mpsc::Receiver<AsyncNotice>)> {
     let Some(runtime) = RUNTIME.get() else { return None };
     let taken = {
         let mut state = tables().lock().unwrap_or_else(|e| e.into_inner());
@@ -1484,7 +1540,7 @@ unsafe fn finish_async(h: H, completed: bool) -> Option<mpsc::Receiver<AsyncNoti
         if let Some(req) = state.requests.get_mut(&state_key(h)) {
             req.replay = Some(replay);
             req.async_prefetch_done = true;
-            req.async_dispatch = Some(sender);
+            req.async_dispatch = Some(sender.clone());
             true
         } else {
             false
@@ -1493,8 +1549,10 @@ unsafe fn finish_async(h: H, completed: bool) -> Option<mpsc::Receiver<AsyncNoti
     if !attached {
         return None;
     }
-    invoke_headers(h, context);
-    Some(receiver)
+    // The original ReadData must unwind before the game's headers callback.
+    // Injecting headers here inline recursively entered libHttpClient.
+    let _ = sender.send(AsyncNotice::Headers { context });
+    Some((id, receiver))
 }
 unsafe extern "system" fn status_bridge(h: H, context: usize, status: u32, info: H, len: u32) {
     if status == STATUS_HEADERS {
@@ -1645,8 +1703,9 @@ unsafe extern "system" fn on_receive(h: H, reserved: H) -> B {
             .map(|r| (r.async_session, r.callback_context))
     };
     if let Some((async_req, context)) = synthetic {
-        if async_req {
-            invoke_headers(h, context);
+        if async_req && !queue_synthetic_notice(h, AsyncNotice::Headers { context }) {
+            SetLastError(8); // ERROR_NOT_ENOUGH_MEMORY
+            return 0;
         }
         return 1;
     }
@@ -1876,15 +1935,20 @@ unsafe extern "system" fn on_read(h: H, buffer: H, cap: u32, out: *mut u32) -> B
             ));
         }
         if async_req {
-            let queued = dispatch.is_some_and(|sender| {
-                sender.send(AsyncNotice::Read {
-                    context: ctx,
-                    buffer: buffer as usize,
-                    len: count,
-                }).is_ok()
-            });
+            let notice = AsyncNotice::Read {
+                context: ctx,
+                buffer: buffer as usize,
+                len: count,
+            };
+            let queued = if let Some(sender) = dispatch {
+                sender.send(notice).is_ok()
+            } else {
+                queue_synthetic_notice(h, notice)
+            };
             if !queued {
-                notify_game(h, ctx, STATUS_READ, buffer, count);
+                warn_log("cape replay read completion could not be queued");
+                SetLastError(8);
+                return 0;
             }
         }
         return 1;
@@ -1914,12 +1978,16 @@ unsafe extern "system" fn on_available(h: H, out: *mut u32) -> B {
             *out = count;
         }
         if async_req {
-            let queued = dispatch.is_some_and(|sender| {
-                sender.send(AsyncNotice::Available { context: ctx, len: count }).is_ok()
-            });
+            let notice = AsyncNotice::Available { context: ctx, len: count };
+            let queued = if let Some(sender) = dispatch {
+                sender.send(notice).is_ok()
+            } else {
+                queue_synthetic_notice(h, notice)
+            };
             if !queued {
-                let mut local = count;
-                notify_game(h, ctx, STATUS_AVAILABLE, &mut local as *mut u32 as H, 4);
+                warn_log("cape replay available completion could not be queued");
+                SetLastError(8);
+                return 0;
             }
         }
         return 1;
@@ -2105,9 +2173,13 @@ unsafe extern "system" fn on_close(h: H) -> B {
         state.callbacks.remove(&state_key(h));
     }
     let gate = {
-        let state = tables().lock().unwrap_or_else(|e| e.into_inner());
-        state.requests.get(&state_key(h))
-            .and_then(|req| req.capture.as_ref())
+        let mut state = tables().lock().unwrap_or_else(|e| e.into_inner());
+        state.requests.get_mut(&state_key(h))
+            .and_then(|req| {
+                req.closing = true;
+                req.async_dispatch = None;
+                req.capture.as_ref()
+            })
             .map(|capture| {
                 capture.cancelled.store(true, Ordering::Release);
                 Arc::clone(&capture.io_guard)
