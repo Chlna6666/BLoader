@@ -176,6 +176,12 @@ pub fn install(config: &Config, game_dir: &Path) -> bool {
         return false;
     }
 
+    // Prepare the immutable local cape catalog before exposing any network
+    // hook. The wardrobe never waits for a ZIP scan or image decoding from a
+    // WinHTTP callback, and every synthetic response reads only cached bytes.
+    // Missing thumbnails can be generated separately in a future cache job.
+    winhttp::prepare_local_resources();
+
     if let Err(error) = unsafe { winhttp::install() } {
         logging::scoped_error_message(
             "cosmetics",
@@ -184,28 +190,14 @@ pub fn install(config: &Config, game_dir: &Path) -> bool {
         HOOK_INSTALLED.store(false, Ordering::SeqCst);
         return false;
     }
-    logging::scoped_debug_message(
+    logging::scoped_info_message(
         "cosmetics",
         &format!(
-            "WinHTTP hooks installed before OEP; config_source={config_source} texture_mode={}",
+            "local cape resources ready; WinHTTP hooks installed before OEP; config_source={config_source} texture_mode={}",
             texture_mode.as_str()
         ),
     );
-
-    // 披风扫描（文件 IO + 图片解码）放到后台线程，不阻塞启动序列。
-    match std::thread::Builder::new()
-        .name("bloader-cosmetics".to_string())
-        .spawn(winhttp::worker_startup)
-    {
-        Ok(_) => true,
-        Err(error) => {
-            logging::scoped_warn_message(
-                "cosmetics",
-                &format!("cape scan worker failed to start: {error}"),
-            );
-            true
-        }
-    }
+    true
 }
 
 /// config.json 热重载扇出点（Config::apply_update 调用）。
