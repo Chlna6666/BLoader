@@ -227,7 +227,7 @@ unsafe fn prepare_premain_preloads(
     // live in BLoader/mods/. A PreLoader failure must not prevent independent
     // BLoader mod-preload initialization, and must never trigger a fallback
     // direct LoadLibrary of LeviLamina or one of its mods.
-    let loaded_summary = crate::loader::load_native_preloads_in_dllmain(&game_dir);
+    let loaded_summary = crate::loader::load_mod_preloads_before_oep(&game_dir);
     crate::platform::logging::write_bootstrap_marker(&format!(
         "bootstrap.native_preload.premain.done discovered={} attempted={} verified={} failed={} required_failed={} execution={execution_mode}",
         loaded_summary.discovered,
