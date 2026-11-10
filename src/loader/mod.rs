@@ -153,31 +153,91 @@ struct NativeLoadReport {
     elapsed_ms: u128,
 }
 
-pub unsafe fn load_mod_preloads_before_oep(game_dir: &Path) -> NativePreloadSummary {
-    let mods_dir = bloader_mods_dir(game_dir);
-    let mut summary = NativePreloadSummary::default();
+const BLOADER_MANIFEST: &str = "bloader.json";
 
-    let Ok(entries) = fs::read_dir(&mods_dir) else {
-        logging::write_bootstrap_marker(&format!(
-            "native-load discovery_failed phase=dllmain path={} reason=mods_dir_unavailable",
-            mods_dir.display()
-        ));
-        let _ = NATIVE_PRELOAD_SUMMARY.set(summary);
-        return summary;
-    };
-
-    let mut native_preloads = Vec::new();
+/// BLoader metadata is not a LeviLamina manifest. For historic installations
+/// sharing mods/, rename ONLY the JSON descriptor; DLLs/directories are never
+/// moved, removed or re-injected. Run before PreLoader starts its own scan.
+pub fn normalize_shared_mod_manifests(game_dir: &Path) {
+    if !file_io_policy::writes_allowed() {
+        return;
+    }
+    let shared_root = game_dir.join("mods");
+    let Ok(entries) = fs::read_dir(&shared_root) else { return };
     for entry in entries.flatten() {
-        let package_dir = entry.path();
-        if !package_dir.is_dir() {
+        let package = entry.path();
+        if !package.is_dir() {
             continue;
         }
-
-        let manifest_path = package_dir.join("manifest.json");
-        if !manifest_path.exists() {
+        let legacy = package.join("manifest.json");
+        if !legacy.is_file() {
             continue;
         }
+        let Ok(bytes) = fs::read(&legacy) else { continue };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { continue };
+        let kind = value.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+        let owned = matches!(
+            kind,
+            "mod-preload" | "mod-native" | "hot-native" | "hot-inject"
+        ) || (kind == "preloader-bootstrap"
+            && package.file_name().and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("PreLoader"))
+            && value.get("entry").and_then(serde_json::Value::as_str)
+                == Some("PreLoader.dll"));
+        if !owned {
+            continue;
+        }
+        let sidecar = package.join(BLOADER_MANIFEST);
+        if sidecar.exists() {
+            logging::write_bootstrap_marker(&format!(
+                "manifest ownership conflict: {} and {} both exist; no files changed",
+                legacy.display(), sidecar.display()
+            ));
+            continue;
+        }
+        match fs::rename(&legacy, &sidecar) {
+            Ok(()) => logging::write_bootstrap_marker(&format!(
+                "BLoader manifest normalized type={kind} from={} to={} (DLL untouched)",
+                legacy.display(), sidecar.display()
+            )),
+            Err(error) => logging::write_bootstrap_marker(&format!(
+                "BLoader manifest normalization failed path={} error={error}",
+                legacy.display()
+            )),
+        }
+    }
+}
 
+fn packaged_manifest_path(package: &Path, shared: bool) -> Option<PathBuf> {
+    let sidecar = package.join(BLOADER_MANIFEST);
+    if sidecar.is_file() {
+        return Some(sidecar);
+    }
+    if shared {
+        return None;
+    }
+    let manifest = package.join("manifest.json");
+    manifest.is_file().then_some(manifest)
+}
+
+pub unsafe fn load_mod_preloads_before_oep(game_dir: &Path) -> NativePreloadSummary {
+    let mut summary = NativePreloadSummary::default();
+    let mut native_preloads = Vec::new();
+    // The shared mods/ directory accepts only BLoader sidecars. Do not let
+    // LeviLamina consume our private mod-preload type from manifest.json.
+    for (mods_dir, shared) in [
+        (bloader_mods_dir(game_dir), false),
+        (game_dir.join("mods"), true),
+    ] {
+        let Ok(entries) = fs::read_dir(&mods_dir) else { continue };
+        for entry in entries.flatten() {
+            let package_dir = entry.path();
+            if !package_dir.is_dir() {
+                continue;
+            }
+            let Some(manifest_path) = packaged_manifest_path(&package_dir, shared) else {
+                continue;
+            };
         let text = match fs::read_to_string(&manifest_path) {
             Ok(text) => text,
             Err(error) => {
@@ -277,6 +337,7 @@ pub unsafe fn load_mod_preloads_before_oep(game_dir: &Path) -> NativePreloadSumm
         };
         let _ = diagnostics_identity(&preload);
         native_preloads.push(preload);
+        }
     }
 
     native_preloads.sort_by(|a, b| {
@@ -995,9 +1056,10 @@ pub fn native_success_notification_message() -> Option<String> {
 /// The separate mod-preload phase has already run on the gated startup thread.
 pub unsafe fn load_mods(game_dir: &Path) {
     let mods_dir = ensure_mods_dir(game_dir);
-    let discovered = discover_mods(&mods_dir);
+    let mut discovered = discover_mods(&mods_dir, false);
+    discovered.hot.extend(discover_mods(&game_dir.join("mods"), true).hot);
     if discovered.hot.is_empty() {
-        logging::info_message("No BLoader startup or delayed mods found.");
+        logging::info_message("No post-OEP BLoader mods found (mod-preload phase already completed).");
         return;
     }
     spawn_hot_mod_loader(discovered.hot);
@@ -1022,7 +1084,7 @@ fn ensure_mods_dir(game_dir: &Path) -> PathBuf {
     mods_dir
 }
 
-fn discover_mods(mods_dir: &Path) -> DiscoveredMods {
+fn discover_mods(mods_dir: &Path, shared: bool) -> DiscoveredMods {
     let mut discovered = DiscoveredMods::default();
     let entries: Vec<_> = fs::read_dir(mods_dir)
         .ok()
@@ -1034,23 +1096,20 @@ fn discover_mods(mods_dir: &Path) -> DiscoveredMods {
     for entry in entries {
         let entry_path = entry.path();
         if entry_path.is_dir() {
-            discover_packaged_mod(&entry_path, &mut discovered);
+            discover_packaged_mod(&entry_path, shared, &mut discovered);
             continue;
         }
-
-        if entry_path.is_file() {
+        if !shared && entry_path.is_file() {
             discover_loose_dll(mods_dir, &entry_path, &mut discovered);
         }
     }
-
     discovered
 }
 
-fn discover_packaged_mod(entry_path: &Path, discovered: &mut DiscoveredMods) {
-    let manifest_path = entry_path.join("manifest.json");
-    if !manifest_path.exists() {
+fn discover_packaged_mod(entry_path: &Path, shared: bool, discovered: &mut DiscoveredMods) {
+    let Some(manifest_path) = packaged_manifest_path(entry_path, shared) else {
         return;
-    }
+    };
 
     let Ok(text) = fs::read_to_string(&manifest_path) else {
         logging::warn_message(&format!(
@@ -1536,6 +1595,23 @@ mod tests {
         resolve_hot_ready_level, MOD_TYPE_MOD_NATIVE, MOD_TYPE_MOD_PRELOAD,
     };
     use crate::bootstrap::runtime_ready::ReadyLevel;
+
+    #[test]
+    fn shared_loader_manifest_is_not_visible_to_levilamina() {
+        let root = std::env::temp_dir().join(format!(
+            "bloader-sidecar-test-{}", std::process::id()
+        ));
+        let package = root.join("mods").join("raylith");
+        std::fs::create_dir_all(&package).unwrap();
+        let old = package.join("manifest.json");
+        std::fs::write(&old, br#"{"name":"raylith","entry":"raylith.dll","type":"mod-preload"}"#).unwrap();
+        normalize_shared_mod_manifests(&root);
+        assert!(!old.exists());
+        let sidecar = package.join("bloader.json");
+        assert!(sidecar.is_file());
+        assert_eq!(packaged_manifest_path(&package, true), Some(sidecar));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn bloader_mods_are_outside_levilamina_mod_root() {
