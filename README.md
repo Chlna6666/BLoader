@@ -143,14 +143,14 @@ BLoader 的 BMCBL 内建集成（Cosmetics、文件重定向、XUser Bridge）�
 
 | 类型 | 负责方 | 加载阶段 | 目录 |
 | --- | --- | --- | --- |
-| `preloader-bootstrap` | BLoader 引导器 | Minecraft OEP 之前，优先装载 PreLoader.dll | `BLoader/PreLoader/` |
+| `preloader-bootstrap` | BLoader 引导器 | Minecraft OEP 之前，优先装载 PreLoader.dll | `mods/PreLoader/` |
 | `preload-native` | 官方 PreLoader | PreLoader 扫描期间、LeviLamina 初始化前 | `mods/` |
 | `native` | LeviLamina ModRegistrar | LeviLamina 初始化期间 | `mods/` |
 | `mod-preload` | BLoader Native Loader | Minecraft OEP 之前 | `BLoader/mods/` |
 | `mod-native` | BLoader Native Loader | Minecraft OEP 释放后（process ready） | `BLoader/mods/` |
 | `hot-native` / `hot-inject` | BLoader Native Loader | 按窗口就绪条件及延迟注入 | `BLoader/mods/` |
 
-其中 `preloader-bootstrap` 是 BMCBL 安装在 `BLoader/PreLoader/manifest.json` 的引导**元数据**，不是由 PreLoader 或 LeviLamina 注册的 Mod 类型。不要将 PreLoader 自身置于 `mods/PreLoader` 并赋予 `preload-native`，否则在某些实现中可能被 PreLoader 再次扫描。BLoader 只执行一次 PreLoader 的 `LoadLibraryW`，由 PreLoader 扫描 `mods/` 并装载 LeviLamina，然后 LeviLamina 加载其所属 Mod。
+其中 `preloader-bootstrap` 是 BMCBL 写入 `mods/PreLoader/manifest.json` 的引导**元数据**，不属于 PreLoader 的 `preload-native` 或 LeviLamina 的 `native`。PreLoader 本体保持在原位置，**不迁移目录**；BLoader 只对 `mods/PreLoader/PreLoader.dll` 执行一次 `LoadLibraryW`，随后 PreLoader 扫描 `mods/` 并加载 LeviLamina，再由 LeviLamina 管理自身 Mod。BLoader 自有的 `mod-preload` / `mod-native` 位于 `BLoader/mods/`，不交给 PreLoader 处理。
 
 BLoader 的 `mod-preload` 可在游戏执行 OEP 前安装需要的启动期 Hook；`mod-native` 在 OEP 已释放后自动加载，适合普通本地原生扩展。**不会**将 BLoader 的新类型注册到 LeviLamina，也不再识别旧的 `bloader-native` 作为别名。Loose DLL 默认自动打包为 `mod-native`，不会悄悄提前执行。
 

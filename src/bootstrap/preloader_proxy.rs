@@ -61,11 +61,11 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
     candidates.sort_by(|a, b| a.path.cmp(&b.path));
 
     if candidates.is_empty() {
-        let legacy_dir = game_dir.join("mods").join("PreLoader");
-        if legacy_dir.join(PRELOADER_DLL).is_file() {
-            logging::scoped_error_message(
+        let dir = game_dir.join("mods").join("PreLoader");
+        if dir.join(PRELOADER_DLL).is_file() {
+            logging::scoped_warn_message(
                 "preloader",
-                "Legacy mods/PreLoader/PreLoader.dll is unsafe: it may be scanned as a preload-native Mod by PreLoader itself. Move the whole package to BLoader/PreLoader/.",
+                "PreLoader.dll exists but bootstrap manifest is missing/invalid: expected mods/PreLoader/manifest.json type=preloader-bootstrap. Reinstall PreLoader from BMCBL; the DLL is not deleted or moved.",
             );
         }
         if logging::console_is_ready() {
@@ -231,21 +231,32 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
     }
 }
 
-/// Bootstrap is not a Mod. Keep PreLoader itself outside mods/, because
-/// PreLoader scans that directory for preload-native entries (including
-/// LeviLamina), and would otherwise see its own DLL.
+/// BLoader directly owns the bootstrap at mods/PreLoader/PreLoader.dll.
+/// Its manifest type is *preloader-bootstrap*, which the PreLoader Mod
+/// scanner does not consider preload-native. Never move or delete this
+/// directory while Minecraft is starting.
 fn discover_candidates(game_dir: &Path) -> Vec<Candidate> {
-    let dir = game_dir.join("BLoader").join("PreLoader");
+    let dir = game_dir.join("mods").join("PreLoader");
     let path = dir.join(PRELOADER_DLL);
     if !path.is_file() {
         return Vec::new();
     }
-    let version = fs::read_to_string(dir.join("manifest.json"))
+    let manifest = fs::read_to_string(dir.join("manifest.json"))
         .ok()
-        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
-        .and_then(|manifest| manifest.get("version")
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned));
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    let is_bootstrap = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind == PRELOAD_TYPE);
+    if !is_bootstrap {
+        return Vec::new();
+    }
+    let version = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.get("version"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
     vec![Candidate {
         id: "PreLoader".to_string(),
         name: "PreLoader".to_string(),
