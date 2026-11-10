@@ -319,7 +319,11 @@ fn replay_console_message_at(level: &str, scope: &str, message: &str, timestamp_
 
 pub fn captured_mod_output(mod_name: &str, mod_id: &str, stream: &str, message: &str) {
     let sanitized = sanitize_terminal_text(message);
-    if let Some(external) = parse_external_structured_line(&sanitized) {
+    // PreLoader's active load scope is only a fallback for unstructured
+    // output. A real LeviLamina console header must override that scope.
+    if let Some(external) = parse_external_structured_line(&sanitized)
+        .or_else(|| parse_levilamina_console_line(&sanitized))
+    {
         // The same logical line usually also arrives through the console hook
         // or the latest.log relay; route it through the shared forwarded-record
         // path so the dedupe journal sees it and the console shows it once.
