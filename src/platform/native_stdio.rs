@@ -1,8 +1,10 @@
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::Read;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 
@@ -75,13 +77,15 @@ struct CrtRedirect {
     _bindings: Vec<CrtBinding>,
 }
 
-static PENDING_LINES: OnceLock<Mutex<Vec<CapturedLine>>> = OnceLock::new();
+static PENDING_LINES: OnceLock<Mutex<VecDeque<CapturedLine>>> = OnceLock::new();
+static EARLY_LINES_DROPPED: AtomicUsize = AtomicUsize::new(0);
+const EARLY_LINES_LIMIT: usize = 4096;
 static PROCESS_CAPTURE_INSTALLED: OnceLock<()> = OnceLock::new();
 static ACTIVE_CAPTURES: OnceLock<Mutex<Vec<ActiveCaptureSnapshot>>> = OnceLock::new();
 static KEPT_WRITE_FILES: OnceLock<Mutex<Vec<File>>> = OnceLock::new();
 
-fn pending_lines() -> &'static Mutex<Vec<CapturedLine>> {
-    PENDING_LINES.get_or_init(|| Mutex::new(Vec::new()))
+fn pending_lines() -> &'static Mutex<VecDeque<CapturedLine>> {
+    PENDING_LINES.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
 fn active_captures() -> &'static Mutex<Vec<ActiveCaptureSnapshot>> {
@@ -202,6 +206,14 @@ pub fn flush_pending() {
     for line in captured {
         emit_line(line.identity, &line.stream, &line.line);
     }
+    let dropped = EARLY_LINES_DROPPED.swap(0, Ordering::Relaxed);
+    if dropped > 0 {
+        logging::scoped_warn_message(
+            "stdio-capture",
+            &format!("early stdio backlog exceeded {} lines; {} oldest lines omitted",
+                EARLY_LINES_LIMIT, dropped),
+        );
+    }
 }
 
 fn create_memory_pipe() -> Option<(File, File)> {
@@ -277,17 +289,28 @@ fn drain_lines(pending: &mut Vec<u8>, identity: Option<ModIdentity>, stream: &st
 }
 
 fn queue_or_emit(identity: Option<ModIdentity>, stream: &str, line: &str) {
+    // PreLoader can print unstructured lines during its own LoadLibrary chain.
+    // Preserve that owning Mod while buffering early messages, instead of
+    // relabeling them StdIO after the runtime has finished initializing.
+    let identity = identity.or_else(|| {
+        let active = active_captures().try_lock().ok()?;
+        (active.len() == 1).then(|| active[0].identity.clone())
+    });
     if logging::is_ready() {
         emit_line(identity, stream, line);
     } else {
-        pending_lines()
+        let mut pending = pending_lines()
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(CapturedLine {
-                identity,
-                stream: stream.to_string(),
-                line: line.to_string(),
-            });
+            .unwrap_or_else(|error| error.into_inner());
+        if pending.len() == EARLY_LINES_LIMIT {
+            pending.pop_front();
+            EARLY_LINES_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        pending.push_back(CapturedLine {
+            identity,
+            stream: stream.to_string(),
+            line: line.to_string(),
+        });
     }
 }
 

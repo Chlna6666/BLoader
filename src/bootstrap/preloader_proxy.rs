@@ -7,7 +7,7 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows::core::PCWSTR;
 
-use crate::platform::{logging, mod_diagnostics};
+use crate::platform::{logging, mod_diagnostics, native_stdio};
 
 const PRELOAD_TYPE: &str = "preload";
 const LEVILAMINA_PRELOAD_TYPE: &str = "preload-native";
@@ -186,8 +186,12 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
 
     let load_result = {
         let _scope = mod_diagnostics::enter_scope(&identity, "LoadLibrary:preloader_priority_early");
-        let wide = wide_null(expected.as_os_str());
-        LoadLibraryW(PCWSTR(wide.as_ptr()))
+        unsafe {
+            native_stdio::capture_library_load(&identity, "preloader_priority_early", || {
+                let wide = wide_null(expected.as_os_str());
+                LoadLibraryW(PCWSTR(wide.as_ptr()))
+            })
+        }
     };
     // Preserve the runtime-owned unhandled exception filter installed by
     // PreLoader/LeviLamina/CrashLogger rather than overriding it here.
