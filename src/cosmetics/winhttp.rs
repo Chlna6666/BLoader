@@ -1532,6 +1532,12 @@ unsafe fn finish_async(h: H, completed: bool) -> Option<(u64, mpsc::Receiver<Asy
                         "route={}: action=replace_json async=true original_bytes={original_len} replacement_bytes={replacement_len} encoding_removed={strip_encoding}",
                         rule.name
                     ));
+                    if matches!(rule.mode, Mode::AppendArray | Mode::PersonaProfile) {
+                        info_log(&format!(
+                            "WARDROBE_RESPONSE_REPLACED route={} request={} local_cape_items={} bytes={replacement_len}",
+                            rule.name, id, local_capes::count()
+                        ));
+                    }
                     debug_log(&format!(
                         "request #{id}: RESPONSE_REPLACED successfully bytes={replacement_len} route={}",
                         rule.name
@@ -1546,6 +1552,12 @@ unsafe fn finish_async(h: H, completed: bool) -> Option<(u64, mpsc::Receiver<Asy
                     debug_log(&format!(
                         "request #{id}: RESPONSE_UNCHANGED duplicate_or_empty"
                     ));
+                    if rule.name == "dressing_room_capes" && local_capes::count() != 0 {
+                        warn_log(&format!(
+                            "WARDROBE_RESPONSE_UNCHANGED route={} request={} local_cape_items={} (check schema and item ids)",
+                            rule.name, id, local_capes::count()
+                        ));
+                    }
                 }
                 Err(e) => {
                     logger(&format!(
@@ -1555,6 +1567,12 @@ unsafe fn finish_async(h: H, completed: bool) -> Option<(u64, mpsc::Receiver<Asy
                     debug_log(&format!(
                         "request #{id}: RESPONSE_REPLACE_FAILED; original bytes retained"
                     ));
+                    if matches!(rule.mode, Mode::AppendArray | Mode::PersonaProfile) {
+                        warn_log(&format!(
+                            "WARDROBE_RESPONSE_REPLACE_FAILED route={} request={} local_cape_items={} error={e}",
+                            rule.name, id, local_capes::count()
+                        ));
+                    }
                 }
             }
         }
@@ -1876,6 +1894,12 @@ unsafe extern "system" fn on_receive(h: H, reserved: H) -> B {
                     "route={}: action=replace_json async=false original_bytes={original_len} replacement_bytes={replacement_len} encoding_removed={strip_encoding}",
                     rule.name
                 ));
+                if matches!(rule.mode, Mode::AppendArray | Mode::PersonaProfile) {
+                    info_log(&format!(
+                        "WARDROBE_RESPONSE_REPLACED route={} request={} local_cape_items={} bytes={replacement_len}",
+                        rule.name, request_id, local_capes::count()
+                    ));
+                }
                 debug_log(&format!(
                     "request #{request_id}: RESPONSE_REPLACED successfully bytes={replacement_len} route={}",
                     rule.name
@@ -1955,6 +1979,11 @@ unsafe extern "system" fn on_read(h: H, buffer: H, cap: u32, out: *mut u32) -> B
             logger(&format!(
                 "request #{id}: route={route} action=client_read_complete delivered_bytes={delivered}"
             ));
+            if route.starts_with("dressing_room_capes") || route.starts_with("local_persona_profile") {
+                info_log(&format!(
+                    "WARDROBE_RESPONSE_DELIVERED request={id} route={route} bytes={delivered}"
+                ));
+            }
             debug_log(&format!(
                 "request #{id}: CLIENT_CONSUMED_OVERLAY completely delivered_bytes={delivered}"
             ));
