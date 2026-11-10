@@ -274,19 +274,31 @@ unsafe fn bootstrap(
     );
 
     if execution_mode == "oep-gated-startup-thread" {
-        schedule_post_oep_runtime_io(config.enable_debug_console, preloader_summary.active());
+        schedule_post_oep_runtime_io(
+            config.enable_debug_console,
+            preloader_summary.discovered > 0,
+        );
     } else {
         if config.enable_debug_console {
-            unsafe { crate::platform::console::init_console(); }
+            if preloader_summary.discovered > 0 {
+                // A failed native runtime may still have CRT state or running
+                // logger threads. Do not rebind stdio even on failure.
+                unsafe {
+                    crate::platform::console::init_console_window_early();
+                    crate::platform::console::activate_console_logging();
+                }
+            } else {
+                unsafe { crate::platform::console::init_console(); }
+            }
             crate::platform::logging::write_bootstrap_marker("bootstrap.console.ready");
         }
-        if !preloader_summary.active() {
+        if preloader_summary.discovered == 0 {
             crate::platform::native_stdio::install_process_capture();
         }
     }
 
     crate::platform::native_stdio::flush_pending();
-    if !preloader_summary.active() {
+    if preloader_summary.discovered == 0 {
         unsafe { crate::game::game_log::install(); }
     }
     crate::bootstrap::xuser_bridge::publish_pending_logs();
@@ -438,7 +450,7 @@ unsafe fn bootstrap(
 
 const POST_OEP_RUNTIME_IO_DELAY_MS: u64 = 1_500;
 
-fn schedule_post_oep_runtime_io(enable_debug_console: bool, preloader_active: bool) {
+fn schedule_post_oep_runtime_io(enable_debug_console: bool, preloader_present: bool) {
     crate::platform::logging::write_bootstrap_marker(&format!(
         "bootstrap.runtime_io.deferred console=after-oep-immediate stdio=oep+{}ms console_enabled={}",
         POST_OEP_RUNTIME_IO_DELAY_MS, enable_debug_console,
@@ -458,7 +470,14 @@ fn schedule_post_oep_runtime_io(enable_debug_console: bool, preloader_active: bo
             }
 
             if enable_debug_console {
-                unsafe { crate::platform::console::init_console(); }
+                if preloader_present {
+                    unsafe {
+                        crate::platform::console::init_console_window_early();
+                        crate::platform::console::activate_console_logging();
+                    }
+                } else {
+                    unsafe { crate::platform::console::init_console(); }
+                }
                 crate::platform::logging::write_bootstrap_marker(
                     "post-oep.console.ready delay_ms=0 stdio_pending=true",
                 );
@@ -470,7 +489,7 @@ fn schedule_post_oep_runtime_io(enable_debug_console: bool, preloader_active: bo
             // process-wide _dup2/_setvbuf/_flushall binding can race with
             // asynchronous native logger threads and corrupt their streams.
             // Use the external latest.log relay instead in delegated mode.
-            if !preloader_active {
+            if !preloader_present {
                 unsafe { crate::platform::native_stdio::install_process_capture(); }
                 crate::platform::native_stdio::flush_pending();
             }
@@ -479,7 +498,7 @@ fn schedule_post_oep_runtime_io(enable_debug_console: bool, preloader_active: bo
             crate::platform::logging::write_bootstrap_marker(&format!(
                 "post-oep.runtime_io.ready delay_ms={} console={} stdio={}",
                 POST_OEP_RUNTIME_IO_DELAY_MS, enable_debug_console,
-                if preloader_active { "delegated-to-PreLoader" } else { "process-crt" },
+                if preloader_present { "reserved-for-PreLoader" } else { "process-crt" },
             ));
         }) {
         Ok(_) => crate::platform::logging::write_bootstrap_marker(
