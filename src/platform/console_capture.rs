@@ -88,18 +88,24 @@ pub fn install() {
             let Some(target) = (unsafe { GetProcAddress(kernel, PCSTR(name.as_ptr())) }) else { continue };
             let target = target as *const () as *mut c_void;
             match unsafe { MinHook::create_hook(target, replacement) } {
-                Ok(trampoline) => match unsafe { MinHook::enable_hook(target) } {
-                    Ok(()) => {
-                        original.store(trampoline as usize, Ordering::Release);
-                        installed += 1;
-                        break;
-                    }
-                    Err(error) => {
-                        let _ = unsafe { MinHook::remove_hook(target) };
-                        logging::scoped_warn_message(
-                            "console-capture",
-                            &format!("enable hook failed: {error:?}"),
-                        );
+                Ok(trampoline) => {
+                    // Publish the trampoline BEFORE enabling the detour.
+                    // Other native loader/logger threads may already emit
+                    // WriteConsole/WriteFile concurrently at startup.
+                    original.store(trampoline as usize, Ordering::Release);
+                    match unsafe { MinHook::enable_hook(target) } {
+                        Ok(()) => {
+                            installed += 1;
+                            break;
+                        }
+                        Err(error) => {
+                            let _ = unsafe { MinHook::remove_hook(target) };
+                            original.store(0, Ordering::Release);
+                            logging::scoped_warn_message(
+                                "console-capture",
+                                &format!("enable hook failed: {error:?}"),
+                            );
+                        }
                     }
                 },
                 Err(error) => logging::scoped_warn_message(
