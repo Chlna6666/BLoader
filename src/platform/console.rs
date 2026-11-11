@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::platform::{build_info, console_branding, file_io_policy, i18n, logging};
-use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE, RECT};
+use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, WriteFile,
 };
@@ -22,7 +22,7 @@ use windows::Win32::System::Console::{
     STD_OUTPUT_HANDLE, SetConsoleCursorPosition, SetConsoleMode, SetConsoleTitleW, SetStdHandle,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DeleteMenu, GetSystemMenu, GetWindowRect, MF_BYCOMMAND, SC_CLOSE, SW_SHOW, ShowWindow,
+    DeleteMenu, GetSystemMenu, MF_BYCOMMAND, SC_CLOSE, SW_SHOW, ShowWindow,
 };
 use windows::core::PCWSTR;
 
@@ -31,7 +31,6 @@ const BMCBL_TERMINAL_HOST_PID_ENV: &str = "BMCBL_TERMINAL_HOST_PID";
 static CONSOLE_WINDOW_READY: AtomicBool = AtomicBool::new(false);
 static CONSOLE_LOGGING_READY: AtomicBool = AtomicBool::new(false);
 static CONSOLE_STDIO_READY: AtomicBool = AtomicBool::new(false);
-static CONSOLE_RESIZE_MONITOR: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -148,7 +147,8 @@ pub unsafe fn init_console_window_early() {
             console_has_vt(h_conout),
             true,
         );
-        start_console_resize_monitor();
+        // Console Host / Windows Terminal already owns window moves and reflow.
+        // Never repaint the entire screen here: doing so destroys scrollback.
     }
 
     logging::write_bootstrap_marker(&format!(
@@ -478,65 +478,6 @@ fn replay_mod_inventory() {
 pub fn publish_runtime_state() {
     replay_pre_main_load_state();
     replay_mod_inventory();
-}
-
-fn start_console_resize_monitor() {
-    if CONSOLE_RESIZE_MONITOR.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let _ = thread::Builder::new()
-        .name("bloader-console-resize".to_string())
-        .spawn(|| {
-            let handle = open_conout();
-            if handle.is_invalid() {
-                return;
-            }
-            let mut last = (visible_geometry(handle), console_window_origin());
-            let mut candidate = None;
-            loop {
-                thread::sleep(Duration::from_millis(200));
-                let geometry = (visible_geometry(handle), console_window_origin());
-                let size = geometry.0;
-                if geometry == last || size.0 == 0 || size.1 == 0 {
-                    candidate = None;
-                    continue;
-                }
-                if candidate == Some(geometry) {
-                    last = geometry;
-                    candidate = None;
-                    // Both window moves and dimension changes can expose stale
-                    // ConHost pixel-art cells; repaint once the drag settles.
-                    logging::request_console_repaint(size.0, size.1);
-                } else {
-                    candidate = Some(geometry);
-                }
-            }
-        });
-}
-
-fn console_window_origin() -> Option<(i32, i32)> {
-    let window = unsafe { GetConsoleWindow() };
-    if window.0.is_null() {
-        return None;
-    }
-    let mut rect = RECT::default();
-    unsafe { GetWindowRect(window, &mut rect).ok()?; }
-    Some((rect.left, rect.top))
-}
-
-fn visible_geometry(handle: HANDLE) -> (usize, usize) {
-    if handle.is_invalid() {
-        return (80, 25);
-    }
-    unsafe {
-        let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
-        if GetConsoleScreenBufferInfo(handle, &mut info).is_ok() {
-            let width = i32::from(info.srWindow.Right) - i32::from(info.srWindow.Left) + 1;
-            let height = i32::from(info.srWindow.Bottom) - i32::from(info.srWindow.Top) + 1;
-            return (width.max(0) as usize, height.max(0) as usize);
-        }
-    }
-    (80, 25)
 }
 
 fn visible_columns(handle: HANDLE) -> usize {
