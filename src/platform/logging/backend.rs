@@ -843,11 +843,20 @@ fn flush_console_backlog() {
 /// Older entries are excluded by the process-start timestamp filter.
 const EXTERNAL_HISTORY_TAIL_BYTES: u64 = 4 * 1024 * 1024;
 
+/// LeviLamina's default FileSink writes logs/latest.log relative to the game
+/// directory. Resolve it once from the executable, not the process CWD:
+/// native mods may change the CWD after our relay starts.
+fn external_log_path() -> PathBuf {
+    crate::platform::utils::get_exe_directory()
+        .join("logs")
+        .join("latest.log")
+}
+
 fn external_history_start_offset() -> u64 {
     if !file_io_policy::writes_allowed() {
         return 0;
     }
-    let path = PathBuf::from("logs").join("latest.log");
+    let path = external_log_path();
     fs::metadata(path)
         .map(|metadata| metadata.len().saturating_sub(EXTERNAL_HISTORY_TAIL_BYTES))
         .unwrap_or(0)
@@ -857,7 +866,7 @@ fn start_external_log_relay(start_offset: u64) {
     if !file_io_policy::writes_allowed() || EXTERNAL_LOG_RELAY_STARTED.set(()).is_err() {
         return;
     }
-    let path = PathBuf::from("logs").join("latest.log");
+    let path = external_log_path();
     let _ = thread::Builder::new()
         .name("bloader-external-log-relay".to_string())
         .spawn(move || tail_external_structured_log(&path, start_offset));
