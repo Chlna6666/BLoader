@@ -294,8 +294,9 @@ fn report_external_capture_health() {
     let file_parsed = file_lines.saturating_sub(RELAY_UNPARSED.load(Ordering::Relaxed));
     let file_forwarded = FILE_RELAY_FORWARDED.load(Ordering::Relaxed);
     let status = format!(
-        "PreLoader log capture | native_hook={} native_fragments={native_fragments} native_lines={native_lines} file_lines={file_lines} file_parsed={file_parsed} file_forwarded={file_forwarded} log_path={} log_status={path_state}",
+        "PreLoader log capture | win32_hook={} crt_fwrite_hook={} native_fragments={native_fragments} native_lines={native_lines} file_lines={file_lines} file_parsed={file_parsed} file_forwarded={file_forwarded} log_path={} log_status={path_state}",
         crate::platform::console_capture::is_active(),
+        crate::platform::console_capture::crt_fwrite_capture_active(),
         path.display(),
     );
     if native_lines == 0 && file_forwarded == 0 {
