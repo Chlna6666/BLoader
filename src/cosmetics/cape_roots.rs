@@ -53,9 +53,26 @@ fn com_mojang_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-/// 解析披风包扫描根（按优先级排序，去重；调用方负责目录创建）。
+/// Find per-account GDK com.mojang roots without recursive filesystem scans.
+/// Each Users/<profile>/games/com.mojang is a distinct local resource root.
+fn profile_roots(data_root: &Path) -> Vec<PathBuf> {
+    let Ok(users) = std::fs::read_dir(data_root.join("Users")) else {
+        return Vec::new();
+    };
+    let mut candidates = users
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|ty| ty.is_dir()))
+        .map(|entry| entry.path().join("games").join("com.mojang"))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.truncate(128);
+    candidates
+}
+
+/// 解析披风包扫描根（按优先级排序，去重；不创建目标目录）。
 pub fn resolve_roots(config: &Config, game_dir: &Path) -> Vec<PathBuf> {
-    let _ = game_dir;
+    // Keep the data root anchored to this launcher instance.
     let mut roots = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut push = |path: PathBuf, seen: &mut std::collections::HashSet<String>| {
@@ -70,6 +87,9 @@ pub fn resolve_roots(config: &Config, game_dir: &Path) -> Vec<PathBuf> {
     if config.enable_redirection {
         if let Some(root) = file_redirection::redirection_root_path(config, game_dir) {
             push(root.join("Users\\Shared\\games\\com.mojang"), &mut seen);
+            for profile in profile_roots(&root) {
+                push(profile, &mut seen);
+            }
             push(root.join("games\\com.mojang"), &mut seen);
         }
     }
@@ -80,6 +100,17 @@ pub fn resolve_roots(config: &Config, game_dir: &Path) -> Vec<PathBuf> {
         // 只接受已存在的 com.mojang，避免在全新机器上凭空构造数据目录。
         if target.is_dir() {
             push(target, &mut seen);
+        }
+    }
+    // GDK keeps account-specific data under Users/<XUID>, not just Shared.
+    // Resolve these bases through the active redirection engine to avoid
+    // mixing the live game profile with another launcher's instance data.
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        for name in ["Minecraft Bedrock", "Minecraft Bedrock Preview"] {
+            let base = file_redirection::preview_redirect_target(&PathBuf::from(&appdata).join(name));
+            for profile in profile_roots(&base) {
+                push(profile, &mut seen);
+            }
         }
     }
 
@@ -104,6 +135,19 @@ mod tests {
             assert!(text.contains("com.mojang"), "{:?}", roots);
             assert!(!text.contains("mods"), "{:?}", roots);
         }
+    }
+
+    #[test]
+    fn discovers_account_specific_gdk_cape_roots() {
+        let base = std::env::temp_dir().join(format!(
+            "bloader-cape-profile-roots-{}", std::process::id()
+        ));
+        let path = base.join("Users").join("4173542688423936997").join("games").join("com.mojang");
+        std::fs::create_dir_all(&path).unwrap();
+        let roots = profile_roots(&base);
+        assert!(roots.contains(&path));
+        assert!(!roots.iter().any(|p| p.ends_with("capes")));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
