@@ -957,30 +957,11 @@ unsafe extern "system" fn on_send(
             ));
             (bytes.to_vec(), 200)
         } else {
-            // The virtual URL may carry a cache-busting query. Match only
-            // the path component, never allow the query into a file lookup.
-            let canonical = local_capes::canonical_asset_path(&path);
-            let loaded = RUNTIME
-                .get()
-                .map(|runtime| persona::load(&runtime.root, canonical));
-            match loaded {
-                Some(Ok(Some(resource))) => {
-                    logger(&format!(
-                        "legacy Persona ZIP found: {} ({} bytes)",
-                        resource.resource_uuid,
-                        resource.bytes.len()
-                    ));
-                    (resource.bytes, 200)
-                }
-                Some(Err(e)) => {
-                    logger(&format!("legacy Persona ZIP rejected: {e}"));
-                    (Vec::new(), 404)
-                }
-                _ => {
-                    logger("virtual local cape asset unavailable; no network request was sent");
-                    (Vec::new(), 404)
-                }
-            }
+            // All virtual Persona and thumbnail assets must have been
+            // registered in memory during the initial Shared/capes scan.
+            // Never probe the old standalone Cosmetics/overrides directory.
+            logger("virtual local cape asset unavailable; no network request was sent");
+            (Vec::new(), 404)
         };
         {
             let mut state = tables().lock().unwrap_or_else(|e| e.into_inner());
