@@ -26,31 +26,6 @@ const MAX_NATIVE: usize = 64 * 1024 * 1024;
 const MAX_PACK_MEMBERS: usize = 256;
 const MAX_SCAN_DEPTH: usize = 4;
 
-/// 生成 persona 包纹理的尺寸策略。
-/// - Canonical：任何 64x32 整数倍纹理按 alpha 加权块平均规范到 64x32（官方
-///   persona 披风规格；游戏角色披风几何按 64x32 采样，高分辨率会采到透明
-///   角落导致玩家身上不显示，鞘翅正常）。
-/// - Original：保留原始分辨率直通（仅 RGBA 归一化），供实验对比。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TextureMode {
-    Canonical,
-    Original,
-}
-impl TextureMode {
-    pub fn parse(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "original" | "passthrough" => Self::Original,
-            _ => Self::Canonical,
-        }
-    }
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Canonical => "canonical",
-            Self::Original => "original",
-        }
-    }
-}
-
 /// 读取一个披风包（ZIP 成员或解包文件夹）的统一视图，成员路径使用 `/` 分隔。
 struct PackFiles {
     members: BTreeMap<String, Vec<u8>>,
@@ -198,8 +173,8 @@ pub struct Registry {
     pub generated_persona_payloads: usize,
 }
 static REGISTRY: OnceLock<Registry> = OnceLock::new();
-pub fn initialize(roots: &[PathBuf], texture_mode: TextureMode, locale: &str) -> &'static Registry {
-    REGISTRY.get_or_init(|| Registry::scan(roots, texture_mode, locale))
+pub fn initialize(roots: &[PathBuf], locale: &str) -> &'static Registry {
+    REGISTRY.get_or_init(|| Registry::scan(roots, locale))
 }
 pub fn count() -> usize {
     REGISTRY.get().map_or(0, |r| r.items.len())
@@ -302,9 +277,8 @@ fn cape_compat_rgba(decoded: &RgbaImage) -> RgbaImage {
 fn persona_texture_png(
     original: &[u8],
     decoded: &RgbaImage,
-    mode: TextureMode,
 ) -> Result<(Vec<u8>, bool, (u32, u32)), String> {
-    if mode == TextureMode::Original || decoded.dimensions() == (64, 32) {
+    if decoded.dimensions() == (64, 32) {
         let (png, converted) = persona_rgba_png(original, decoded)?;
         return Ok((png, converted, decoded.dimensions()));
     }
@@ -839,7 +813,7 @@ fn pack_file(
     }
 }
 impl Registry {
-    pub fn scan(roots: &[PathBuf], texture_mode: TextureMode, locale: &str) -> Self {
+    pub fn scan(roots: &[PathBuf], locale: &str) -> Self {
         let mut reg = Self::default();
         let mut item_ids = HashSet::new();
         let mut asset_ids = HashSet::new();
@@ -907,7 +881,7 @@ impl Registry {
                     continue;
                 }
                 reg.discovered_packs += 1;
-                let result = Self::read_pack(&path, is_dir, texture_mode, locale);
+                let result = Self::read_pack(&path, is_dir, locale);
                 match result {
                     Ok((name, entries)) => {
                         let items = entries.len();
@@ -975,7 +949,6 @@ impl Registry {
     fn read_pack(
         path: &Path,
         is_dir: bool,
-        texture_mode: TextureMode,
         locale: &str,
     ) -> Result<(String, Vec<PreparedCape>), String> {
         let files = if is_dir {
@@ -1060,7 +1033,6 @@ impl Registry {
                 version,
                 cape.rarity.as_deref(),
                 cape.start_date.as_deref(),
-                texture_mode,
             )?;
             for (resource, _) in &prepared.assets {
                 if !resources.insert(resource.clone()) {
@@ -1083,7 +1055,6 @@ impl Registry {
         version: [u32; 3],
         rarity: Option<&str>,
         start_date: Option<&str>,
-        texture_mode: TextureMode,
     ) -> Result<PreparedCape, String> {
         if !name_ok(&name) || !name_ok(author) {
             return Err("invalid cape name or author".into());
@@ -1159,7 +1130,7 @@ impl Registry {
                 let source = png.as_deref().ok_or("missing cape PNG")?;
                 let decoded = decoded.as_ref().ok_or("missing decoded cape PNG")?;
                 let (texture, converted, tex_dims) =
-                    persona_texture_png(source, decoded, texture_mode)?;
+                    persona_texture_png(source, decoded)?;
                 converted_rgba = converted;
                 persona_texture_dims = Some(tex_dims);
                 experimental_persona_png(
@@ -1271,7 +1242,7 @@ mod tests {
         ));
         let account = root.join("Users").join("1234567890123456789").join("games").join("com.mojang");
         assert!(!account.exists());
-        let registry = Registry::scan(&[account.clone()], TextureMode::Canonical, "en_US");
+        let registry = Registry::scan(&[account.clone()], "en_US");
         assert_eq!(registry.discovered_packs, 0);
         assert_eq!(registry.discovered_roots, 0);
         assert!(!account.exists(), "cape scan must not construct a game profile");
@@ -1297,7 +1268,7 @@ mod tests {
         )
         .unwrap();
         fs::write(folder.join("cape.png"), dummy_png()).unwrap();
-        let registry = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let registry = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(registry.accepted, 1);
         fs::remove_dir_all(root).unwrap();
     }
@@ -1435,7 +1406,7 @@ mod tests {
         assert_eq!(rgba[25], 6);
         assert_eq!(validate_png(&rgba).unwrap(), decoded);
         let (compatible, converted, dims) =
-            persona_texture_png(&original, &decoded, TextureMode::Canonical).unwrap();
+            persona_texture_png(&original, &decoded).unwrap();
         assert!(converted);
         assert_eq!(dims, (64, 32));
         assert_eq!(compatible[25], 6);
@@ -1445,7 +1416,6 @@ mod tests {
         let small = persona_texture_png(
             &dummy_png(),
             &validate_png(&dummy_png()).unwrap(),
-            TextureMode::Canonical,
         )
         .unwrap();
         assert!(
@@ -1464,7 +1434,6 @@ mod tests {
             [1, 0, 0],
             None,
             None,
-            TextureMode::Canonical,
         )
         .unwrap();
         assert_eq!(cape.dimensions, Some((1280, 640)));
@@ -1519,7 +1488,7 @@ mod tests {
         let decoded = validate_png(&png).unwrap();
         assert_eq!(decoded.dimensions(), (1280, 640));
         let (payload, transcoded, _) =
-            persona_texture_png(&png, &decoded, TextureMode::Canonical).unwrap();
+            persona_texture_png(&png, &decoded).unwrap();
         assert!(
             transcoded,
             "20x RGBA8 still requires Persona 64x32 compatibility"
@@ -1573,7 +1542,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cosmetics_pack_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         pack_zip(&root, "MyCape.zip", "red", "Red Cape");
-        let reg = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let reg = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(reg.items.len(), 1, "{:?}", reg.diagnostics);
         assert_eq!(
             (reg.discovered_packs, reg.accepted, reg.rejected),
@@ -1627,7 +1596,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cosmetics_mccapes_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         pack_zip(&root, "Example.mccapes", "example", "Example Cape");
-        let reg = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let reg = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(
             (reg.discovered_packs, reg.accepted, reg.rejected),
             (1, 1, 0),
@@ -1679,7 +1648,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cosmetics_thumbs_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         pack_zip(&root, "cape.zip", "cape", "Local Cape");
-        let reg = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let reg = Registry::scan(&[root.clone()], "en_US");
         let item = &reg.items[0];
         assert_eq!(item["images"][0]["url"], item["thumbnail"]["url"]);
         assert_eq!(
@@ -1701,7 +1670,7 @@ mod tests {
             "Sample Cape",
             r#","rarity":"legendary","startDate":"2026-10-17T10:20:30Z""#,
         );
-        let reg = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let reg = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(reg.items.len(), 1, "{:?}", reg.diagnostics);
         let item = &reg.items[0];
         for field in [
@@ -1780,7 +1749,7 @@ mod tests {
             "Invalid Cape",
             r#","rarity":"invalid""#,
         );
-        let reg = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let reg = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(reg.rejected, 1);
         assert!(reg.items.is_empty());
         assert!(
@@ -1795,7 +1764,7 @@ mod tests {
             "Invalid Cape",
             r#","startDate":"untrusted""#,
         );
-        let reg = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let reg = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(reg.rejected, 1);
         assert!(reg.items.is_empty());
         assert!(
@@ -1833,7 +1802,7 @@ mod tests {
             .unwrap();
         outer.write_all(&native).unwrap();
         outer.finish().unwrap();
-        let reg = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let reg = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(reg.accepted, 1, "{:?}", reg.diagnostics);
         assert_eq!(reg.native_payloads, 1);
         assert_eq!(reg.items[0]["packIdentity"][0]["uuid"], uuid);
@@ -1859,8 +1828,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cosmetics_unnamed_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         pack_zip(&root, "blue.zip", "blue", "Blue Cape");
-        let a = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
-        let b = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let a = Registry::scan(&[root.clone()], "en_US");
+        let b = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(a.items[0]["id"], b.items[0]["id"]);
         assert_eq!(a.items[0]["title"], "Blue Cape");
         let _ = fs::remove_dir_all(&root);
@@ -1871,7 +1840,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("capes")).unwrap();
         fs::write(root.join("capes/bad.zip"), b"not a zip").unwrap();
-        let reg = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let reg = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(reg.items.len(), 0);
         assert_eq!(
             (reg.discovered_packs, reg.accepted, reg.rejected),
@@ -1893,7 +1862,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         pack_zip(&root, "working.zip", "working", "Working Cape");
         fs::write(root.join("capes/broken.zip"), b"not-zip").unwrap();
-        let registry = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let registry = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(registry.discovered_packs, 2);
         assert_eq!(registry.accepted, 1);
         assert_eq!(registry.rejected, 1);
@@ -1951,7 +1920,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cosmetics_multicape_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         write_multi(&root, "old-name.zip", "1.0.0", false);
-        let a = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let a = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(a.discovered_packs, 1);
         assert_eq!(a.accepted, 1);
         assert_eq!(a.items.len(), 2);
@@ -1964,8 +1933,8 @@ mod tests {
             root.join("capes/renamed.zip"),
         )
         .unwrap();
-        let b = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
-        let c = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let b = Registry::scan(&[root.clone()], "en_US");
+        let c = Registry::scan(&[root.clone()], "en_US");
         for i in 0..2 {
             assert_eq!(a.items[i]["id"], b.items[i]["id"]);
             assert_eq!(b.items[i]["id"], c.items[i]["id"]);
@@ -2001,7 +1970,6 @@ mod tests {
                 [1, 0, 0],
                 None,
                 None,
-                TextureMode::Canonical,
             )
             .unwrap()
         };
@@ -2055,7 +2023,6 @@ mod tests {
                 [1, 0, 0],
                 None,
                 None,
-                TextureMode::Canonical,
             )
             .unwrap()
         };
@@ -2096,9 +2063,9 @@ mod tests {
             std::env::temp_dir().join(format!("cosmetics_packversion_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         write_multi(&root, "collection.zip", "1.0.0", false);
-        let a = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let a = Registry::scan(&[root.clone()], "en_US");
         write_multi(&root, "collection.zip", "1.0.1", false);
-        let b = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let b = Registry::scan(&[root.clone()], "en_US");
         for i in 0..2 {
             assert_eq!(a.items[i]["id"], b.items[i]["id"]);
             assert_eq!(
@@ -2128,7 +2095,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cosmetics_duplicate_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         write_multi(&root, "duplicate.zip", "1.0.0", true);
-        let reg = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let reg = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(reg.discovered_packs, 1);
         assert_eq!(reg.rejected, 1);
         assert!(reg.items.is_empty());
@@ -2175,7 +2142,7 @@ mod tests {
                 .unwrap();
             outer.write_all(encoded.get_ref()).unwrap();
             outer.finish().unwrap();
-            let reg = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+            let reg = Registry::scan(&[root.clone()], "en_US");
             assert_eq!(reg.accepted, 1, "{:?}", reg.diagnostics);
             assert_eq!(reg.generated_persona_payloads, 1);
             assert!(
@@ -2240,7 +2207,7 @@ mod tests {
             .unwrap();
         zip.write_all(bytes.get_ref()).unwrap();
         zip.finish().unwrap();
-        let reg = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let reg = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(reg.rejected, 1);
         assert_eq!(reg.items.len(), 0);
         assert!(
@@ -2294,7 +2261,7 @@ mod tests {
         .unwrap();
         fs::write(dir.join("cape.png"), dummy_png()).unwrap();
 
-        let reg = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let reg = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(
             (reg.discovered_packs, reg.accepted, reg.rejected),
             (1, 1, 0),
@@ -2304,7 +2271,7 @@ mod tests {
         assert_eq!(reg.items.len(), 1);
 
         // Stable identity: scanning again yields the same item UUID.
-        let again = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let again = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(again.items[0]["id"], reg.items[0]["id"]);
         let _ = fs::remove_dir_all(&root);
     }
@@ -2314,7 +2281,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cosmetics_dirpack_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         write_folder_pack(&root, "我的披风1", "my_cape", "我的披风");
-        let reg = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let reg = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(
             (reg.discovered_packs, reg.accepted, reg.rejected),
             (1, 1, 0),
@@ -2338,7 +2305,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         pack_zip(&root, "MyCape.zip", "my_cape", "My Cape");
         write_folder_pack(&root, "MyCape", "my_cape", "My Cape");
-        let reg = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let reg = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(
             (reg.discovered_packs, reg.accepted, reg.rejected),
             (2, 1, 1),
@@ -2360,7 +2327,7 @@ mod tests {
         let dir = root.join("capes").join("not-a-pack");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("readme.txt"), b"hello").unwrap();
-        let reg = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let reg = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(
             (reg.discovered_packs, reg.accepted, reg.rejected),
             (0, 0, 0),
@@ -2403,7 +2370,7 @@ mod tests {
             "capepack.my_folder_collection=My Folder Collection\ncape.my_folder_collection.red=Red Cape\ncape.my_folder_collection.blue=Blue Cape\n").unwrap();
         fs::write(dir.join("textures/red.png"), dummy_png()).unwrap();
         fs::write(dir.join("textures/blue.png"), dummy_png()).unwrap();
-        let reg = Registry::scan(&[root.clone()], TextureMode::Canonical, "en_US");
+        let reg = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(
             (reg.discovered_packs, reg.accepted, reg.rejected),
             (1, 1, 0),
@@ -2427,7 +2394,6 @@ mod tests {
         pack_zip(&second, "OnlyB.zip", "only_b", "Only B");
         let reg = Registry::scan(
             &[first.clone(), second.clone()],
-            TextureMode::Canonical,
             "en_US",
         );
         assert_eq!(reg.discovered_roots, 2, "{:?}", reg.diagnostics);
@@ -2450,34 +2416,5 @@ mod tests {
         let _ = fs::remove_dir_all(first);
         let _ = fs::remove_dir_all(second);
     }
-    #[test]
-    fn original_texture_mode_keeps_source_resolution() {
-        let original = palette_cape_png(20);
-        let decoded = validate_png(&original).unwrap();
-        let (texture, converted, dims) =
-            persona_texture_png(&original, &decoded, TextureMode::Original).unwrap();
-        assert_eq!(
-            dims,
-            (1280, 640),
-            "original 模式必须保持源分辨率（仅 RGBA 归一化）"
-        );
-        assert!(converted, "palette PNG 仍需转换为 RGBA8");
-        assert_eq!(validate_png(&texture).unwrap().dimensions(), (1280, 640));
-        let id = "11111111-2222-4333-8444-555555555555".to_string();
-        let cape = Registry::prepare_cape(
-            id,
-            "HD".to_string(),
-            "Player",
-            Some(original),
-            None,
-            None,
-            "1.0.0",
-            [1, 0, 0],
-            None,
-            None,
-            TextureMode::Original,
-        )
-        .unwrap();
-        assert_eq!(cape.persona_texture_dimensions, Some((1280, 640)));
-    }
+
 }
