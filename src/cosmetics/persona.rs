@@ -1,13 +1,8 @@
 //! Local opaque Persona ZIP response source.
 //! Does not interpret images, decrypt proprietary assets or forge signatures.
 use serde_json::Value;
-use std::fs::{self, File};
-use std::io::Read;
-use std::path::Path;
-
 pub const LOCAL_HOST: &str = "cosmetics.invalid";
 pub const LOCAL_PREFIX: &str = "/personabinary/";
-pub const MAX_ZIP_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn is_uuid(text: &str) -> bool {
     text.len() == 36
@@ -22,63 +17,6 @@ pub fn is_uuid(text: &str) -> bool {
 pub fn resource_uuid(path: &str) -> Option<&str> {
     let id = path.strip_prefix(LOCAL_PREFIX)?.strip_suffix(".zip")?;
     is_uuid(id).then_some(id)
-}
-pub struct ZipPayload {
-    pub bytes: Vec<u8>,
-    pub resource_uuid: String,
-}
-pub fn load(root: &Path, path: &str) -> Result<Option<ZipPayload>, String> {
-    let Some(id) = resource_uuid(path) else {
-        return Ok(None);
-    };
-    let file_path = root
-        .join("overrides")
-        .join("persona")
-        .join(format!("{id}.zip"));
-    if !file_path.is_file() {
-        return Ok(None);
-    }
-    let len = fs::metadata(&file_path).map_err(|e| e.to_string())?.len();
-    if len == 0 || len > MAX_ZIP_BYTES as u64 {
-        return Err("Persona ZIP must be nonempty and at most 64 MiB".into());
-    }
-    let mut archive = zip::ZipArchive::new(File::open(&file_path).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("invalid ZIP: {e}"))?;
-    if archive.len() > 4096 {
-        return Err("Persona ZIP has too many files".into());
-    }
-    // Only inspect a small plaintext manifest, not binary or encrypted cape resources.
-    let mut manifest_file = archive
-        .by_name("manifest.json")
-        .map_err(|e| format!("missing plain manifest.json: {e}"))?;
-    if manifest_file.size() > 256 * 1024 {
-        return Err("manifest too large".into());
-    }
-    let mut plain = Vec::new();
-    manifest_file
-        .by_ref()
-        .take(256 * 1024 + 1)
-        .read_to_end(&mut plain)
-        .map_err(|e| format!("manifest read failed: {e}"))?;
-    drop(manifest_file);
-    let manifest: Value =
-        serde_json::from_slice(&plain).map_err(|e| format!("invalid persona manifest: {e}"))?;
-    let modules = manifest
-        .get("modules")
-        .and_then(Value::as_array)
-        .ok_or("manifest has no modules array")?;
-    if !modules
-        .iter()
-        .any(|m| m.get("type").and_then(Value::as_str) == Some("persona_piece"))
-    {
-        return Err("manifest has no persona_piece module".into());
-    }
-    drop(archive);
-    let bytes = fs::read(&file_path).map_err(|e| format!("reading Persona ZIP failed: {e}"))?;
-    Ok(Some(ZipPayload {
-        bytes,
-        resource_uuid: id.to_string(),
-    }))
 }
 
 /// BLoader 移植：仅接受本地虚拟资源 URL。Cosmos CDN 白名单已随
