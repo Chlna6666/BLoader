@@ -1993,6 +1993,38 @@ mod tests {
     }
 
     #[test]
+    fn premium_cache_is_regular_game_data_not_a_cosmetics_override() {
+        // The official game owns premium_cache. Isolating the game's data
+        // root may relocate it, but the path mapper must not synthesize,
+        // rewrite, special-case or open cache entries for the Cosmetics Hook.
+        let state = state_with_rule(
+            r"C:\Users\Tester\AppData\Roaming\Minecraft Bedrock",
+            r"C:\BMCBL\versions\26.40\Minecraft Bedrock",
+        );
+        for name in ["persona", "skin_packs"] {
+            let original = format!(
+                r"C:\Users\Tester\AppData\Roaming\Minecraft Bedrock\premium_cache\{name}"
+            );
+            let expected = format!(
+                r"C:\BMCBL\versions\26.40\Minecraft Bedrock\premium_cache\{name}"
+            );
+            assert_eq!(state.redirect_path(&original), Some(expected));
+        }
+    }
+
+    #[test]
+    fn disabled_data_root_redirection_does_not_touch_official_cache() {
+        let config = Config::default();
+        assert!(!config.enable_redirection);
+        let state = RedirectionState::from_config(&config, Path::new(r"C:\BMCBL\versions\26.40"));
+        assert!(state.rules.is_empty());
+        assert_eq!(
+            state.redirect_path(r"C:\Users\Tester\AppData\Roaming\Minecraft Bedrock\premium_cache\persona"),
+            None
+        );
+    }
+
+    #[test]
     fn custom_rules_do_not_require_data_root_redirection() {
         let mut config = Config::default();
         config.enable_redirection = false;
