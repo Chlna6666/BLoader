@@ -12,6 +12,7 @@ use core::ffi::c_void;
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use windows::Win32::Foundation::{GetLastError, SetLastError};
+use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
 
 use minhook::MinHook;
 use windows::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
@@ -48,6 +49,11 @@ static CRT_STDOUT: AtomicUsize = AtomicUsize::new(0);
 static CRT_STDERR: AtomicUsize = AtomicUsize::new(0);
 static CRT_FWRITE_READY: AtomicBool = AtomicBool::new(false);
 static CRT_FWRITE_INSTALLING: AtomicBool = AtomicBool::new(false);
+static UCRT_WRITE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+static MSVCRT_WRITE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+static UCRT_WRITE_READY: AtomicBool = AtomicBool::new(false);
+static MSVCRT_WRITE_READY: AtomicBool = AtomicBool::new(false);
+static CRT_WRITE_INSTALLING: AtomicBool = AtomicBool::new(false);
 thread_local! {
     static BYPASS: Cell<bool> = const { Cell::new(false) };
     // A hooked implementation may re-enter another hooked export (for example
@@ -60,7 +66,6 @@ thread_local! {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetConsoleMode(handle: *mut c_void, mode: *mut u32) -> i32;
-    fn GetFileType(handle: *mut c_void) -> u32;
     fn MultiByteToWideChar(
         code_page: u32,
         flags: u32,
@@ -72,6 +77,7 @@ unsafe extern "system" {
 }
 type WriteFn = unsafe extern "system" fn(*mut c_void, *const c_void, u32, *mut u32, *mut c_void) -> i32;
 type FwriteFn = unsafe extern "C" fn(*const c_void, usize, usize, *mut c_void) -> usize;
+type CrtWriteFn = unsafe extern "C" fn(i32, *const c_void, u32) -> i32;
 type CrtIobFn = unsafe extern "C" fn(i32) -> *mut c_void;
 
 pub fn with_passthrough<T>(f: impl FnOnce() -> T) -> T {
@@ -85,8 +91,7 @@ pub fn with_passthrough<T>(f: impl FnOnce() -> T) -> T {
 }
 
 /// Indicates whether at least one native console write export is hooked.
-/// This does not imply the external loader uses those APIs; the structured
-/// file relay remains the fallback for other output transports.
+/// Hook installation does not prove that any external writes were observed.
 pub fn is_active() -> bool {
     READY.load(Ordering::Acquire)
 }
@@ -170,6 +175,91 @@ pub fn install_crt_fwrite_capture() {
     }
 }
 
+
+pub fn crt_write_capture_active() -> bool {
+    UCRT_WRITE_READY.load(Ordering::Acquire)
+        || MSVCRT_WRITE_READY.load(Ordering::Acquire)
+}
+
+/// Observe stdout and stderr from native CRTs without rebinding their FILE*
+/// or redirecting any file descriptors. A Mod may use _write rather than fwrite.
+pub fn install_crt_write_capture() {
+    if !logging::console_is_ready() || CRT_WRITE_INSTALLING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    struct ResetInstalling;
+    impl Drop for ResetInstalling {
+        fn drop(&mut self) {
+            CRT_WRITE_INSTALLING.store(false, Ordering::Release);
+        }
+    }
+    let _reset = ResetInstalling;
+    for (dll, original, ready, detour) in [
+        (w!("ucrtbase.dll"), &UCRT_WRITE_ORIGINAL, &UCRT_WRITE_READY, intercept_ucrt_write as *mut c_void),
+        (w!("msvcrt.dll"), &MSVCRT_WRITE_ORIGINAL, &MSVCRT_WRITE_READY, intercept_msvcrt_write as *mut c_void),
+    ] {
+        if ready.load(Ordering::Acquire) {
+            continue;
+        }
+        let Ok(module) = (unsafe { GetModuleHandleW(dll) }) else { continue };
+        let Some(address) = (unsafe { GetProcAddress(module, PCSTR(b"_write\0".as_ptr())) }) else { continue };
+        let target = address as *const () as *mut c_void;
+        match unsafe { MinHook::create_hook(target, detour) } {
+            Ok(trampoline) => {
+                original.store(trampoline as usize, Ordering::Release);
+                match unsafe { MinHook::enable_hook(target) } {
+                    Ok(()) => { ready.store(true, Ordering::Release); }
+                    Err(error) => {
+                        let _ = unsafe { MinHook::remove_hook(target) };
+                        original.store(0, Ordering::Release);
+                        logging::scoped_debug_message("console-capture",
+                            &format!("CRT _write observer enable failed: {error:?}"));
+                    }
+                }
+            }
+            Err(error) => logging::scoped_debug_message("console-capture",
+                &format!("CRT _write observer creation failed: {error:?}")),
+        }
+    }
+}
+
+unsafe extern "C" fn intercept_ucrt_write(fd: i32, data: *const c_void, len: u32) -> i32 {
+    unsafe { observe_crt_write(&UCRT_WRITE_ORIGINAL, &UCRT_WRITE_READY, fd, data, len) }
+}
+
+unsafe extern "C" fn intercept_msvcrt_write(fd: i32, data: *const c_void, len: u32) -> i32 {
+    unsafe { observe_crt_write(&MSVCRT_WRITE_ORIGINAL, &MSVCRT_WRITE_READY, fd, data, len) }
+}
+
+unsafe fn observe_crt_write(
+    trampoline: &AtomicUsize, ready: &AtomicBool, fd: i32,
+    data: *const c_void, len: u32,
+) -> i32 {
+    let address = trampoline.load(Ordering::Acquire);
+    if address == 0 { return -1; }
+    let original: CrtWriteFn = unsafe { std::mem::transmute(address) };
+    if !ready.load(Ordering::Acquire) || !matches!(fd, 1 | 2)
+        || data.is_null() || BYPASS.with(Cell::get) || IN_DETOUR.with(Cell::get)
+    {
+        return unsafe { original(fd, data, len) };
+    }
+    IN_DETOUR.with(|state| state.set(true));
+    let _guard = DetourGuard;
+    let written = unsafe { original(fd, data, len) };
+    let last_error = unsafe { GetLastError() };
+    if written > 0 && (written as usize) <= MAX_WRITE {
+        let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, written as usize) };
+        if !bytes.contains(&0) {
+            let _ = std::panic::catch_unwind(|| {
+                let decoded = decode_ansi(bytes);
+                capture(std::ptr::null_mut(), &decoded, caller_scope);
+            });
+        }
+    }
+    unsafe { SetLastError(last_error) };
+    written
+}
+
 fn bounded_crt_write_length(size: usize, count: usize) -> Option<usize> {
     size.checked_mul(count).filter(|length| *length > 0 && *length <= MAX_WRITE)
 }
@@ -201,8 +291,8 @@ unsafe extern "C" fn intercept_crt_fwrite(
     // when the external CRT stdout is invalid or points to a closed pipe.
     let result = unsafe { original(data, size, count, stream) };
     let last_error = unsafe { GetLastError() };
-    if !data.is_null() {
-        if let Some(length) = bounded_crt_write_length(size, count) {
+    if !data.is_null() && result > 0 {
+        if let Some(length) = bounded_crt_write_length(size, result) {
             let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, length) };
             // No attempt is made to parse binary output or arbitrary FILE*.
             if !bytes.contains(&0) {
@@ -299,6 +389,20 @@ fn eligible(handle: *mut c_void) -> bool {
     }
     let mut mode = 0;
     unsafe { GetConsoleMode(handle, &mut mode) != 0 }
+}
+
+/// Only observe redirected stdout/stderr, never arbitrary file handles. This
+/// captures native pipes while avoiding Mod files and on-disk logs.
+fn redirected_std_handle(handle: *mut c_void) -> bool {
+    if !READY.load(Ordering::Acquire) || !logging::console_is_ready()
+        || BYPASS.with(Cell::get) || handle.is_null() || handle as usize == usize::MAX
+    { return false; }
+    let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE).ok() };
+    let stderr = unsafe { GetStdHandle(STD_ERROR_HANDLE).ok() };
+    if !stdout.is_some_and(|value| value.0 == handle)
+        && !stderr.is_some_and(|value| value.0 == handle) { return false; }
+    let mut mode = 0;
+    unsafe { GetConsoleMode(handle, &mut mode) == 0 }
 }
 
 /// Resolves the module behind the detour caller. `FramesToSkip=2` skips this
@@ -450,28 +554,49 @@ unsafe extern "system" fn intercept_a(h: *mut c_void, data: *const c_void, len: 
 
 unsafe extern "system" fn intercept_file(h: *mut c_void, data: *const c_void, len: u32,
                                            count: *mut u32, overlapped: *mut c_void) -> i32 {
-    // FILE_TYPE_CHAR=2; the common file/pipe path falls through unchanged.
     if IN_DETOUR.with(Cell::get) {
         return unsafe { call_original(&ORIGINAL_FILE, h, data, len, count, overlapped) };
     }
     IN_DETOUR.with(|cell| cell.set(true));
     let _guard = DetourGuard;
-    if !data.is_null() && len > 0 && (len as usize) <= MAX_WRITE && overlapped.is_null()
-        && READY.load(Ordering::Acquire) && !BYPASS.with(Cell::get)
-        && unsafe { GetFileType(h) } == 2 && eligible(h)
-    {
-        let slice = unsafe { std::slice::from_raw_parts(data as *const u8, len as usize) };
-        // Binary console output (or an ANSI escape fragment) is not a log
-        // line; hand it back to the original writer untouched.
-        if slice.iter().all(|&b| b >= 0x20 || matches!(b, b'\r' | b'\n' | b'\t')) {
-            let text = decode_ansi(slice);
-            if std::panic::catch_unwind(|| capture(h, &text, caller_scope)).unwrap_or(false) {
-                if !count.is_null() { unsafe { *count = len }; }
-                return 1;
-            }
+    if data.is_null() || len == 0 || (len as usize) > MAX_WRITE || !overlapped.is_null() {
+        return unsafe { call_original(&ORIGINAL_FILE, h, data, len, count, overlapped) };
+    }
+    let is_console = eligible(h);
+    let is_redirected_stdout = !is_console && redirected_std_handle(h);
+    if !is_console && !is_redirected_stdout {
+        return unsafe { call_original(&ORIGINAL_FILE, h, data, len, count, overlapped) };
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, len as usize) };
+    // Keep VT colour fragments until a full line is available for sanitizing.
+    if bytes.contains(&0) {
+        return unsafe { call_original(&ORIGINAL_FILE, h, data, len, count, overlapped) };
+    }
+    if is_console {
+        let decoded = decode_ansi(bytes);
+        if std::panic::catch_unwind(|| capture(h, &decoded, caller_scope)).unwrap_or(false) {
+            if !count.is_null() { unsafe { *count = len }; }
+            return 1;
+        }
+        return unsafe { call_original(&ORIGINAL_FILE, h, data, len, count, overlapped) };
+    }
+
+    // Pipes must receive their original bytes. Capture only actual successful
+    // writes and preserve the native return value and last-error state.
+    let result = unsafe { call_original(&ORIGINAL_FILE, h, data, len, count, overlapped) };
+    let last_error = unsafe { GetLastError() };
+    if result != 0 {
+        let written = if count.is_null() { len } else { unsafe { *count }.min(len) };
+        if written > 0 {
+            let output = &bytes[..written as usize];
+            let _ = std::panic::catch_unwind(|| {
+                let decoded = decode_ansi(output);
+                capture(h, &decoded, caller_scope);
+            });
         }
     }
-    unsafe { call_original(&ORIGINAL_FILE, h, data, len, count, overlapped) }
+    unsafe { SetLastError(last_error) };
+    result
 }
 
 #[cfg(test)]
