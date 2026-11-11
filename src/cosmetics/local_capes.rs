@@ -1260,6 +1260,24 @@ impl Registry {
 mod tests {
     use super::*;
     #[test]
+    fn scanning_absent_capes_does_not_create_profile_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "bloader-no-create-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let account = root.join("Users").join("1234567890123456789").join("games").join("com.mojang");
+        assert!(!account.exists());
+        let registry = Registry::scan(&[account.clone()], TextureMode::Canonical, "en_US");
+        assert_eq!(registry.discovered_packs, 0);
+        assert_eq!(registry.discovered_roots, 0);
+        assert!(!account.exists(), "cape scan must not construct a game profile");
+        assert!(!root.exists(), "cape scan must not construct any ancestor");
+    }
+    #[test]
     fn standard_cape_folder_is_registered() {
         let root = std::env::temp_dir().join(format!(
             "bloader-cape-{}-{}",
