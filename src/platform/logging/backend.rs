@@ -630,7 +630,13 @@ pub fn captured_console_output_from(attribution: Option<&str>, input: &str) {
     if line.trim().is_empty() {
         return;
     }
-    if let Some(external) = parse_external_structured_line(&line) {
+    // LeviLamina's Win32 console sink uses "HH:MM:SS.mmm LEVEL SOURCE text",
+    // whereas its file sink uses "[date time LEVEL][SOURCE] text".
+    // Capture both forms before fallback stack attribution; otherwise native
+    // WARN/ERROR events appear as INFO with duplicated timestamps.
+    if let Some(external) =
+        parse_external_structured_line(&line).or_else(|| parse_levilamina_console_line(&line))
+    {
         if external_line_ignored(&external.source) {
             return;
         }
