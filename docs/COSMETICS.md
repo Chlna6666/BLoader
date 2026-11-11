@@ -27,14 +27,16 @@ src/cosmetics/
 ├── persona_pack.rs   persona 包字节生成（ppack0、AES-256-CFB8、contents.json）
 ├── persona.rs        虚拟资源路由与本地 URL 校验
 ├── codec.rs          gzip/deflate/brotli 有界解码
-├── cape_roots.rs     扫描根解析（com.mojang 候选 × 重定向映射）
+├── cape_roots.rs     读取 BMCBL 实例 Shared/capes 的物理路径（不依赖重定向 Hook）
 ├── debug.rs          脱敏 JSON 形状摘要（永不输出值）
 └── diagnostics.rs    端点归一化标签（allowlist，防泄露）
 ```
 
 装配点：`lib.rs bootstrap()` 中 `file_redirection::install` → `network_hook::install` →
 `cosmetics::install`，全部发生在 Minecraft `main`（OEP）之前，覆盖启动期 marketplace 请求。
-扫描（文件 IO + PNG 解码）在后台线程 `bloader-cosmetics` 执行，不阻塞启动。
+前两者是游戏实例文件和普通网络功能；披风模块自身只安装 WinHTTP Hook，
+不会添加、修改、借用文件重定向规则来拦截披风请求。
+本地披风注册表在启用 WinHTTP Hook 前同步读取并缓存，HTTP 响应读取不会触发 PNG/ZIP 扫描。
 
 ## 3. WinHTTP 钩子层
 
@@ -158,16 +160,19 @@ mode 一览：`append_array`（身份去重追加，披风页走分区注入并�
 
 ## 6. 扫描根解析（cape_roots）
 
-按序去重，每个根下进入 `capes/` 子目录（不存在则创建；仅接受**已存在**的
-com.mojang，不在全新机器上凭空造目录）：
+按序去重，每个根下只读检查 `capes/`，不存在便跳过，**不会创建游戏数据目录**：
 
-1. `enable_redirection=true` 时：`<redirection_root>\Users\Shared\games\com.mojang`
-   与 `<redirection_root>\games\com.mojang`（GDK 镜像与 UWP 镜像两种布局）；
-2. 原始候选经 `file_redirection::preview_redirect_target`（词法映射，未命中原样）：
-   `%APPDATA%\Minecraft Bedrock\Users\Shared\games\com.mojang`、
-   `%APPDATA%\Minecraft Bedrock Preview\Users\Shared\games\com.mojang`、
-   `C:\Users\Shared\games\com.mojang`、UWP 五包
-   (`UWP / WindowsBeta / Education×3`) `LocalState\games\com.mojang`。
+1. `enable_redirection=true` 时，直接读取 BMCBL 实例对应的**物理数据目录**：
+   `<redirection_root>\Users\Shared\games\com.mojang\capes`（GDK），
+   `<redirection_root>\games\com.mojang\capes`（UWP）。不扫描账号目录，也不回退到其他系统安装实例；
+2. 未启用实例隔离时，只读检查系统 GDK/UWP 的实际数据目录，包括
+   `%APPDATA%\Minecraft Bedrock\Users\Shared\games\com.mojang\capes`、
+   `%APPDATA%\Minecraft Bedrock Preview\Users\Shared\games\com.mojang\capes`
+   和 UWP 包 `LocalState\games\com.mojang\capes`。
+
+这些位置只用于定位本地资源，**不参与 HTTP 地址改写**。披风实际注入仍由
+`WinHttpSendRequest / WinHttpReceiveResponse / WinHttpReadData / WinHttpQueryHeaders`
+拦截并返回合成或修改后的响应完成；官方请求继续使用原本的 host 与 path。
 
 独立 DLL 时代的 `mods/Cosmetics/capes` 已不参与扫描；`cosmetics_dir` 仅承载
 `cosmetics.json` 与 `overrides/`。
