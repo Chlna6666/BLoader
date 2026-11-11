@@ -1,4 +1,5 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
+use std::fmt::Write as _;
 use std::io::Write;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use chrono::Local;
 use serde::Serialize;
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{GetLastError, HMODULE, SetLastError};
 use windows::Win32::System::Diagnostics::Debug::{
     ADDRESS64, AddVectoredExceptionHandler, AddrModeFlat, EXCEPTION_CONTINUE_SEARCH,
     EXCEPTION_EXECUTE_HANDLER, EXCEPTION_POINTERS, IMAGEHLP_LINEW64, KDHELP64,
@@ -20,7 +21,7 @@ use windows::Win32::System::Diagnostics::Debug::{
     SymFunctionTableAccess64, SymGetLineFromAddrW64, SymGetModuleBase64, SymInitializeW,
     SymSetOptions,
 };
-use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
+use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
 use windows::Win32::System::ProcessStatus::{
     EnumProcessModules, GetModuleInformation, MODULEINFO,
@@ -42,6 +43,132 @@ static LAST_REPORT: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static LAST_EXCEPTION_SIGNATURE: AtomicU64 = AtomicU64::new(0);
 static SYMBOLS_READY: OnceLock<bool> = OnceLock::new();
 static EXTERNAL_LOGGER_STARTED: AtomicBool = AtomicBool::new(false);
+// First-chance observations are evidence, not proof of a fatal exception.
+// This pre-opened file is only written with a fixed-size stack buffer in VEH;
+// do not call DbgHelp, heap allocation or MiniDumpWriteDump in the handler.
+struct PassiveGameExceptionWitness {
+    file: File,
+    exe_base: usize,
+    exe_end: usize,
+}
+static GAME_EXCEPTION_WITNESS: OnceLock<PassiveGameExceptionWitness> = OnceLock::new();
+static GAME_EXCEPTION_WRITING: AtomicBool = AtomicBool::new(false);
+
+struct FixedExceptionLine {
+    data: [u8; 256],
+    len: usize,
+}
+impl std::fmt::Write for FixedExceptionLine {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        let end = self.len.checked_add(value.len()).ok_or(std::fmt::Error)?;
+        let Some(target) = self.data.get_mut(self.len..end) else {
+            return Err(std::fmt::Error);
+        };
+        target.copy_from_slice(value.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+fn is_game_access_violation(code: u32, address: usize, base: usize, end: usize) -> bool {
+    code == 0xC0000005 && base != 0 && address >= base && address < end
+}
+
+/// Install a non-invasive crash witness for the game's executable before
+/// third-party exception filters take ownership. It must not replace
+/// LeviLamina's unhandled filter or claim a recoverable first-chance AV was fatal.
+pub fn enable_passive_game_exception_observer() {
+    if GAME_EXCEPTION_WITNESS.get().is_some() || !file_io_policy::writes_allowed() {
+        return;
+    }
+    let Ok(exe) = (unsafe { GetModuleHandleW(PCWSTR::null()) }) else {
+        return;
+    };
+    let mut module = MODULEINFO::default();
+    if unsafe {
+        GetModuleInformation(
+            GetCurrentProcess(),
+            exe,
+            &mut module,
+            std::mem::size_of::<MODULEINFO>() as u32,
+        )
+    }.is_err() {
+        return;
+    }
+    let exe_base = module.lpBaseOfDll as usize;
+    let Some(exe_end) = exe_base.checked_add(module.SizeOfImage as usize) else {
+        return;
+    };
+    let output = prepare_crash_dir().join(format!(
+        "exception-first-chance-pid-{}.log",
+        unsafe { GetCurrentProcessId() },
+    ));
+    match OpenOptions::new().create(true).append(true).open(&output) {
+        Ok(file) => {
+            if GAME_EXCEPTION_WITNESS.set(PassiveGameExceptionWitness {
+                file,
+                exe_base,
+                exe_end,
+            }).is_ok() {
+                logging::scoped_info_message(
+                    "crash-report",
+                    &format!(
+                        "Passive Minecraft exception witness active; first-chance only, does not replace external crash handlers; path={}",
+                        output.display()
+                    ),
+                );
+            }
+        }
+        Err(error) => logging::scoped_warn_message(
+            "crash-report",
+            &format!("Passive Minecraft exception witness unavailable: {error}"),
+        ),
+    }
+}
+
+unsafe fn observe_first_chance_game_exception(exception: *const EXCEPTION_POINTERS) {
+    let Some(witness) = GAME_EXCEPTION_WITNESS.get() else { return };
+    if exception.is_null() || (*exception).ExceptionRecord.is_null() {
+        return;
+    }
+    let record = &*(*exception).ExceptionRecord;
+    let code = record.ExceptionCode.0 as u32;
+    let fault = record.ExceptionAddress as usize;
+    if !is_game_access_violation(code, fault, witness.exe_base, witness.exe_end) {
+        return;
+    }
+    // Avoid callback reentry while writing the tiny append-only witness record.
+    if GAME_EXCEPTION_WRITING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let last_error = GetLastError();
+    let mut line = FixedExceptionLine {
+        data: [0u8; 256],
+        len: 0,
+    };
+    let access = if record.NumberParameters >= 1 {
+        record.ExceptionInformation[0] as u64
+    } else {
+        u64::MAX
+    };
+    let target = if record.NumberParameters >= 2 {
+        record.ExceptionInformation[1] as u64
+    } else {
+        u64::MAX
+    };
+    let _ = write!(
+        &mut line,
+        "phase=first_chance code=0x{code:08X} thread={} fault=0x{fault:X} exe_rva=0x{:X} access={} target=0x{target:X}\r\n",
+        GetCurrentThreadId(),
+        fault - witness.exe_base,
+        access
+    );
+    let mut handle = &witness.file;
+    let _ = handle.write_all(&line.data[..line.len]);
+    SetLastError(last_error);
+    GAME_EXCEPTION_WRITING.store(false, Ordering::Release);
+}
+
 
 #[derive(Clone, Debug, Serialize)]
 struct CrashAttribution {
@@ -209,6 +336,9 @@ pub fn spawn_external_logger(module_handle: usize) {
 }
 
 unsafe extern "system" fn vectored_exception_handler(exception: *mut EXCEPTION_POINTERS) -> i32 {
+    // Observe game-owned AVs without claiming they are unhandled. An external
+    // CrashLogger remains responsible for the definitive dump and stack.
+    observe_first_chance_game_exception(exception);
     if should_capture_veh_exception(exception) {
         capture_exception(exception, "veh", false);
     }
@@ -1277,5 +1407,27 @@ fn pwstr_to_string(ptr: windows::core::PWSTR) -> String {
             len += 1;
         }
         String::from_utf16_lossy(slice::from_raw_parts(raw, len))
+    }
+}
+
+#[cfg(test)]
+mod passive_witness_tests {
+    use super::*;
+
+    #[test]
+    fn only_game_executable_access_violations_are_observed() {
+        assert!(is_game_access_violation(0xC0000005, 0x140001000, 0x140000000, 0x150000000));
+        assert!(!is_game_access_violation(0xC0000005, 0x160000000, 0x140000000, 0x150000000));
+        assert!(!is_game_access_violation(0x80000003, 0x140001000, 0x140000000, 0x150000000));
+        assert!(!is_game_access_violation(0xC0000005, 0x140001000, 0, 0));
+    }
+
+    #[test]
+    fn fixed_witness_record_never_allocates_or_overruns() {
+        let mut record = FixedExceptionLine { data: [0; 256], len: 0 };
+        assert!(write!(&mut record, "code=0x{:08X} fault=0x{:X}", 0xC0000005u32, 0x1234u64).is_ok());
+        assert_eq!(std::str::from_utf8(&record.data[..record.len]).unwrap(), "code=0xC0000005 fault=0x1234");
+        assert!(record.write_str(&"x".repeat(257)).is_err());
+        assert!(record.len < record.data.len());
     }
 }
