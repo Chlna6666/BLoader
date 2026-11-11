@@ -456,25 +456,12 @@ unsafe fn should_capture_veh_exception(exception: *const EXCEPTION_POINTERS) -> 
     let record = &*(*exception).ExceptionRecord;
     let code = record.ExceptionCode.0 as u32;
     let flags = record.ExceptionFlags;
-    // Do not capture arbitrary first-chance exceptions: Windows runtimes can
-    // legitimately recover them. The narrowly scoped null-dereference below
-    // is different: the game crashed inside libHttpClient while executing the
-    // callback registered through BLoader's Cosmetics WinHTTP detour. It is
-    // otherwise missed because the faulting instruction is outside BLoader.
-    if code == 0xC0000005
-        && record.NumberParameters >= 2
-        && record.ExceptionInformation[0] == 0
-        && record.ExceptionInformation[1] == 0
-        && crate::cosmetics::inside_game_callback()
-    {
-        let module = module_path_from_address(record.ExceptionAddress as usize)
-            .to_ascii_lowercase();
-        if module.ends_with("libhttpclient.dll") {
-            return true;
-        }
-    }
-    // Never take a dump for a generic continuable first-chance exception;
-    // a native allocator may recover from it via SEH.
+    // VEH sees first-chance exceptions before SEH can handle them. A fault
+    // inside libHttpClient (even while a BLoader callback is active) is not
+    // proof of an unhandled crash. Writing a dump here re-enters loader and
+    // allocator code inside the exception handler, risking a secondary fault.
+    // Let the last-chance handler or external CrashLogger capture cross-DLL
+    // failures; keep stack-based attribution for their reports.
     if flags & 0x1 == 0 {
         return false;
     }
