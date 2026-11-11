@@ -142,7 +142,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!(
             "bloader-cape-profile-roots-{}", std::process::id()
         ));
-        let path = base.join("Users").join("4173542688423936997").join("games").join("com.mojang");
+        let path = base.join("Users").join("1234567890123456789").join("games").join("com.mojang");
         std::fs::create_dir_all(&path).unwrap();
         let roots = profile_roots(&base);
         assert!(roots.contains(&path));
