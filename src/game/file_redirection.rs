@@ -935,10 +935,18 @@ fn prepare_redirect_parent(
     }
 }
 
+/// Minecraft uses OPEN_EXISTING to probe optional files and pack entries.
+/// Missing targets are not redirection failures; preserve the original result.
+fn expected_existing_file_miss(disposition: u32, error: u32) -> bool {
+    disposition == 3 && matches!(error, 2 | 3)
+}
+
 fn log_redirected_create_result(
     api: &str,
     redirected: Option<&RedirectedWidePath>,
     creation_disposition: u32,
+    desired_access: u32,
+    flags_and_attributes: Option<u32>,
     result: HANDLE,
 ) -> HANDLE {
     let Some(redirected) = redirected else {
@@ -947,13 +955,28 @@ fn log_redirected_create_result(
 
     let last_error = unsafe { GetLastError() };
     if result.is_invalid() {
-        logging::scoped_warn_message(
-            "file-redirection",
-            &format!(
-                "redirect create failed api={} disposition={} target={} win32_error={}",
-                api, creation_disposition, redirected.path, last_error.0
-            ),
+        let details = format!(
+            "api={} disposition={} access=0x{:08X} flags={} target={} win32_error={}",
+            api,
+            creation_disposition,
+            desired_access,
+            flags_and_attributes
+                .map(|flags| format!("0x{flags:08X}"))
+                .unwrap_or_else(|| "unknown".to_string()),
+            redirected.path,
+            last_error.0
         );
+        if expected_existing_file_miss(creation_disposition, last_error.0) {
+            logging::scoped_debug_message(
+                "file-redirection",
+                &format!("redirect open-existing probe missing {details}"),
+            );
+        } else {
+            logging::scoped_warn_message(
+                "file-redirection",
+                &format!("redirect create failed {details}"),
+            );
+        }
     } else {
         logging::scoped_debug_message(
             "file-redirection",
@@ -1002,6 +1025,8 @@ unsafe extern "system" fn detour_create_file_w(
         "CreateFileW",
         redirected.as_ref(),
         creation_disposition.0,
+        desired_access,
+        Some(flags_and_attributes.0),
         result,
     )
 }
@@ -1046,6 +1071,8 @@ unsafe extern "system" fn detour_create_file_from_app_w(
         "CreateFileFromAppW",
         redirected.as_ref(),
         creation_disposition,
+        desired_access,
+        Some(flags_and_attributes),
         result,
     )
 }
@@ -1079,6 +1106,8 @@ unsafe extern "system" fn detour_create_file2(
         "CreateFile2",
         redirected.as_ref(),
         creation_disposition.0,
+        desired_access,
+        None,
         result,
     )
 }
@@ -1117,6 +1146,8 @@ unsafe extern "system" fn detour_create_file2_from_app_w(
         "CreateFile2FromAppW",
         redirected.as_ref(),
         creation_disposition,
+        desired_access,
+        None,
         result,
     )
 }
@@ -1780,6 +1811,18 @@ mod tests {
             game_dir: PathBuf::from(r"C:\Games\Minecraft"),
             rules,
         }
+    }
+
+    #[test]
+    fn open_existing_absence_is_debug_but_real_failures_remain_warnings() {
+        assert!(expected_existing_file_miss(3, 2));
+        assert!(expected_existing_file_miss(3, 3));
+        assert!(!expected_existing_file_miss(3, 5)); // ACCESS_DENIED
+        assert!(!expected_existing_file_miss(3, 32)); // SHARING_VIOLATION
+        assert!(!expected_existing_file_miss(1, 2)); // CREATE_NEW
+        assert!(!expected_existing_file_miss(2, 3)); // CREATE_ALWAYS
+        assert!(!expected_existing_file_miss(4, 3)); // OPEN_ALWAYS
+        assert!(!expected_existing_file_miss(5, 2)); // TRUNCATE_EXISTING
     }
 
     #[test]
