@@ -31,7 +31,7 @@ pub(crate) fn inside_game_callback() -> bool {
     winhttp::inside_game_callback()
 }
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::Config;
@@ -41,9 +41,8 @@ static HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
 static INSTALL_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 
-/// 内置默认规则：恢复本地披风的 PersonaProfile 入口，
-/// 同时保留更衣室本地披风与目录接口，全部 local_only，不包含 Cosmos 商品条目。
-/// 外部 cosmetics.json 存在时仍以用户配置为准。
+/// Built-in HTTP rules are immutable and local-only. No standalone
+/// Cosmetics config or overlay files are read during game startup.
 const DEFAULT_RULES_JSON: &str = r#"{
   "enabled": true,
   "max_capture_bytes": 4194304,
@@ -79,51 +78,6 @@ const DEFAULT_RULES_JSON: &str = r#"{
   ]
 }"#;
 
-/// Optional advanced HTTP overlay rules are independent of any Mods tree.
-/// The capes themselves remain in the active com.mojang/Shared data root.
-pub(crate) fn cosmetics_root(game_dir: &Path) -> PathBuf {
-    game_dir.join("BLoader").join("cosmetics")
-}
-
-fn load_rules(root: &Path) -> (response::Config, &'static str) {
-    match std::fs::read(root.join("cosmetics.json")) {
-        Ok(bytes) => match serde_json::from_slice::<response::Config>(&bytes) {
-            Ok(mut cfg) => {
-                // Existing installations may carry a two-rule cosmetics.json
-                // from the first BLoader integration. Preserve their rules,
-                // but restore the locally imported cape navigation endpoint
-                // when it was omitted altogether. Explicitly disabled
-                // PersonaProfile rules are respected.
-                let has_profile = cfg.rules.iter().any(|rule| {
-                    rule.path == "/api/v2.0/layout/pages/DressingRoom_PersonaProfile"
-                });
-                if !has_profile {
-                    if let Some(rule) = default_rules().rules.into_iter().find(|rule| {
-                        rule.name == "local_persona_profile"
-                    }) {
-                        cfg.rules.push(rule);
-                        logging::scoped_info_message(
-                            "cosmetics",
-                            "restored missing local PersonaProfile navigation rule from default configuration",
-                        );
-                    }
-                }
-                (cfg, "external_cosmetics_json")
-            },
-            Err(error) => {
-                logging::scoped_warn_message(
-                    "cosmetics",
-                    &format!(
-                        "external cosmetics.json invalid; using built-in local-only defaults: {error}"
-                    ),
-                );
-                (default_rules(), "builtin_defaults_invalid_external")
-            }
-        },
-        Err(_) => (default_rules(), "builtin_defaults_no_external"),
-    }
-}
-
 fn default_rules() -> response::Config {
     serde_json::from_str(DEFAULT_RULES_JSON).expect("built-in cosmetics rules JSON is valid")
 }
@@ -144,8 +98,10 @@ pub fn install(config: &Config, game_dir: &Path) -> bool {
         return true;
     }
 
-    let root = cosmetics_root(game_dir);
-    let (cfg, config_source) = load_rules(&root);
+    let cfg = default_rules();
+    // In local-only mode the HTTP overlay never reads this path. Keep it
+    // within BLoader's own namespace, never under mods/Cosmetics.
+    let root = game_dir.join("BLoader");
     let roots = cape_roots::resolve_roots(config, game_dir);
     if let Err(error) = winhttp::set_runtime(
         cfg,
@@ -177,9 +133,7 @@ pub fn install(config: &Config, game_dir: &Path) -> bool {
     }
     logging::scoped_info_message(
         "cosmetics",
-        &format!(
-            "local cape resources ready; WinHTTP hooks installed before OEP; config_source={config_source}"
-        ),
+        "local cape resources ready; WinHTTP hooks installed before OEP; config_source=builtin",
     );
     true
 }
@@ -236,15 +190,6 @@ fn matches_suppressed_name(package_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cosmetics_rules_directory_is_internal_to_loader() {
-        let game_dir = Path::new(r"C:\Game");
-        assert_eq!(
-            cosmetics_root(game_dir),
-            game_dir.join("BLoader").join("cosmetics")
-        );
-    }
 
     #[test]
     fn built_in_local_cape_navigation_is_enabled() {
