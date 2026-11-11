@@ -197,6 +197,31 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
                     started.elapsed().as_millis()
                 ),
             );
+            // Loaded != captured: the line above is BLoader's own lifecycle
+            // event, not a message emitted by PreLoader. Report the actual
+            // observer state and the presence of LeviLamina's module without
+            // claiming to own its Mod registry or CRT streams.
+            logging::scoped_info_message(
+                "preloader",
+                &format!(
+                    "External loader observation | LeviLamina.dll={} | native_console_capture={} | file_log_relay={} | external_mods=delegated",
+                    if module_by_name("LeviLamina.dll").is_some() {
+                        "present"
+                    } else {
+                        "not_detected_at_preload_return"
+                    },
+                    if crate::platform::console_capture::is_active() {
+                        "active"
+                    } else {
+                        "inactive"
+                    },
+                    if logging::console_is_ready() {
+                        "logs/latest.log"
+                    } else {
+                        "waiting_for_console"
+                    },
+                ),
+            );
             logging::write_bootstrap_marker(&format!(
                 "preloader.priority.active module=0x{:X} path={} elapsed_ms={} delegate_remaining=true phase=bootstrap-thread-first",
                 module.0 as usize,
