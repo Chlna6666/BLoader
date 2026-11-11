@@ -260,11 +260,52 @@ fn spawn_relay_report() {
     let _ = thread::Builder::new()
         .name("bloader-relay-report".to_string())
         .spawn(|| {
-            for total_secs in [60u64, 300u64] {
-                thread::sleep(Duration::from_secs(total_secs));
-                logging_scoped_debug_relay_report(total_secs);
+            let started = Instant::now();
+            for total_secs in [30u64, 60u64, 300u64] {
+                thread::sleep(Duration::from_secs(total_secs).saturating_sub(started.elapsed()));
+                if total_secs == 30 {
+                    report_external_capture_health();
+                } else {
+                    logging_scoped_debug_relay_report(total_secs);
+                }
             }
         });
+}
+
+/// BLoader can load PreLoader while its own logger never reaches the Windows
+/// console. Installing a detour does not guarantee that stdout is attached,
+/// and a file sink may use a different location. Give one actionable warning
+/// only when both independent input channels have received no actual records.
+fn report_external_capture_health() {
+    let preloader_ready = crate::platform::mod_diagnostics::find_by_name("PreLoader")
+        .is_some_and(|identity| identity.state == "loaded");
+    if !preloader_ready {
+        return;
+    }
+    let path = external_log_path();
+    let path_state = match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => format!("file_size={}", metadata.len()),
+        Ok(_) => "not_a_regular_file".to_string(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing".to_string(),
+        Err(error) => format!("unavailable={error}"),
+    };
+    let (native_fragments, native_lines) = crate::platform::console_capture::capture_counts();
+    let file_lines = RELAY_SEEN.load(Ordering::Relaxed);
+    let file_parsed = file_lines.saturating_sub(RELAY_UNPARSED.load(Ordering::Relaxed));
+    let file_forwarded = FILE_RELAY_FORWARDED.load(Ordering::Relaxed);
+    let status = format!(
+        "PreLoader log capture | native_hook={} native_fragments={native_fragments} native_lines={native_lines} file_lines={file_lines} file_parsed={file_parsed} file_forwarded={file_forwarded} log_path={} log_status={path_state}",
+        crate::platform::console_capture::is_active(),
+        path.display(),
+    );
+    if native_lines == 0 && file_forwarded == 0 {
+        scoped_warn_message(
+            "logging",
+            &format!("{status} | no external output observed after 30s; hook-installed does not mean logs-received"),
+        );
+    } else {
+        scoped_debug_message("logging", &status);
+    }
 }
 
 fn logging_scoped_debug_relay_report(total_secs: u64) {
@@ -971,6 +1012,7 @@ static RELAY_SEEN: AtomicU64 = AtomicU64::new(0);
 static RELAY_UNPARSED: AtomicU64 = AtomicU64::new(0);
 static RELAY_FORWARDED: AtomicU64 = AtomicU64::new(0);
 static RELAY_STALE_SKIPPED: AtomicU64 = AtomicU64::new(0);
+static FILE_RELAY_FORWARDED: AtomicU64 = AtomicU64::new(0);
 
 /// Records the earliest BLoader execution point (DllMain entry). External log
 /// lines keep their original timestamps, and the shared `logs/latest.log` may
@@ -1069,14 +1111,16 @@ fn forward_external_line(external: &ExternalStructuredLine) {
     if external_line_ignored(&external.source) {
         return;
     }
-    forward_captured_record(CapturedRecord {
+    if forward_captured_record(CapturedRecord {
         timestamp_full: external.timestamp_full.clone(),
         timestamp_clock: external.timestamp_clock.clone(),
         level: external_level_for(&external.source, external.level, &external.message),
         scope: external_scope(&external.source),
         message: external.message.clone(),
         channel: CaptureChannel::FileRelay,
-    });
+    }) {
+        FILE_RELAY_FORWARDED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn forward_captured_record(record: CapturedRecord) -> bool {
