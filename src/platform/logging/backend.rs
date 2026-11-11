@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -35,8 +35,6 @@ unsafe extern "system" {
 }
 
 const CONSOLE_BACKLOG_LIMIT: usize = 4096;
-const EXTERNAL_RELAY_POLL_MS: u64 = 50;
-const EXTERNAL_RELAY_MAX_PENDING: usize = 128 * 1024;
 /// Session-wide journal of already-forwarded captured lines. Bounded by entry
 /// count, not by time: the log relay can deliver a line long after the live
 /// channels did, and a time window let those late copies through again.
@@ -72,7 +70,6 @@ static CONSOLE_ANSI_ENABLED: AtomicBool = AtomicBool::new(false);
 static CONSOLE_BACKLOG: OnceLock<Mutex<VecDeque<ConsoleBacklogRecord>>> = OnceLock::new();
 static CONSOLE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CONSOLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-static EXTERNAL_LOG_RELAY_STARTED: OnceLock<()> = OnceLock::new();
 /// The same logical record may be seen from the native console, CRT pipes,
 /// OutputDebugString, logger callback and the shared file relay. Keep a
 /// per-channel occurrence counter, rather than dropping *all* equal lines
@@ -83,7 +80,6 @@ enum CaptureChannel {
     Stdio,
     DebugString,
     Logger,
-    FileRelay,
 }
 impl CaptureChannel {
     const fn index(self) -> usize {
@@ -92,13 +88,12 @@ impl CaptureChannel {
             Self::Stdio => 1,
             Self::DebugString => 2,
             Self::Logger => 3,
-            Self::FileRelay => 4,
         }
     }
 }
 #[derive(Default)]
 struct DedupeCounts {
-    by_channel: [u32; 5],
+    by_channel: [u32; 4],
     emitted: u32,
 }
 #[derive(Default)]
@@ -239,7 +234,7 @@ pub fn init(level: &str) {
 
     let _ = LOGGING_READY.set(());
     flush_early_events();
-    spawn_relay_report();
+    spawn_capture_report();
     write_bootstrap_marker(&format!(
         "logging.init.ready level={} mode={} sinks=latest+archive+console+OutputDebugString latest={} archive={} file_writes=true",
         level,
@@ -249,82 +244,30 @@ pub fn init(level: &str) {
     ));
 }
 
-/// One-shot observability for the external log relay, mirroring the game-log
-/// channel check: every counter at zero while LeviLamina is running means the
-/// relay never saw the shared log's new content, so the console shows no
-/// native Mod or game lines.
-fn spawn_relay_report() {
-    if !file_io_policy::writes_allowed() {
-        return;
-    }
+/// Measure actual captured output, never other native loaders' log files.
+fn spawn_capture_report() {
     let _ = thread::Builder::new()
-        .name("bloader-relay-report".to_string())
+        .name("bloader-console-capture-health".to_string())
         .spawn(|| {
-            let started = Instant::now();
-            for total_secs in [30u64, 60u64, 300u64] {
-                thread::sleep(Duration::from_secs(total_secs).saturating_sub(started.elapsed()));
-                if total_secs == 30 {
-                    report_external_capture_health();
-                } else {
-                    logging_scoped_debug_relay_report(total_secs);
-                }
+            thread::sleep(Duration::from_secs(30));
+            let preloader_ready = crate::platform::mod_diagnostics::find_by_name("PreLoader")
+                .is_some_and(|identity| identity.state == "loaded");
+            if !preloader_ready || !console_is_ready() { return; }
+            let (fragments, lines) = crate::platform::console_capture::capture_counts();
+            let status = format!(
+                "native console capture | win32_hook={} crt_fwrite_hook={} crt_write_hook={} observed_fragments={} observed_lines={}",
+                crate::platform::console_capture::is_active(),
+                crate::platform::console_capture::crt_fwrite_capture_active(),
+                crate::platform::console_capture::crt_write_capture_active(),
+                fragments, lines,
+            );
+            if lines == 0 {
+                scoped_warn_message("console-capture",
+                    &format!("{status} | no external stdout/stderr traffic observed; hook installation alone is not proof of capture"));
+            } else {
+                scoped_debug_message("console-capture", &status);
             }
         });
-}
-
-/// BLoader can load PreLoader while its own logger never reaches the Windows
-/// console. Installing a detour does not guarantee that stdout is attached,
-/// and a file sink may use a different location. Give one actionable warning
-/// only when both independent input channels have received no actual records.
-fn report_external_capture_health() {
-    let preloader_ready = crate::platform::mod_diagnostics::find_by_name("PreLoader")
-        .is_some_and(|identity| identity.state == "loaded");
-    if !preloader_ready {
-        return;
-    }
-    let path = external_log_path();
-    let path_state = match fs::metadata(&path) {
-        Ok(metadata) if metadata.is_file() => format!("file_size={}", metadata.len()),
-        Ok(_) => "not_a_regular_file".to_string(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing".to_string(),
-        Err(error) => format!("unavailable={error}"),
-    };
-    let (native_fragments, native_lines) = crate::platform::console_capture::capture_counts();
-    let file_lines = RELAY_SEEN.load(Ordering::Relaxed);
-    let file_parsed = file_lines.saturating_sub(RELAY_UNPARSED.load(Ordering::Relaxed));
-    let file_forwarded = FILE_RELAY_FORWARDED.load(Ordering::Relaxed);
-    let status = format!(
-        "PreLoader log capture | win32_hook={} crt_fwrite_hook={} native_fragments={native_fragments} native_lines={native_lines} file_lines={file_lines} file_parsed={file_parsed} file_forwarded={file_forwarded} log_path={} log_status={path_state}",
-        crate::platform::console_capture::is_active(),
-        crate::platform::console_capture::crt_fwrite_capture_active(),
-        path.display(),
-    );
-    if native_lines == 0 && file_forwarded == 0 {
-        scoped_warn_message(
-            "logging",
-            &format!("{status} | no external output observed after 30s; hook-installed does not mean logs-received"),
-        );
-    } else {
-        scoped_debug_message("logging", &status);
-    }
-}
-
-fn logging_scoped_debug_relay_report(total_secs: u64) {
-    scoped_debug_message(
-        "logging",
-        &format!(
-            "capture channel check (after {total_secs}s): seen={} unparsed={} forwarded={} stale_skipped={} file_batches={} file_sync_fallbacks={} console_batches={} console_late={} console_omitted={}",
-            RELAY_SEEN.load(Ordering::Relaxed),
-            RELAY_UNPARSED.load(Ordering::Relaxed),
-            RELAY_FORWARDED.load(Ordering::Relaxed),
-            RELAY_STALE_SKIPPED.load(Ordering::Relaxed),
-            FILE_BATCHES.load(Ordering::Relaxed),
-            FILE_SYNC_FALLBACKS.load(Ordering::Relaxed),
-            CONSOLE_BATCHES.load(Ordering::Relaxed),
-            CONSOLE_LATE_TOTAL.load(Ordering::Relaxed),
-            CONSOLE_DROPPED_TOTAL.load(Ordering::Relaxed),
-        ),
-    );
 }
 
 pub fn is_ready() -> bool {
@@ -503,7 +446,6 @@ fn sanitize_file_component(value: &str) -> String {
 }
 
 pub fn set_console_handle(handle: HANDLE) {
-    let relay_offset = external_history_start_offset();
     let _ = CONSOLE_HANDLE.set(SendHandle(handle));
     CONSOLE_FORCE_ANSI.store(false, Ordering::Release);
     enable_console_ansi(handle);
@@ -516,14 +458,12 @@ pub fn set_console_handle(handle: HANDLE) {
         console_supports_ansi(),
     ));
     flush_console_backlog();
-    start_external_log_relay(relay_offset);
 }
 
 /// Installs a non-console stream (for example a Windows Terminal named-pipe
 /// mirror) as the interactive output sink. ANSI is forced because GetConsoleMode
 /// is not defined for pipe handles.
 pub fn set_console_stream_handle(handle: HANDLE, ansi: bool) {
-    let relay_offset = external_history_start_offset();
     let _ = CONSOLE_HANDLE.set(SendHandle(handle));
     CONSOLE_FORCE_ANSI.store(ansi, Ordering::Release);
     CONSOLE_ANSI_ENABLED.store(ansi, Ordering::Release);
@@ -533,7 +473,6 @@ pub fn set_console_stream_handle(handle: HANDLE, ansi: bool) {
         ansi,
     ));
     flush_console_backlog();
-    start_external_log_relay(relay_offset);
 }
 
 pub fn startup_banner(
@@ -880,146 +819,7 @@ fn flush_console_backlog() {
     }
 }
 
-/// Discover the bounded history range without performing file I/O on the
-/// Minecraft bootstrap thread. The relay worker parses this tail asynchronously.
-/// Older entries are excluded by the process-start timestamp filter.
-const EXTERNAL_HISTORY_TAIL_BYTES: u64 = 4 * 1024 * 1024;
-
-/// LeviLamina's default FileSink writes logs/latest.log relative to the game
-/// directory. Resolve it once from the executable, not the process CWD:
-/// native mods may change the CWD after our relay starts.
-fn external_log_path() -> PathBuf {
-    crate::platform::utils::get_exe_directory()
-        .join("logs")
-        .join("latest.log")
-}
-
-fn external_history_start_offset() -> u64 {
-    if !file_io_policy::writes_allowed() {
-        return 0;
-    }
-    let path = external_log_path();
-    fs::metadata(path)
-        .map(|metadata| metadata.len().saturating_sub(EXTERNAL_HISTORY_TAIL_BYTES))
-        .unwrap_or(0)
-}
-
-fn start_external_log_relay(start_offset: u64) {
-    if !file_io_policy::writes_allowed() || EXTERNAL_LOG_RELAY_STARTED.set(()).is_err() {
-        return;
-    }
-    let path = external_log_path();
-    let _ = thread::Builder::new()
-        .name("bloader-external-log-relay".to_string())
-        .spawn(move || tail_external_structured_log(&path, start_offset));
-}
-
-/// Cheap identity of the file currently living at `path`: creation time plus
-/// size. LeviLamina rotates `latest.log` by renaming it and creating a fresh
-/// one; a renamed file keeps its content, so a size-only check cannot tell
-/// "the other writer truncated" apart from "the file was swapped" — and both
-/// break the byte offset differently. Comparing creation time detects the
-/// swap reliably.
-#[cfg(windows)]
-fn file_epoch(path: &Path) -> Option<(u64, u64)> {
-    use std::os::windows::fs::MetadataExt;
-    let metadata = fs::metadata(path).ok()?;
-    // creation_time() is the Win32 FILETIME (100ns ticks since 1601).
-    Some((metadata.creation_time(), metadata.len()))
-}
-
-#[cfg(not(windows))]
-fn file_epoch(path: &Path) -> Option<(u64, u64)> {
-    let metadata = fs::metadata(path).ok()?;
-    Some((0, metadata.len()))
-}
-
-fn tail_external_structured_log(path: &Path, mut offset: u64) {
-    let mut pending = Vec::<u8>::new();
-    let mut buffer = [0u8; 16 * 1024];
-    let mut epoch = file_epoch(path);
-
-    loop {
-        if !console_is_ready() {
-            thread::sleep(Duration::from_millis(EXTERNAL_RELAY_POLL_MS));
-            continue;
-        }
-
-        let current = file_epoch(path);
-        let rotated_or_truncated = match (epoch, current) {
-            (Some((old_creation, _)), Some((new_creation, new_len))) => {
-                old_creation != new_creation || new_len < offset
-            }
-            (None, None) => false,
-            _ => true,
-        };
-        if rotated_or_truncated {
-            // Rotation or truncation invalidates the byte offset; appends do not.
-            offset = 0;
-            pending.clear();
-        }
-        epoch = current;
-
-        if let Ok(mut file) = File::open(path) {
-            if file.seek(SeekFrom::Start(offset)).is_ok() {
-                loop {
-                    match file.read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(read) => {
-                            offset += read as u64;
-                            pending.extend_from_slice(&buffer[..read]);
-                            drain_external_structured_lines(&mut pending);
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-
-        if pending.len() > EXTERNAL_RELAY_MAX_PENDING {
-            pending.clear();
-        }
-        thread::sleep(Duration::from_millis(EXTERNAL_RELAY_POLL_MS));
-    }
-}
-
-fn drain_external_structured_lines(pending: &mut Vec<u8>) {
-    let mut consumed = 0usize;
-    for (index, byte) in pending.iter().enumerate() {
-        if *byte != b'\n' {
-            continue;
-        }
-        let line = String::from_utf8_lossy(&pending[consumed..index])
-            .trim_end_matches('\r')
-            .to_string();
-        consumed = index + 1;
-        RELAY_SEEN.fetch_add(1, Ordering::Relaxed);
-        let Some(external) = parse_external_structured_line(&line) else {
-            RELAY_UNPARSED.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
-        forward_external_line(&external);
-    }
-    if consumed > 0 {
-        pending.drain(..consumed);
-    }
-}
-
-/// Relay observability: how many lines the latest.log tailer read, how many
-/// carried a structured header, how many passed the current-run filter and
-/// reached the sinks. All zero with LeviLamina running means the relay never
-/// saw the file's new content (rotation detection or offset issue).
-static RELAY_SEEN: AtomicU64 = AtomicU64::new(0);
-static RELAY_UNPARSED: AtomicU64 = AtomicU64::new(0);
-static RELAY_FORWARDED: AtomicU64 = AtomicU64::new(0);
-static RELAY_STALE_SKIPPED: AtomicU64 = AtomicU64::new(0);
-static FILE_RELAY_FORWARDED: AtomicU64 = AtomicU64::new(0);
-
-/// Records the earliest BLoader execution point (DllMain entry). External log
-/// lines keep their original timestamps, and the shared `logs/latest.log` may
-/// still hold entire previous sessions when LeviLamina has not truncated it
-/// yet, so anything older than this moment is history and must never be
-/// re-printed on the console.
+/// Earliest runtime timestamp; used to reject stale structured messages.
 pub fn note_process_start() {
     let _ = PROCESS_START_TIMESTAMP.set(current_console_timestamp().0);
 }
@@ -1031,7 +831,6 @@ fn external_line_from_current_run(timestamp_full: &str) -> bool {
 }
 
 fn external_timestamp_at_or_after(timestamp_full: &str, process_start: &str) -> bool {
-    // Source loggers may omit milliseconds; include the shared first second.
     let event_second = timestamp_full.get(..19).unwrap_or(timestamp_full);
     let start_second = process_start.get(..19).unwrap_or(process_start);
     event_second >= start_second
@@ -1104,35 +903,13 @@ fn forward_captured_now(
     });
 }
 
-/// Forwards one parsed external line to the unified sinks. The live Win32
-/// console capture and the shared `latest.log` tail relay both call this path,
-/// so native mods (LeviLamina, the Bedrock server, ...) and the game itself
-/// render exactly like BLoader's own log events.
-fn forward_external_line(external: &ExternalStructuredLine) {
-    if external_line_ignored(&external.source) {
-        return;
-    }
-    if forward_captured_record(CapturedRecord {
-        timestamp_full: external.timestamp_full.clone(),
-        timestamp_clock: external.timestamp_clock.clone(),
-        level: external_level_for(&external.source, external.level, &external.message),
-        scope: external_scope(&external.source),
-        message: external.message.clone(),
-        channel: CaptureChannel::FileRelay,
-    }) {
-        FILE_RELAY_FORWARDED.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 fn forward_captured_record(record: CapturedRecord) -> bool {
     if !external_line_from_current_run(&record.timestamp_full) {
-        RELAY_STALE_SKIPPED.fetch_add(1, Ordering::Relaxed);
         return false;
     }
     if !record_captured_line_once(&record) {
         return false;
     }
-    RELAY_FORWARDED.fetch_add(1, Ordering::Relaxed);
     if console_should_show(record.level, &record.scope, &record.message) {
         if console_is_ready() {
             write_console_record_at(
@@ -2219,9 +1996,9 @@ mod external_line_tests {
         };
         assert!(record_captured_line_once(&record(CaptureChannel::Console)));
         assert!(record_captured_line_once(&record(CaptureChannel::Console)));
-        assert!(!record_captured_line_once(&record(CaptureChannel::FileRelay)));
-        assert!(!record_captured_line_once(&record(CaptureChannel::FileRelay)));
-        assert!(record_captured_line_once(&record(CaptureChannel::FileRelay)));
+        assert!(!record_captured_line_once(&record(CaptureChannel::Stdio)));
+        assert!(!record_captured_line_once(&record(CaptureChannel::Stdio)));
+        assert!(record_captured_line_once(&record(CaptureChannel::Stdio)));
     }
 
     #[test]
