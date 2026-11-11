@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -1023,8 +1023,8 @@ fn known_external_scope(line: &str) -> Option<String> {
 
 /// Returns `false` when the same captured line (timestamp + text) was already
 /// forwarded inside the dedupe window. A native mod may print a line to the
-/// console and append the identical line to `latest.log`; without this journal
-/// the unified sinks would record it twice.
+/// console and also use a second live output channel; without this journal
+/// the unified sinks could record the same emission twice.
 /// Normalizes one captured line into the dedupe key. The same logical line
 /// arrives from different channels with different decorations: the console
 /// copy may carry a leading `[Logger]` tag that the parsed copy already
