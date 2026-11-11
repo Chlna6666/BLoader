@@ -11,6 +11,7 @@
 use core::ffi::c_void;
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use windows::Win32::Foundation::{GetLastError, SetLastError};
 
 use minhook::MinHook;
 use windows::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
@@ -37,6 +38,16 @@ static OBSERVED_LINES: AtomicU64 = AtomicU64::new(0);
 static ORIGINAL_W: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_A: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_FILE: AtomicUsize = AtomicUsize::new(0);
+
+// LeviLamina's ConsoleSink falls back to fwrite(stdout) when its CRT stdout
+// is not a terminal. Its FileSink buffers INFO without an immediate flush,
+// so the latest.log relay alone cannot provide live output. Intercept only
+// the CRT's standard output streams; never rebind or flush its FILE* objects.
+static CRT_FWRITE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+static CRT_STDOUT: AtomicUsize = AtomicUsize::new(0);
+static CRT_STDERR: AtomicUsize = AtomicUsize::new(0);
+static CRT_FWRITE_READY: AtomicBool = AtomicBool::new(false);
+static CRT_FWRITE_INSTALLING: AtomicBool = AtomicBool::new(false);
 thread_local! {
     static BYPASS: Cell<bool> = const { Cell::new(false) };
     // A hooked implementation may re-enter another hooked export (for example
@@ -60,6 +71,8 @@ unsafe extern "system" {
     ) -> i32;
 }
 type WriteFn = unsafe extern "system" fn(*mut c_void, *const c_void, u32, *mut u32, *mut c_void) -> i32;
+type FwriteFn = unsafe extern "C" fn(*const c_void, usize, usize, *mut c_void) -> usize;
+type CrtIobFn = unsafe extern "C" fn(i32) -> *mut c_void;
 
 pub fn with_passthrough<T>(f: impl FnOnce() -> T) -> T {
     BYPASS.with(|cell| {
@@ -76,6 +89,132 @@ pub fn with_passthrough<T>(f: impl FnOnce() -> T) -> T {
 /// file relay remains the fallback for other output transports.
 pub fn is_active() -> bool {
     READY.load(Ordering::Acquire)
+}
+
+/// True only when the ucrtbase fwrite fallback has an active trampoline.
+/// This is independent of Win32 WriteConsole/WriteFile capture activation.
+pub fn crt_fwrite_capture_active() -> bool {
+    CRT_FWRITE_READY.load(Ordering::Acquire)
+}
+
+/// Installs a passive write observer for LeviLamina's documented
+/// fwrite(stdout) fallback. No CRT FILE*, file descriptor, or return value
+/// is modified, and non-stdio fwrite calls are forwarded without inspection.
+pub fn install_crt_fwrite_capture() {
+    if CRT_FWRITE_READY.load(Ordering::Acquire)
+        || CRT_FWRITE_INSTALLING.swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    struct ResetInstalling;
+    impl Drop for ResetInstalling {
+        fn drop(&mut self) {
+            CRT_FWRITE_INSTALLING.store(false, Ordering::Release);
+        }
+    }
+    let _reset = ResetInstalling;
+    if !logging::console_is_ready() {
+        return;
+    }
+    let Ok(module) = (unsafe { GetModuleHandleW(w!("ucrtbase.dll")) }) else {
+        // Some versions load ucrtbase only with PreLoader's dependency graph.
+        // The caller retries once after loading PreLoader.
+        return;
+    };
+    let Some(iob_address) = (unsafe { GetProcAddress(module, PCSTR(b"__acrt_iob_func\0".as_ptr())) }) else {
+        return;
+    };
+    let Some(fwrite_address) = (unsafe { GetProcAddress(module, PCSTR(b"fwrite\0".as_ptr())) }) else {
+        return;
+    };
+    let get_iob: CrtIobFn = unsafe { std::mem::transmute(iob_address) };
+    let stdout_stream = unsafe { get_iob(1) };
+    let stderr_stream = unsafe { get_iob(2) };
+    if stdout_stream.is_null() || stderr_stream.is_null() {
+        return;
+    }
+    let target = fwrite_address as *const () as *mut c_void;
+    match unsafe { MinHook::create_hook(target, intercept_crt_fwrite as *mut c_void) } {
+        Ok(original) => {
+            // Store the original and the exact ucrtbase FILE* addresses
+            // before enabling the detour for other native logger threads.
+            CRT_FWRITE_ORIGINAL.store(original as usize, Ordering::Release);
+            CRT_STDOUT.store(stdout_stream as usize, Ordering::Release);
+            CRT_STDERR.store(stderr_stream as usize, Ordering::Release);
+            match unsafe { MinHook::enable_hook(target) } {
+                Ok(()) => {
+                    CRT_FWRITE_READY.store(true, Ordering::Release);
+                    logging::scoped_debug_message(
+                        "console-capture",
+                        "CRT stdout/stderr fallback capture active (ucrtbase!fwrite, streams=readonly, output=passthrough)",
+                    );
+                }
+                Err(error) => {
+                    let _ = unsafe { MinHook::remove_hook(target) };
+                    CRT_FWRITE_ORIGINAL.store(0, Ordering::Release);
+                    CRT_STDOUT.store(0, Ordering::Release);
+                    CRT_STDERR.store(0, Ordering::Release);
+                    logging::scoped_debug_message(
+                        "console-capture",
+                        &format!("optional CRT fwrite capture unavailable: {error:?}"),
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            logging::scoped_debug_message(
+                "console-capture",
+                &format!("optional CRT fwrite capture not installed: {error:?}"),
+            );
+        }
+    }
+}
+
+fn bounded_crt_write_length(size: usize, count: usize) -> Option<usize> {
+    size.checked_mul(count).filter(|length| *length > 0 && *length <= MAX_WRITE)
+}
+
+unsafe extern "C" fn intercept_crt_fwrite(
+    data: *const c_void,
+    size: usize,
+    count: usize,
+    stream: *mut c_void,
+) -> usize {
+    let original_address = CRT_FWRITE_ORIGINAL.load(Ordering::Acquire);
+    if original_address == 0 {
+        return 0;
+    }
+    let original: FwriteFn = unsafe { std::mem::transmute(original_address) };
+    let stdout = CRT_STDOUT.load(Ordering::Acquire);
+    let stderr = CRT_STDERR.load(Ordering::Acquire);
+    if !CRT_FWRITE_READY.load(Ordering::Acquire)
+        || (stream as usize != stdout && stream as usize != stderr)
+        || BYPASS.with(Cell::get)
+        || IN_DETOUR.with(Cell::get)
+    {
+        return unsafe { original(data, size, count, stream) };
+    }
+
+    IN_DETOUR.with(|in_detour| in_detour.set(true));
+    let _guard = DetourGuard;
+    // Call through unchanged. In particular do not lie about fwrite's return
+    // when the external CRT stdout is invalid or points to a closed pipe.
+    let result = unsafe { original(data, size, count, stream) };
+    let last_error = unsafe { GetLastError() };
+    if !data.is_null() {
+        if let Some(length) = bounded_crt_write_length(size, count) {
+            let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, length) };
+            // No attempt is made to parse binary output or arbitrary FILE*.
+            if !bytes.contains(&0) {
+                let _ = std::panic::catch_unwind(|| {
+                    let decoded = decode_ansi(bytes);
+                    let _ = capture(std::ptr::null_mut(), &decoded, caller_scope);
+                });
+            }
+        }
+    }
+    unsafe { SetLastError(last_error) };
+    result
 }
 
 /// Actual native console traffic, not the presence of the MinHook trampolines.
@@ -338,6 +477,15 @@ unsafe extern "system" fn intercept_file(h: *mut c_void, data: *const c_void, le
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn crt_write_observation_never_overflows_or_decodes_huge_buffers() {
+        assert_eq!(bounded_crt_write_length(1, 8), Some(8));
+        assert_eq!(bounded_crt_write_length(2, 3), Some(6));
+        assert_eq!(bounded_crt_write_length(0, 9), None);
+        assert_eq!(bounded_crt_write_length(usize::MAX, 2), None);
+        assert_eq!(bounded_crt_write_length(MAX_WRITE + 1, 1), None);
+    }
+
     #[test]
     fn preserves_colored_fragments_with_single_attribution() {
         let calls = std::cell::Cell::new(0usize);
