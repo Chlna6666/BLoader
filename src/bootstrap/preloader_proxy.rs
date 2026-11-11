@@ -87,6 +87,9 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
     // Only repair missing Win32 handles. Never rebind another loader's CRT
     // stdout/stderr or replace an inherited pipe/file destination.
     unsafe { crate::platform::console::prepare_native_loader_std_handles() };
+    // LeviLamina uses fwrite(stdout) when stdout is not a tty. Observing
+    // that fallback is necessary because its FileSink does not flush INFO.
+    crate::platform::console_capture::install_crt_fwrite_capture();
     let discovered = candidates.len();
     let candidate = candidates.remove(0);
     let expected = canonical_or_original(&candidate.path);
@@ -117,6 +120,7 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
     if let Some(module) = module_by_name(PRELOADER_DLL) {
         let resolved = canonical_or_original(&crate::platform::utils::get_module_path(module.0 as usize));
         if paths_equivalent(&expected, &resolved) {
+            crate::platform::console_capture::install_crt_fwrite_capture();
             mod_diagnostics::mark_loaded(&identity, module.0 as usize, "preloader_preexisting");
             logging::write_bootstrap_marker(&format!(
                 "preloader.priority.preexisting module=0x{:X} path={}",
@@ -174,6 +178,9 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
 
     match load_result {
         Ok(module) => {
+            // ucrtbase may have arrived as a PreLoader dependency. Install
+            // the passive CRT observer now if it was absent before LoadLibrary.
+            crate::platform::console_capture::install_crt_fwrite_capture();
             let resolved = canonical_or_original(&crate::platform::utils::get_module_path(module.0 as usize));
             if !paths_equivalent(&expected, &resolved) {
                 let detail = format!(
@@ -208,13 +215,18 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
             logging::scoped_info_message(
                 "preloader",
                 &format!(
-                    "External loader observation | LeviLamina.dll={} | native_console_capture={} | stdout={} | external_mods=delegated",
+                    "External loader observation | LeviLamina.dll={} | win32_capture={} | crt_fwrite_capture={} | stdout={} | external_mods=delegated",
                     if module_by_name("LeviLamina.dll").is_some() {
                         "present"
                     } else {
                         "not_detected_at_preload_return"
                     },
                     if crate::platform::console_capture::is_active() {
+                        "active"
+                    } else {
+                        "inactive"
+                    },
+                    if crate::platform::console_capture::crt_fwrite_capture_active() {
                         "active"
                     } else {
                         "inactive"
