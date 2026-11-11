@@ -241,22 +241,17 @@ fn discover_candidates(game_dir: &Path) -> Vec<Candidate> {
     if !path.is_file() {
         return Vec::new();
     }
-    // BLoader-owned metadata lives in bloader.json, outside LeviLamina's
-    // manifest.json scanner. Retain legacy read-only fallback for old installs.
-    let sidecar = dir.join("bloader.json");
-    let manifest_path = if sidecar.is_file() {
-        sidecar
-    } else {
-        dir.join("manifest.json")
-    };
-    let manifest = fs::read_to_string(&manifest_path)
+    // Only BLoader-owned metadata can authorize loading PreLoader.dll.
+    // LeviLamina's manifest.json must never be accepted as a bootstrap
+    // fallback, even if it happens to contain an old BLoader type string.
+    let manifest = fs::read_to_string(dir.join("bloader.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
-    let is_bootstrap = manifest
-        .as_ref()
-        .and_then(|manifest| manifest.get("type"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|kind| kind == PRELOAD_TYPE);
+    let is_bootstrap = manifest.as_ref().is_some_and(|manifest| {
+        manifest.get("type").and_then(serde_json::Value::as_str) == Some(PRELOAD_TYPE)
+            && manifest.get("entry").and_then(serde_json::Value::as_str) == Some(PRELOADER_DLL)
+            && manifest.get("name").and_then(serde_json::Value::as_str) == Some("PreLoader")
+    });
     if !is_bootstrap {
         return Vec::new();
     }
