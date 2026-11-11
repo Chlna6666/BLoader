@@ -151,6 +151,29 @@ mod tests {
     }
 
     #[test]
+    fn redirected_instance_includes_account_profile_capes() {
+        let data_root = std::env::temp_dir().join(format!(
+            "bloader-cape-instance-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let account = data_root.join("Users").join("1234567890123456789")
+            .join("games").join("com.mojang");
+        std::fs::create_dir_all(&account).unwrap();
+        let mut config = Config::default();
+        config.enable_redirection = true;
+        config.redirection_root = data_root.to_string_lossy().into_owned();
+        let roots = resolve_roots(&config, Path::new(r"C:\Minecraft"));
+        assert!(roots.iter().any(|root| canonical_key(root) == canonical_key(&account)),
+            "redirected instance account profile must be scanned: {roots:?}");
+        assert!(!account.join("capes").exists(), "root resolution must not create a cape directory");
+        std::fs::remove_dir_all(&data_root).unwrap();
+    }
+
+    #[test]
     fn uwp_candidates_cover_preview_and_education() {
         let candidates = com_mojang_candidates();
         assert!(candidates.iter().any(|p| {
