@@ -465,8 +465,9 @@ fn redirected_std_handle(handle: *mut c_void) -> bool {
     let stderr = unsafe { GetStdHandle(STD_ERROR_HANDLE).ok() };
     if !stdout.is_some_and(|value| value.0 == handle)
         && !stderr.is_some_and(|value| value.0 == handle) { return false; }
-    let mut mode = 0;
-    (unsafe { GetConsoleMode(handle, &mut mode) == 0 }) && live_console_transport(handle)
+    // Only redirected pipes qualify. A redirected file (.log or otherwise)
+    // never enters the live console pipeline.
+    unsafe { GetFileType(handle) == 3 }
 }
 
 /// Resolves the module behind the detour caller. `FramesToSkip=2` skips this
@@ -626,8 +627,14 @@ unsafe extern "system" fn intercept_file(h: *mut c_void, data: *const c_void, le
     if data.is_null() || len == 0 || (len as usize) > MAX_WRITE || !overlapped.is_null() {
         return unsafe { call_original(&ORIGINAL_FILE, h, data, len, count, overlapped) };
     }
-    let is_console = eligible(h);
-    let is_redirected_stdout = !is_console && redirected_std_handle(h);
+    // Most Minecraft writes target disk files. Reject them before expensive
+    // console and std-handle probes on the game I/O hot path.
+    let kind = unsafe { GetFileType(h) };
+    if kind != 2 && kind != 3 {
+        return unsafe { call_original(&ORIGINAL_FILE, h, data, len, count, overlapped) };
+    }
+    let is_console = kind == 2 && eligible(h);
+    let is_redirected_stdout = kind == 3 && redirected_std_handle(h);
     if !is_console && !is_redirected_stdout {
         return unsafe { call_original(&ORIGINAL_FILE, h, data, len, count, overlapped) };
     }
