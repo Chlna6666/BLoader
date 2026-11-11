@@ -83,6 +83,10 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
         };
     }
 
+    // A GUI-subsystem Minecraft process may have no standard output handle.
+    // Only repair missing Win32 handles. Never rebind another loader's CRT
+    // stdout/stderr or replace an inherited pipe/file destination.
+    unsafe { crate::platform::console::prepare_native_loader_std_handles() };
     let discovered = candidates.len();
     let candidate = candidates.remove(0);
     let expected = canonical_or_original(&candidate.path);
@@ -204,7 +208,7 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
             logging::scoped_info_message(
                 "preloader",
                 &format!(
-                    "External loader observation | LeviLamina.dll={} | native_console_capture={} | relay_path={} | external_mods=delegated",
+                    "External loader observation | LeviLamina.dll={} | native_console_capture={} | stdout={} | external_mods=delegated",
                     if module_by_name("LeviLamina.dll").is_some() {
                         "present"
                     } else {
@@ -215,7 +219,7 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
                     } else {
                         "inactive"
                     },
-                    "logs/latest.log",
+                    crate::platform::console::native_loader_stdout_kind(),
                 ),
             );
             logging::write_bootstrap_marker(&format!(
