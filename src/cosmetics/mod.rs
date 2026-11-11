@@ -37,8 +37,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::config::Config;
 use crate::platform::logging;
 
-use local_capes::TextureMode;
-
 static HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
 static INSTALL_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
@@ -148,15 +146,11 @@ pub fn install(config: &Config, game_dir: &Path) -> bool {
 
     let root = cosmetics_root(game_dir);
     let (cfg, config_source) = load_rules(&root);
-    // The original-size experimental mode can yield an invisible player cape.
-    // Keep the officially compatible 64x32 Persona texture invariant.
-    let texture_mode = TextureMode::Canonical;
     let roots = cape_roots::resolve_roots(config, game_dir);
     if let Err(error) = winhttp::set_runtime(
         cfg,
         root,
         roots,
-        texture_mode,
         config.default_locale.clone(),
     ) {
         logging::scoped_error_message(
@@ -184,8 +178,7 @@ pub fn install(config: &Config, game_dir: &Path) -> bool {
     logging::scoped_info_message(
         "cosmetics",
         &format!(
-            "local cape resources ready; WinHTTP hooks installed before OEP; config_source={config_source} texture_mode={}",
-            texture_mode.as_str()
+            "local cape resources ready; WinHTTP hooks installed before OEP; config_source={config_source}"
         ),
     );
     true
