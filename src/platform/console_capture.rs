@@ -69,6 +69,13 @@ pub fn with_passthrough<T>(f: impl FnOnce() -> T) -> T {
     })
 }
 
+/// Indicates whether at least one native console write export is hooked.
+/// This does not imply the external loader uses those APIs; the structured
+/// file relay remains the fallback for other output transports.
+pub fn is_active() -> bool {
+    READY.load(Ordering::Acquire)
+}
+
 pub fn install() {
     if !logging::console_is_ready() { return; }
     if ATTEMPTED.swap(true, Ordering::AcqRel) { return; }
