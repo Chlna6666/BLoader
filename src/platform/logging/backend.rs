@@ -1890,18 +1890,14 @@ struct ConsoleLine {
     message: String,
 }
 
-enum ConsoleCommand {
-    Line(ConsoleLine),
-    Repaint { columns: usize, rows: usize },
-}
-
-static CONSOLE_SINK: OnceLock<Option<std::sync::mpsc::SyncSender<ConsoleCommand>>> = OnceLock::new();
+// The console is append-only during the session. Terminal hosts own resize
+// and scrollback; no window event is allowed to clear/replay a partial history.
+static CONSOLE_SINK: OnceLock<Option<std::sync::mpsc::SyncSender<ConsoleLine>>> = OnceLock::new();
 static CONSOLE_DROPPED: AtomicUsize = AtomicUsize::new(0);
 static CONSOLE_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONSOLE_LATE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONSOLE_BATCHES: AtomicU64 = AtomicU64::new(0);
 const CONSOLE_QUEUE_LIMIT: usize = 8192;
-const CONSOLE_HISTORY_LIMIT: usize = 512;
 const CONSOLE_BATCH_LIMIT: usize = 128;
 const CONSOLE_REORDER_WINDOW: Duration = Duration::from_millis(24);
 
@@ -1925,7 +1921,6 @@ fn console_display_time(actual: &str, last: &mut String) -> (String, bool) {
 
 fn append_console_line(
     line: ConsoleLine,
-    history: &mut VecDeque<Vec<u8>>,
     output: &mut Vec<u8>,
     last_display: &mut String,
 ) {
@@ -1939,60 +1934,26 @@ fn append_console_line(
     } else {
         format_console_line_at(&display_time, line.level, &line.scope, &line.message).into_bytes()
     };
-    if history.len() == CONSOLE_HISTORY_LIMIT {
-        history.pop_front();
-    }
     output.extend_from_slice(&rendered);
-    history.push_back(rendered);
 }
 
-fn repaint_console(columns: usize, rows: usize, history: &VecDeque<Vec<u8>>) {
-    if !console_supports_ansi() {
-        return;
-    }
-    let banner = crate::platform::console_branding::render_banner(columns, true);
-    let mut output = Vec::<u8>::new();
-    output.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[3J\x1b[H");
-    for line in &banner {
-        output.extend_from_slice(line.as_bytes());
-        output.extend_from_slice(b"\r\n");
-    }
-    let visible_records = rows
-        .saturating_sub(banner.len().saturating_add(1))
-        .saturating_div(2)
-        .min(32);
-    let skip = history.len().saturating_sub(visible_records);
-    for line in history.iter().skip(skip) {
-        output.extend_from_slice(line);
-    }
-    write_bytes_to_console_locked(&output);
-}
-
-fn console_sink() -> &'static Option<std::sync::mpsc::SyncSender<ConsoleCommand>> {
+fn console_sink() -> &'static Option<std::sync::mpsc::SyncSender<ConsoleLine>> {
     CONSOLE_SINK.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<ConsoleCommand>(CONSOLE_QUEUE_LIMIT);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<ConsoleLine>(CONSOLE_QUEUE_LIMIT);
         match thread::Builder::new()
             .name("bloader-console-writer".to_string())
             .spawn(move || {
-                let mut history = VecDeque::<Vec<u8>>::new();
                 let mut last_display = String::new();
                 while let Ok(first) = receiver.recv() {
                     let mut lines = Vec::<ConsoleLine>::with_capacity(CONSOLE_BATCH_LIMIT);
-                    let mut repaint = None;
-                    match first {
-                        ConsoleCommand::Line(line) => lines.push(line),
-                        ConsoleCommand::Repaint { columns, rows } => repaint = Some((columns, rows)),
-                    }
+                    lines.push(first);
                     let started = Instant::now();
                     while lines.len() < CONSOLE_BATCH_LIMIT {
                         let Some(remaining) = CONSOLE_REORDER_WINDOW.checked_sub(started.elapsed()) else {
                             break;
                         };
                         match receiver.recv_timeout(remaining) {
-                            Ok(ConsoleCommand::Line(line)) => lines.push(line),
-                            Ok(ConsoleCommand::Repaint { columns, rows }) => {
-                                repaint = Some((columns, rows));
-                            }
+                            Ok(line) => lines.push(line),
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                         }
@@ -2004,7 +1965,7 @@ fn console_sink() -> &'static Option<std::sync::mpsc::SyncSender<ConsoleCommand>
                     CONSOLE_BATCHES.fetch_add(1, Ordering::Relaxed);
                     let mut output = Vec::<u8>::with_capacity(lines.len() * 160);
                     for line in lines {
-                        append_console_line(line, &mut history, &mut output, &mut last_display);
+                        append_console_line(line, &mut output, &mut last_display);
                     }
                     let skipped = CONSOLE_DROPPED.swap(0, Ordering::Relaxed);
                     if skipped > 0 {
@@ -2024,13 +1985,10 @@ fn console_sink() -> &'static Option<std::sync::mpsc::SyncSender<ConsoleCommand>
                                     }
                                 ),
                             },
-                            &mut history, &mut output, &mut last_display,
+                            &mut output, &mut last_display,
                         );
                     }
                     write_bytes_to_console_locked(&output);
-                    if let Some((columns, rows)) = repaint {
-                        repaint_console(columns, rows, &history);
-                    }
                 }
             }) {
             Ok(_) => Some(sender),
@@ -2043,15 +2001,6 @@ fn console_sink() -> &'static Option<std::sync::mpsc::SyncSender<ConsoleCommand>
             }
         }
     })
-}
-
-pub fn request_console_repaint(columns: usize, rows: usize) {
-    if !console_is_ready() || columns == 0 || rows == 0 {
-        return;
-    }
-    if let Some(sender) = console_sink() {
-        let _ = sender.try_send(ConsoleCommand::Repaint { columns, rows });
-    }
 }
 
 fn write_console_record_at(timestamp_full: &str, level: Level, scope: &str, message: &str) {
@@ -2067,7 +2016,7 @@ fn write_console_record_at(timestamp_full: &str, level: Level, scope: &str, mess
         scope: scope.to_string(),
         message: message.to_string(),
     };
-    if sender.try_send(ConsoleCommand::Line(line)).is_err() {
+    if sender.try_send(line).is_err() {
         // Never fall back to synchronous WriteFile from a native hook.
         CONSOLE_DROPPED.fetch_add(1, Ordering::Relaxed);
         CONSOLE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -2149,6 +2098,32 @@ fn write_debug_string(line: &str) {
 mod compact_console_tests {
     use super::*;
 
+    #[test]
+    fn console_batch_keeps_every_record_without_clearing_scrollback() {
+        let mut output = Vec::new();
+        let mut last_display = String::new();
+        // Simulate a long console session. Window movement/resize must never
+        // truncate this output or insert terminal history erase commands.
+        for index in 0..600 {
+            append_console_line(
+                ConsoleLine {
+                    timestamp_full: format!("2026-11-11 14:32:{:02}.000", index / 60),
+                    sequence: index,
+                    level: Level::INFO,
+                    scope: "loader".into(),
+                    message: format!("record-{index:04}"),
+                },
+                &mut output,
+                &mut last_display,
+            );
+        }
+        let text = String::from_utf8(output).unwrap();
+        for index in 0..600 {
+            assert!(text.contains(&format!("record-{index:04}")));
+        }
+        assert!(!text.contains("\x1b[2J"));
+        assert!(!text.contains("\x1b[3J"));
+    }
     #[test]
     fn console_uses_second_precision_without_sequence() {
         assert_eq!(compact_console_clock("10:09:04.376"), "10:09:04");
