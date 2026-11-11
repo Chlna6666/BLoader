@@ -3,7 +3,7 @@
 //! BLoader 移植版：日志走 BLoader logging（scope=cosmetics），钩子经 `minhook`
 //! crate 安装，运行时装配由 `super::mod` 在 bootstrap 阶段完成。
 use super::response::{Config, Mode};
-use super::{TextureMode, codec, debug, diagnostics, local_capes, persona};
+use super::{codec, debug, diagnostics, local_capes, persona};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -98,7 +98,6 @@ struct Runtime {
     cfg: Config,
     root: PathBuf,
     cape_roots: Vec<PathBuf>,
-    texture_mode: TextureMode,
     locale: String,
 }
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -262,12 +261,11 @@ fn should_intercept(cfg: &Config, host: &str, path: &str, method: &str) -> bool 
 }
 
 /// BLoader 移植：由 `super::install` 在装钩子之前装配运行时
-/// （规则配置、Cosmetics 数据目录、披风扫描根、纹理模式）。
+/// （HTTP 规则、内部数据目录与游戏披风扫描根）。
 pub fn set_runtime(
     cfg: Config,
     root: PathBuf,
     cape_roots: Vec<PathBuf>,
-    texture_mode: TextureMode,
     locale: String,
 ) -> Result<(), String> {
     RUNTIME
@@ -275,7 +273,6 @@ pub fn set_runtime(
             cfg,
             root,
             cape_roots,
-            texture_mode,
             locale,
         })
         .map_err(|_| "cosmetics runtime already initialized".to_string())
@@ -296,9 +293,8 @@ pub fn set_master_enabled(enabled: bool) {
 /// 横幅、逐包注册、规则清单等明细全部为 debug 级遥测。
 pub fn prepare_local_resources() {
     let Some(runtime) = RUNTIME.get() else { return };
-    let texture_mode = runtime.texture_mode;
     let roots = runtime.cape_roots.clone();
-    let registry = local_capes::initialize(&roots, texture_mode, &runtime.locale);
+    let registry = local_capes::initialize(&roots, &runtime.locale);
     logger("============================================================");
     logger(&format!(
         "BLoader {} built-in cosmetics | origin=Chlna6666/Cosmetics | license=GPL-3.0-only",
@@ -308,10 +304,7 @@ pub fn prepare_local_resources() {
     logger(
         "Scope: local cape catalog, virtual thumbnails and Persona download; no Minecraft skin/equip hook",
     );
-    logger(&format!(
-        "logs=bloader latest.log scope=cosmetics texture_mode={}",
-        texture_mode.as_str()
-    ));
+    logger("logs=bloader latest.log scope=cosmetics persona_atlas=64x32");
     logger(&format!(
         "local_capes ZIP_SCAN complete discovered={} validated={} rejected={} skipped={} roots={} registered_items={} registered_assets={} native_persona={} generated_persona={} in_game_loaded=UNVERIFIED",
         registry.discovered_packs,
