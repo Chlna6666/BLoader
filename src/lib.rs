@@ -126,6 +126,10 @@ fn run_bootstrap_sequence(execution_mode: &'static str) -> bool {
     }
 
     crate::platform::crash_report::install();
+    // Capture minimal first-chance evidence for game-owned access violations
+    // before PreLoader installs the external crash filter. The observer never
+    // intercepts exception dispatch, writes a dump or claims fault ownership.
+    crate::platform::crash_report::enable_passive_game_exception_observer();
 
     // LeviLamina owns its own async logger and exception/crash hooks.
     // Avoid process-wide OutputDebugString interception when delegating to
