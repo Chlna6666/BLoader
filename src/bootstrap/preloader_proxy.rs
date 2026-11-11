@@ -123,7 +123,6 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
         if paths_equivalent(&expected, &resolved) {
             crate::platform::console_capture::install_crt_fwrite_capture();
             crate::platform::console_capture::install_crt_write_capture();
-            crate::platform::console_capture::install_crt_write_capture();
             mod_diagnostics::mark_loaded(&identity, module.0 as usize, "preloader_preexisting");
             logging::write_bootstrap_marker(&format!(
                 "preloader.priority.preexisting module=0x{:X} path={}",
@@ -184,6 +183,7 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
             // ucrtbase may have arrived as a PreLoader dependency. Install
             // the passive CRT observer now if it was absent before LoadLibrary.
             crate::platform::console_capture::install_crt_fwrite_capture();
+            crate::platform::console_capture::install_crt_write_capture();
             let resolved = canonical_or_original(&crate::platform::utils::get_module_path(module.0 as usize));
             if !paths_equivalent(&expected, &resolved) {
                 let detail = format!(
