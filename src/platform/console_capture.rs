@@ -42,7 +42,7 @@ static ORIGINAL_FILE: AtomicUsize = AtomicUsize::new(0);
 
 // LeviLamina's ConsoleSink falls back to fwrite(stdout) when its CRT stdout
 // is not a terminal. Its FileSink buffers INFO without an immediate flush,
-// so the latest.log relay alone cannot provide live output. Intercept only
+// so we must observe the live CRT streams directly. Intercept only
 // the CRT's standard output streams; never rebind or flush its FILE* objects.
 static CRT_FWRITE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 static CRT_STDOUT: AtomicUsize = AtomicUsize::new(0);
