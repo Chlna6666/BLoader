@@ -155,59 +155,6 @@ struct NativeLoadReport {
 
 const BLOADER_MANIFEST: &str = "bloader.json";
 
-/// BLoader metadata is not a LeviLamina manifest. For historic installations
-/// sharing mods/, rename ONLY the JSON descriptor; DLLs/directories are never
-/// moved, removed or re-injected. Run before PreLoader starts its own scan.
-pub fn normalize_shared_mod_manifests(game_dir: &Path) {
-    if !file_io_policy::writes_allowed() {
-        return;
-    }
-    let shared_root = game_dir.join("mods");
-    let Ok(entries) = fs::read_dir(&shared_root) else { return };
-    for entry in entries.flatten() {
-        let package = entry.path();
-        if !package.is_dir() {
-            continue;
-        }
-        let legacy = package.join("manifest.json");
-        if !legacy.is_file() {
-            continue;
-        }
-        let Ok(bytes) = fs::read(&legacy) else { continue };
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { continue };
-        let kind = value.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
-        let owned = matches!(
-            kind,
-            "mod-preload" | "mod-native" | "hot-native" | "hot-inject"
-        ) || (kind == "preloader-bootstrap"
-            && package.file_name().and_then(|name| name.to_str())
-                .is_some_and(|name| name.eq_ignore_ascii_case("PreLoader"))
-            && value.get("entry").and_then(serde_json::Value::as_str)
-                == Some("PreLoader.dll"));
-        if !owned {
-            continue;
-        }
-        let sidecar = package.join(BLOADER_MANIFEST);
-        if sidecar.exists() {
-            logging::write_bootstrap_marker(&format!(
-                "manifest ownership conflict: {} and {} both exist; no files changed",
-                legacy.display(), sidecar.display()
-            ));
-            continue;
-        }
-        match fs::rename(&legacy, &sidecar) {
-            Ok(()) => logging::write_bootstrap_marker(&format!(
-                "BLoader manifest normalized type={kind} from={} to={} (DLL untouched)",
-                legacy.display(), sidecar.display()
-            )),
-            Err(error) => logging::write_bootstrap_marker(&format!(
-                "BLoader manifest normalization failed path={} error={error}",
-                legacy.display()
-            )),
-        }
-    }
-}
-
 fn packaged_manifest_path(package: &Path, shared: bool) -> Option<PathBuf> {
     let sidecar = package.join(BLOADER_MANIFEST);
     if sidecar.is_file() {
@@ -1099,8 +1046,17 @@ fn discover_mods(mods_dir: &Path, shared: bool) -> DiscoveredMods {
             discover_packaged_mod(&entry_path, shared, &mut discovered);
             continue;
         }
-        if !shared && entry_path.is_file() {
-            discover_loose_dll(mods_dir, &entry_path, &mut discovered);
+        if !shared && entry_path.is_file() && is_dll_path(&entry_path) {
+            // Without a manifest there is no reliable identity, owner, phase
+            // or dependency graph. Startup must never move a bare DLL or
+            // synthesize a manifest on the user's behalf.
+            logging::scoped_warn_message(
+                "native-loader",
+                &format!(
+                    "SKIP_UNMANIFESTED_DLL | path={} | explicit BLoader manifest required; files unchanged",
+                    entry_path.display()
+                ),
+            );
         }
     }
     discovered
@@ -1134,13 +1090,16 @@ fn discover_packaged_mod(entry_path: &Path, shared: bool, discovered: &mut Disco
     ) {
         // PreLoader and LeviLamina are the sole owners of preload-native and
         // native respectively; do not retry their DLLs even after failure.
-        logging::scoped_warn_message(
-            "native-loader",
-            &format!(
-                "SKIP_FOREIGN_MOD_TYPE | name={} type={} | BLoader types=mod-preload|mod-native|hot-native|hot-inject; LeviLamina native and PreLoader preload-native are external",
-                manifest.name, mod_type
-            ),
+        let detail = format!(
+            "SKIP_FOREIGN_MOD_TYPE | name={} type={} | BLoader types=mod-preload|mod-native|hot-native|hot-inject",
+            manifest.name, mod_type
         );
+        // Foreign descriptors in shared mods are expected, not failures.
+        if shared {
+            logging::scoped_debug_message("native-loader", &detail);
+        } else {
+            logging::scoped_warn_message("native-loader", &detail);
+        }
         return;
     }
 
@@ -1258,132 +1217,6 @@ fn parse_manifest_json(text: &str) -> Result<ModManifest, serde_json::Error> {
         Ok(manifest) => Ok(manifest),
         Err(_) => serde_json::from_str::<ManifestBundle>(text).map(|bundle| bundle.manifest),
     }
-}
-
-fn discover_loose_dll(mods_dir: &Path, entry_path: &Path, discovered: &mut DiscoveredMods) {
-    if !is_dll_path(entry_path) {
-        return;
-    }
-    if is_reserved_runtime_dll(entry_path) {
-        logging::scoped_info_message(
-            "native-loader",
-            &format!(
-                "SKIP_RESERVED_RUNTIME | loose system runtime DLL is not packaged or loaded | path={}",
-                entry_path.display()
-            ),
-        );
-        return;
-    }
-    // Unmanifested DLLs are packaged as mod-native, never as early mod-preload.
-    // Do not load them inside the game bootstrap before OEP.
-    if let Some(packaged) = package_loose_dll(mods_dir, entry_path) {
-        discovered.hot.push(HotMod {
-            id: packaged.id,
-            name: packaged.name,
-            dependencies: packaged.dependencies,
-            version: packaged.version,
-            kind: MOD_TYPE_MOD_NATIVE.to_string(),
-            dll_path: packaged.dll_path,
-            log_aliases: packaged.log_aliases,
-            inject_delay_ms: 0,
-            ready_level: ReadyLevel::Process,
-            required: packaged.required,
-            verify_exports: packaged.verify_exports,
-            verify_modules: packaged.verify_modules,
-            notify_success: packaged.notify_success,
-        });
-    }
-}
-
-fn package_loose_dll(mods_dir: &Path, entry_path: &Path) -> Option<PreloadMod> {
-    if !file_io_policy::writes_allowed() {
-        logging::scoped_warn_message(
-            "native-loader",
-            &format!(
-                "SKIP_AUTO_PACKAGE | legacy UWP read-only mode leaves loose DLL untouched | path={}",
-                entry_path.display()
-            ),
-        );
-        return None;
-    }
-
-    let file_stem = entry_path.file_stem()?.to_string_lossy().to_string();
-    let file_name = entry_path.file_name()?.to_string_lossy().to_string();
-    let target_dir = mods_dir.join(&file_stem);
-    let target_dll = target_dir.join(&file_name);
-    let target_manifest = target_dir.join("manifest.json");
-
-    logging::info_message(&format!("Auto-packaging found: {}", file_name));
-
-    if !target_dir.exists() && fs::create_dir(&target_dir).is_err() {
-        logging::error_message(&format!("Failed to create package dir for {}", file_stem));
-        return None;
-    }
-
-    if !target_dll.exists() {
-        if let Err(error) = fs::rename(entry_path, &target_dll) {
-            logging::error_message(&format!("Failed to move DLL {}: {}", file_name, error));
-            return None;
-        }
-    } else {
-        logging::warn_message(&format!(
-            "Target DLL {} already exists, skipping move.",
-            target_dll.display()
-        ));
-    }
-
-    if !target_manifest.exists() {
-        let manifest = ModManifest {
-            id: Some(file_stem.clone()),
-            name: file_stem.clone(),
-            entry: file_name.clone(),
-            version: None,
-            author: None,
-            description: None,
-            mod_type: MOD_TYPE_MOD_NATIVE.to_string(),
-            api_version: None,
-            inject_delay_ms: None,
-            inject_min_frames: None,
-            inject_ready: None,
-            requires_symbol_pack: false,
-            required_symbols: Vec::new(),
-            required: false,
-            verify_exports: Vec::new(),
-            verify_modules: Vec::new(),
-            notify_success: false,
-            log_aliases: Vec::new(),
-            bloader_dependencies: Vec::new(),
-        };
-
-        match serde_json::to_string_pretty(&manifest) {
-            Ok(json) => {
-                if let Err(error) = fs::write(&target_manifest, json) {
-                    logging::error_message(&format!(
-                        "Failed to generate manifest for {}: {}",
-                        file_stem, error
-                    ));
-                }
-            }
-            Err(error) => logging::error_message(&format!(
-                "Failed to serialize manifest for {}: {}",
-                file_stem, error
-            )),
-        }
-    }
-
-    Some(PreloadMod {
-        id: file_stem.clone(),
-        name: file_stem,
-        dependencies: Vec::new(),
-        version: None,
-        kind: MOD_TYPE_MOD_NATIVE.to_string(),
-        dll_path: target_dll,
-        log_aliases: Vec::new(),
-        required: false,
-        verify_exports: Vec::new(),
-        verify_modules: Vec::new(),
-        notify_success: false,
-    })
 }
 
 fn hot_as_native(hot: &HotMod) -> PreloadMod {
@@ -1591,27 +1424,33 @@ unsafe fn load_library(preload: &PreloadMod, phase: &str, silent_success: bool) 
 #[cfg(test)]
 mod tests {
     use super::{
-        bloader_mods_dir, checked_mod_entry, is_reserved_runtime_dll, normalize_shared_mod_manifests,
+        bloader_mods_dir, checked_mod_entry, is_reserved_runtime_dll,
         packaged_manifest_path, parse_manifest_json, resolve_hot_ready_level, MOD_TYPE_MOD_NATIVE,
         MOD_TYPE_MOD_PRELOAD,
     };
     use crate::bootstrap::runtime_ready::ReadyLevel;
 
     #[test]
-    fn shared_loader_manifest_is_not_visible_to_levilamina() {
+    fn shared_mod_manifest_is_never_rewritten_or_implicitly_claimed() {
         let root = std::env::temp_dir().join(format!(
-            "bloader-sidecar-test-{}", std::process::id()
+            "bloader-manifest-ownership-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let package = root.join("mods").join("raylith");
         std::fs::create_dir_all(&package).unwrap();
-        let old = package.join("manifest.json");
-        std::fs::write(&old, br#"{"name":"raylith","entry":"raylith.dll","type":"mod-preload"}"#).unwrap();
-        normalize_shared_mod_manifests(&root);
-        assert!(!old.exists());
+        let manifest = package.join("manifest.json");
+        let original = br#"{"name":"raylith","entry":"raylith.dll","type":"mod-preload"}"#;
+        std::fs::write(&manifest, original).unwrap();
+        // Only the caller explicitly installing bloader.json may claim a
+        // shared package. The native discovery process does not migrate it.
+        assert!(packaged_manifest_path(&package, true).is_none());
+        assert_eq!(std::fs::read(&manifest).unwrap(), original);
         let sidecar = package.join("bloader.json");
-        assert!(sidecar.is_file());
+        std::fs::write(&sidecar, original).unwrap();
         assert_eq!(packaged_manifest_path(&package, true), Some(sidecar));
-        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(std::fs::read(&manifest).unwrap(), original);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
