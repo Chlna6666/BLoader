@@ -13,8 +13,7 @@
 //!   不含任何 Cosmos 条目）；
 //! - 披风包除原 ZIP 外支持解包文件夹，并可扫描游戏 com.mojang 的
 //!   `capes/` 目录（GDK/UWP/预览/重定向感知，见 `cape_roots`）；
-//! - 高像素披风纹理默认规范到 64x32（`cosmetics_cape_texture=original`
-//!   可切回直通），修复玩家披风不显示而鞘翅正常的问题。
+//! - 高像素披风纹理固定规范到 64x32，避免玩家披风不显示、鞘翅正常。
 pub mod cape_roots;
 pub mod cape_sections;
 pub mod codec;
@@ -43,7 +42,6 @@ use local_capes::TextureMode;
 static HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
 static INSTALL_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
-pub(crate) const DEFAULT_COSMETICS_DIR: &str = "mods/Cosmetics";
 
 /// 内置默认规则：恢复本地披风的 PersonaProfile 入口，
 /// 同时保留更衣室本地披风与目录接口，全部 local_only，不包含 Cosmos 商品条目。
@@ -83,19 +81,10 @@ const DEFAULT_RULES_JSON: &str = r#"{
   ]
 }"#;
 
-/// 解析 Cosmetics 数据目录（规则、capes、overrides 的宿主目录）。
-pub(crate) fn cosmetics_root(config: &Config, game_dir: &Path) -> PathBuf {
-    let configured = config.cosmetics_dir.trim();
-    let dir = if configured.is_empty() {
-        PathBuf::from(DEFAULT_COSMETICS_DIR)
-    } else {
-        PathBuf::from(configured)
-    };
-    if dir.is_absolute() {
-        dir
-    } else {
-        game_dir.join(dir)
-    }
+/// Optional advanced HTTP overlay rules are independent of any Mods tree.
+/// The capes themselves remain in the active com.mojang/Shared data root.
+pub(crate) fn cosmetics_root(game_dir: &Path) -> PathBuf {
+    game_dir.join("BLoader").join("cosmetics")
 }
 
 fn load_rules(root: &Path) -> (response::Config, &'static str) {
@@ -157,9 +146,11 @@ pub fn install(config: &Config, game_dir: &Path) -> bool {
         return true;
     }
 
-    let root = cosmetics_root(config, game_dir);
+    let root = cosmetics_root(game_dir);
     let (cfg, config_source) = load_rules(&root);
-    let texture_mode = TextureMode::parse(&config.cosmetics_cape_texture);
+    // The original-size experimental mode can yield an invisible player cape.
+    // Keep the officially compatible 64x32 Persona texture invariant.
+    let texture_mode = TextureMode::Canonical;
     let roots = cape_roots::resolve_roots(config, game_dir);
     if let Err(error) = winhttp::set_runtime(
         cfg,
@@ -237,8 +228,7 @@ fn builtin_enabled_early() -> bool {
 }
 
 /// 独立 Cosmetics.dll 抑制判断：内置启用时跳过同名原生 mod 包，
-/// 避免两套 WinHTTP 钩子叠加。数据目录（cosmetics.json/capes/overrides）
-/// 保留并由内置模块继续使用。
+/// 避免两套 WinHTTP 钩子叠加。内置模块不会复用第三方 Mod 数据目录。
 pub fn should_suppress_native_mod(package_name: &str) -> bool {
     // DllMain 预加载阶段每个包都会查询一次；结果缓存（重启生效）。
     static BUILTIN_ENABLED_EARLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -255,25 +245,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn texture_mode_parses_config_values() {
-        assert_eq!(TextureMode::parse("canonical"), TextureMode::Canonical);
-        assert_eq!(TextureMode::parse(""), TextureMode::Canonical);
-        assert_eq!(TextureMode::parse("Original"), TextureMode::Original);
-        assert_eq!(TextureMode::parse("passthrough"), TextureMode::Original);
-    }
-
-    #[test]
-    fn cosmetics_root_resolves_relative_to_game_dir() {
+    fn cosmetics_rules_directory_is_internal_to_loader() {
         let game_dir = Path::new(r"C:\Game");
-        let mut config = Config::default();
         assert_eq!(
-            cosmetics_root(&config, game_dir),
-            PathBuf::from(r"C:\Game\mods\Cosmetics")
-        );
-        config.cosmetics_dir = r"D:\Data\Cosmetics".to_string();
-        assert_eq!(
-            cosmetics_root(&config, game_dir),
-            PathBuf::from(r"D:\Data\Cosmetics")
+            cosmetics_root(game_dir),
+            game_dir.join("BLoader").join("cosmetics")
         );
     }
 
