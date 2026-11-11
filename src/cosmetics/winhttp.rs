@@ -335,12 +335,19 @@ pub fn prepare_local_resources() {
         }
     }
     info_log(&format!(
-        "cape scan discovered={} loaded={} failed={} items={}",
+        "cape scan discovered={} loaded={} failed={} items={} candidate_roots={} existing_cape_roots={}",
         registry.discovered_packs,
         registry.accepted,
         registry.rejected,
-        local_capes::count()
+        local_capes::count(),
+        roots.len(),
+        registry.discovered_roots
     ));
+    if registry.discovered_packs == 0 {
+        info_log(
+            "no local cape packs found in the instance's com.mojang/capes roots; the wardrobe cannot display imported capes until resources are discovered",
+        );
+    }
     for (_index, item) in local_capes::items().iter().enumerate() {
         let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("?");
         let name = item.get("title").and_then(|v| v.as_str()).unwrap_or("?");
