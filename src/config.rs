@@ -15,6 +15,10 @@ const REMOVED_CONFIG_KEYS: &[&str] = &[
     "lock_mouse_on_launch",
     "unlock_mouse_hotkey",
     "reduce_pixels",
+    // Built-in Cosmetics uses fixed internal behavior and never accepts
+    // a legacy standalone Mod directory or experimental texture mode.
+    "cosmetics_dir",
+    "cosmetics_cape_texture",
 ];
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -75,12 +79,6 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub enable_cosmetics: bool,
 
-    #[serde(default = "default_cosmetics_dir")]
-    pub cosmetics_dir: String,
-
-    #[serde(default = "default_cape_texture_mode")]
-    pub cosmetics_cape_texture: String,
-
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
@@ -110,14 +108,6 @@ fn default_net_hex_bytes() -> usize {
 
 fn default_ignore_ports() -> Vec<u16> {
     vec![7897]
-}
-
-fn default_cosmetics_dir() -> String {
-    crate::cosmetics::DEFAULT_COSMETICS_DIR.to_string()
-}
-
-fn default_cape_texture_mode() -> String {
-    "canonical".to_string()
 }
 
 fn default_log_level() -> String {
@@ -155,8 +145,6 @@ impl Default for Config {
             network_verbose: false,
             network_ignore_ports: default_ignore_ports(),
             enable_cosmetics: true,
-            cosmetics_dir: default_cosmetics_dir(),
-            cosmetics_cape_texture: default_cape_texture_mode(),
             log_level: default_log_level(),
             log_archive_days: default_log_archive_days(),
             default_locale: default_locale(),
@@ -446,6 +434,25 @@ mod tests {
 
         let complete_json = serde_json::to_string_pretty(&loaded).unwrap();
         assert!(!is_config_file_outdated(&complete_json, &loaded));
+    }
+
+    #[test]
+    fn legacy_cosmetics_settings_do_not_survive_config_serialization() {
+        let input = r#"{
+            "enable_cosmetics": true,
+            "cosmetics_dir": "mods/Cosmetics",
+            "cosmetics_cape_texture": "original",
+            "launcher_owned_value": "keep"
+        }"#;
+        let config: Config = serde_json::from_str(input).unwrap();
+        assert!(config.enable_cosmetics);
+        assert!(is_config_file_outdated(input, &config));
+        let output = merged_config_json(Some(input), &config).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(value.get("cosmetics_dir").is_none());
+        assert!(value.get("cosmetics_cape_texture").is_none());
+        assert_eq!(value.get("launcher_owned_value"), Some(&serde_json::json!("keep")));
+        assert_eq!(value.get("enable_cosmetics"), Some(&serde_json::json!(true)));
     }
 
     #[test]
