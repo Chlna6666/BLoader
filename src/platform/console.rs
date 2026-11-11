@@ -181,7 +181,7 @@ pub unsafe fn activate_console_logging() {
     logging::set_console_handle(h_conout);
     // Do not install process-global WriteConsole/WriteFile detours before
     // deciding whether native PreLoader owns this console. In delegated mode
-    // the shared file relay is the only LeviLamina logging integration.
+    // the live Win32/CRT observers are installed separately before LoadLibraryW.
     logging::scoped_debug_message(
         "console",
         &format!(
