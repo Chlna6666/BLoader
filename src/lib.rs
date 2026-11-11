@@ -188,10 +188,9 @@ unsafe fn prepare_premain_preloads(
         );
     }
     let game_dir = crate::platform::utils::get_exe_directory();
-    // Only normalize BLoader's JSON descriptors. This must happen before
-    // PreLoader loads LeviLamina, which scans manifest.json in mods/.
-    // No DLL or directory is moved/deleted.
-    crate::loader::normalize_shared_mod_manifests(&game_dir);
+    // The shared mods directory belongs to its original loader. Only explicit
+    // bloader.json sidecars opt a package into BLoader; never rename another
+    // loader's manifest.json during startup.
     crate::platform::logging::write_bootstrap_marker(&format!(
         "bootstrap.preloader.premain.begin phase={execution_mode}"
     ));
