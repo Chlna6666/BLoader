@@ -473,25 +473,6 @@ fn push_runtime_rule(rules: &mut Vec<RuntimeRule>, source: &Path, target: &str) 
     }
 }
 
-/// 解析当前配置下的重定向根目录（enable_redirection 的写入目标）。
-/// 供其他模块（如内置披风的 com.mojang/capes 扫描）定位重定向后的数据根。
-pub fn redirection_root_path(config: &Config, game_dir: &Path) -> Option<PathBuf> {
-    default_redirection_root(config, game_dir).map(PathBuf::from)
-}
-
-/// 把一个"游戏视角"的绝对路径按当前已安装的重定向规则做词法映射，
-/// 返回它实际会落在磁盘上的位置。未命中规则或重定向未启用时原样返回。
-pub fn preview_redirect_target(path: &Path) -> PathBuf {
-    let requested = path.to_string_lossy();
-    match REDIRECTION_STATE
-        .get()
-        .and_then(|state| state.redirect_path(&requested))
-    {
-        Some(target) => PathBuf::from(target),
-        None => path.to_path_buf(),
-    }
-}
-
 fn prepare_rule_targets(state: &RedirectionState) {
     for rule in &state.rules {
         let target = Path::new(&rule.target);
