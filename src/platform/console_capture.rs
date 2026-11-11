@@ -289,16 +289,22 @@ unsafe fn observe_crt_write(
 /// Only CONOUT$/console handles and anonymous or named pipes are eligible.
 /// FILE_TYPE_DISK is never an output capture source, even when stdout was
 /// explicitly redirected to a .log file.
+fn supported_console_file_type(file_type: u32, is_console: bool) -> bool {
+    // FILE_TYPE_CHAR without GetConsoleMode may be NUL or another character
+    // device, not a console. FILE_TYPE_DISK is always a private file.
+    file_type == 3 || (file_type == 2 && is_console)
+}
+
 fn live_console_transport(handle: *mut c_void) -> bool {
     if handle.is_null() || handle as usize == usize::MAX { return false; }
-    match unsafe { GetFileType(handle) } {
-        3 => true, // FILE_TYPE_PIPE
-        2 => {
-            let mut mode = 0;
-            unsafe { GetConsoleMode(handle, &mut mode) != 0 }
-        }
-        _ => false, // FILE_TYPE_DISK, FILE_TYPE_UNKNOWN, failure
-    }
+    let file_type = unsafe { GetFileType(handle) };
+    let is_console = if file_type == 2 {
+        let mut mode = 0;
+        unsafe { GetConsoleMode(handle, &mut mode) != 0 }
+    } else {
+        false
+    };
+    supported_console_file_type(file_type, is_console)
 }
 
 fn crt_fd_has_console_transport(fd: i32, osfhandle: &AtomicUsize) -> bool {
@@ -660,6 +666,17 @@ unsafe extern "system" fn intercept_file(h: *mut c_void, data: *const c_void, le
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn never_observe_disk_file_log_handles() {
+        assert!(!supported_console_file_type(1, false)); // FILE_TYPE_DISK
+        assert!(!supported_console_file_type(1, true));
+        assert!(!supported_console_file_type(0, false)); // FILE_TYPE_UNKNOWN
+        assert!(!supported_console_file_type(u32::MAX, false));
+        assert!(!supported_console_file_type(2, false)); // NUL / non-console char device
+        assert!(supported_console_file_type(2, true)); // console
+        assert!(supported_console_file_type(3, false)); // redirected pipe
+    }
+
     #[test]
     fn crt_write_observation_never_overflows_or_decodes_huge_buffers() {
         assert_eq!(bounded_crt_write_length(1, 8), Some(8));
