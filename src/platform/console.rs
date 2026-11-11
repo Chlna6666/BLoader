@@ -17,7 +17,7 @@ use windows::Win32::System::Console::{
     AllocConsole, CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, COORD, ENABLE_ECHO_INPUT,
     ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT,
     ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WRAP_AT_EOL_OUTPUT,
-    FillConsoleOutputAttribute, FillConsoleOutputCharacterW, GetConsoleMode,
+    FillConsoleOutputAttribute, FillConsoleOutputCharacterW, GetConsoleMode, GetStdHandle,
     GetConsoleScreenBufferInfo, GetConsoleWindow, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
     STD_OUTPUT_HANDLE, SetConsoleCursorPosition, SetConsoleMode, SetConsoleTitleW, SetStdHandle,
 };
@@ -190,6 +190,54 @@ pub unsafe fn activate_console_logging() {
             file_io_policy::mode_label(),
         ),
     );
+}
+
+/// Supply missing Win32 stdout/stderr handles before PreLoader initializes.
+/// This is deliberately narrower than CRT descriptor rebinding (_dup2,
+/// freopen, setvbuf): altering an existing FILE* while LeviLamina has
+/// asynchronous logger threads has caused process crashes. Existing inherited
+/// pipes and redirected files remain untouched.
+pub unsafe fn prepare_native_loader_std_handles() {
+    if !window_ready() || !logging::console_is_ready() {
+        return;
+    }
+    let stdout_missing = GetStdHandle(STD_OUTPUT_HANDLE)
+        .is_err_or(|handle| handle.is_invalid());
+    let stderr_missing = GetStdHandle(STD_ERROR_HANDLE)
+        .is_err_or(|handle| handle.is_invalid());
+    if !stdout_missing && !stderr_missing {
+        return;
+    }
+    let h_conout = open_conout();
+    if h_conout.is_invalid() {
+        logging::scoped_warn_message("console", "PreLoader stdout/stderr cannot use CONOUT$");
+        return;
+    }
+    let stdout_bound = stdout_missing && SetStdHandle(STD_OUTPUT_HANDLE, h_conout).is_ok();
+    let stderr_bound = stderr_missing && SetStdHandle(STD_ERROR_HANDLE, h_conout).is_ok();
+    logging::scoped_debug_message(
+        "console",
+        &format!(
+            "native-loader std handles: repaired_stdout={stdout_bound} repaired_stderr={stderr_bound} existing_redirection=preserved crt_descriptors=untouched"
+        ),
+    );
+}
+
+/// Returns the actual Win32 standard-handle state. A file/pipe is not
+/// necessarily an error: the caller may have inherited a redirect.
+pub fn native_loader_stdout_kind() -> &'static str {
+    let Ok(handle) = (unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }) else {
+        return "absent";
+    };
+    if handle.is_invalid() {
+        return "absent";
+    }
+    let mut mode = CONSOLE_MODE(0);
+    if unsafe { GetConsoleMode(handle, &mut mode) }.is_ok() {
+        "console"
+    } else {
+        "redirected-or-unavailable"
+    }
 }
 
 /// Binds Minecraft's process standard handles only after OEP has been released.
