@@ -141,7 +141,7 @@ fn run_bootstrap_sequence(execution_mode: &'static str) -> bool {
         unsafe { crate::game::game_log::install(); }
     } else {
         crate::platform::logging::write_bootstrap_marker(
-            "bootstrap.game_log.delegated owner=PreLoader transport=file-relay",
+            "bootstrap.game_log.delegated owner=PreLoader transport=live-console-capture",
         );
     }
 
@@ -455,7 +455,7 @@ fn schedule_post_oep_runtime_io(enable_debug_console: bool, preloader_present: b
             // LeviLamina/PreLoader owns its own CRT stdout and stderr. The
             // process-wide _dup2/_setvbuf/_flushall binding can race with
             // asynchronous native logger threads and corrupt their streams.
-            // Use the external latest.log relay instead in delegated mode.
+            // Rely on passive live console/CRT observers in delegated mode. No local log-file tailing.
             if !preloader_present {
                 unsafe { crate::platform::native_stdio::install_process_capture(); }
                 crate::platform::native_stdio::flush_pending();
