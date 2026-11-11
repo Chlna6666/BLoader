@@ -846,9 +846,13 @@ impl Registry {
         let mut total = 0usize;
         for root in roots {
             let dir = root.join("capes");
-            if let Err(e) = fs::create_dir_all(&dir) {
+            // Scanning is read-only. The old create_dir_all() populated empty
+            // com.mojang trees during bootstrap *after* file redirection was
+            // installed, potentially changing which game-data root appears to
+            // exist. A missing capes directory simply has no imported packs.
+            if !dir.is_dir() {
                 reg.diagnostics.push(format!(
-                    "CAPE_ROOT path={} error=cannot create capes directory: {e}",
+                    "CAPE_ROOT_ABSENT path={} action=skip_without_creation",
                     dir.display()
                 ));
                 continue;
