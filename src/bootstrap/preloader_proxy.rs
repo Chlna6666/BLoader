@@ -59,7 +59,7 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
     // Capture native WriteConsoleA/W and console WriteFile output before
     // PreLoader and LeviLamina start their own logger threads. The console
     // hook observes writes without rebinding any third-party CRT FILE*.
-    // The latest.log relay remains an independent fallback for file-only logs.
+    // Only actual in-process output is captured; local Mod log files are not read.
     if logging::console_is_ready() {
         crate::platform::console_capture::install();
     }
@@ -90,6 +90,7 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
     // LeviLamina uses fwrite(stdout) when stdout is not a tty. Observing
     // that fallback is necessary because its FileSink does not flush INFO.
     crate::platform::console_capture::install_crt_fwrite_capture();
+    crate::platform::console_capture::install_crt_write_capture();
     let discovered = candidates.len();
     let candidate = candidates.remove(0);
     let expected = canonical_or_original(&candidate.path);
@@ -121,6 +122,8 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
         let resolved = canonical_or_original(&crate::platform::utils::get_module_path(module.0 as usize));
         if paths_equivalent(&expected, &resolved) {
             crate::platform::console_capture::install_crt_fwrite_capture();
+            crate::platform::console_capture::install_crt_write_capture();
+            crate::platform::console_capture::install_crt_write_capture();
             mod_diagnostics::mark_loaded(&identity, module.0 as usize, "preloader_preexisting");
             logging::write_bootstrap_marker(&format!(
                 "preloader.priority.preexisting module=0x{:X} path={}",
@@ -160,7 +163,7 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
     // and offers no reliable interception of WriteConsoleW in any case.
     mod_diagnostics::mark_loading(&identity, "preloader_priority_early");
     logging::write_bootstrap_marker(&format!(
-        "preloader.priority.load.begin path={} capture=noninvasive-log-relay",
+        "preloader.priority.load.begin path={} capture=win32-console-and-crt-stdio",
         expected.display()
     ));
 
@@ -215,7 +218,7 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
             logging::scoped_info_message(
                 "preloader",
                 &format!(
-                    "External loader observation | LeviLamina.dll={} | win32_capture={} | crt_fwrite_capture={} | stdout={} | external_mods=delegated",
+                    "External loader observation | LeviLamina.dll={} | win32_capture={} | crt_fwrite_capture={} | crt_write_capture={} | stdout={} | external_mods=delegated",
                     if module_by_name("LeviLamina.dll").is_some() {
                         "present"
                     } else {
@@ -227,6 +230,11 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
                         "inactive"
                     },
                     if crate::platform::console_capture::crt_fwrite_capture_active() {
+                        "active"
+                    } else {
+                        "inactive"
+                    },
+                    if crate::platform::console_capture::crt_write_capture_active() {
                         "active"
                     } else {
                         "inactive"
