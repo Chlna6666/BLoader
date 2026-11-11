@@ -202,9 +202,9 @@ pub unsafe fn prepare_native_loader_std_handles() {
         return;
     }
     let stdout_missing = GetStdHandle(STD_OUTPUT_HANDLE)
-        .is_err_or(|handle| handle.is_invalid());
+        .map_or(true, |handle| handle.is_invalid());
     let stderr_missing = GetStdHandle(STD_ERROR_HANDLE)
-        .is_err_or(|handle| handle.is_invalid());
+        .map_or(true, |handle| handle.is_invalid());
     if !stdout_missing && !stderr_missing {
         return;
     }
