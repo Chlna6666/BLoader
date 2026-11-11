@@ -150,9 +150,9 @@ BLoader 的 BMCBL 内建集成（Cosmetics、文件重定向、XUser Bridge）�
 | `mod-native` | BLoader Native Loader | Minecraft OEP 释放后（process ready） | `BLoader/mods/` |
 | `hot-native` / `hot-inject` | BLoader Native Loader | 按窗口就绪条件及延迟注入 | `BLoader/mods/` |
 
-其中 `preloader-bootstrap` 是 BMCBL 写入 `mods/PreLoader/manifest.json` 的引导**元数据**，不属于 PreLoader 的 `preload-native` 或 LeviLamina 的 `native`。PreLoader 本体保持在原位置，**不迁移目录**；BLoader 只对 `mods/PreLoader/PreLoader.dll` 执行一次 `LoadLibraryW`，随后 PreLoader 扫描 `mods/` 并加载 LeviLamina，再由 LeviLamina 管理自身 Mod。BLoader 自有的 `mod-preload` / `mod-native` 位于 `BLoader/mods/`，不交给 PreLoader 处理。
+其中 `preloader-bootstrap` 使用 `mods/PreLoader/bloader.json` 的显式 BLoader 引导元数据，不属于 PreLoader 的 `preload-native` 或 LeviLamina 的 `native`。PreLoader 本体保持在原位置，**不迁移目录**；BLoader 只对 `mods/PreLoader/PreLoader.dll` 执行一次 `LoadLibraryW`，随后 PreLoader 扫描 `mods/` 并加载 LeviLamina，再由 LeviLamina 管理自身 Mod。BLoader 自有的 `mod-preload` / `mod-native` 位于 `BLoader/mods/`，不交给 PreLoader 处理。
 
-BLoader 的 `mod-preload` 可在游戏执行 OEP 前安装需要的启动期 Hook；`mod-native` 在 OEP 已释放后自动加载，适合普通本地原生扩展。**不会**将 BLoader 的新类型注册到 LeviLamina，也不再识别旧的 `bloader-native` 作为别名。Loose DLL 默认自动打包为 `mod-native`，不会悄悄提前执行。
+BLoader 的 `mod-preload` 可在游戏执行 OEP 前安装需要的启动期 Hook；`mod-native` 在 OEP 已释放后自动加载，适合普通本地原生扩展。**不会**将 BLoader 的新类型注册到 LeviLamina，也不再识别旧的 `bloader-native` 作为别名。没有 BLoader 显式清单的 DLL 不自动打包、不自动迁移、不自动加载。
 
 使用 `mod-preload`：
 
@@ -316,22 +316,19 @@ BLoader 在 DLL 所在目录读取 `config.json`。常用配置：
 | `enable_p2p_redirection` | `false` | P2P 重定向开关 |
 | `enable_mc_bug_fix` | `true` | 内置游戏问题修复 |
 | `enable_cosmetics` | `true` | 内置披风模块总开关（详见下文） |
-| `cosmetics_dir` | `mods/Cosmetics` | 披风模块配置目录 |
-| `cosmetics_cape_texture` | `canonical` | 生成 persona 纹理尺寸（详见下文） |
 
 XUser Bridge 不使用 `config.json` 开关。它只由 BMCBL 为当前 Minecraft PID 创建并认证的有效一次性会话激活。
 
 ## 内置披风模块
 
-移植自 [Chlna6666/Cosmetics](https://github.com/Chlna6666/Cosmetics)（同作者、GPL-3.0-only），内置于 BLoader.dll，OEP 前安装 WinHTTP 钩子。功能：向更衣室披风页追加本地披风、为本地商品合成 PlayFab 目录响应、从内存下发虚拟 persona ZIP 与缩略图。**默认开启、仅本地披风**——不包含任何 Bedrock-Cosmos 内置数据，目录元数据仅接受本地虚拟资源，不联系任何第三方目录/订阅服务，不改动账号数据与官方缓存。启用后自动抑制独立 `Cosmetics.dll` 加载（BLoader 发现路径），其数据目录转由内置模块使用。
+移植自 [Chlna6666/Cosmetics](https://github.com/Chlna6666/Cosmetics)（同作者、GPL-3.0-only），内置于 BLoader.dll，OEP 前安装 WinHTTP 钩子。功能：向更衣室披风页追加本地披风、为本地商品合成 PlayFab 目录响应、从内存下发虚拟 persona ZIP 与缩略图。**默认开启、仅本地披风**——不包含任何 Bedrock-Cosmos 内置数据，目录元数据仅接受本地虚拟资源，不联系任何第三方目录/订阅服务，不改动账号数据与官方缓存。内置披风仅使用固定本地 HTTP 规则与游戏 `com.mojang/capes` 中的资源，不加载旧 `mods/Cosmetics` 配置或资源。
 
 完整实现文档（架构 / WinHTTP 钩子层 / 规则引擎 / 三种披风包格式 / UUID 派生 / persona 生成器 / 扫描根 / 日志 / 部署）见 [docs/COSMETICS.md](docs/COSMETICS.md)。以下为速览。
 
 ### 配置
 
 - `enable_cosmetics`（默认 `true`）：总开关。运行时关闭立即停止拦截；重新开启需重启游戏。
-- `cosmetics_dir`（默认 `mods/Cosmetics`）：配置目录，承载 `cosmetics.json`（规则引擎）与 `overrides/`（可选旧工作流）。文件缺失时使用内置默认规则（两条 `local_only` 核心规则，不含任何 Cosmos 条目）。
-- `cosmetics_cape_texture`：`canonical`（默认）| `original`（实验直通），见下文"高分辨率说明"。
+披风 HTTP 规则固定内建，生成纹理规范化为 64×32；不再读取 `cosmetics.json`、`overrides/`，也没有实验性纹理模式配置。
 
 ### 披风包位置与格式
 
@@ -340,15 +337,15 @@ XUser Bridge 不使用 `config.json` 开关。它只由 BMCBL 为当前 Minecraf
 - **解包文件夹**（推荐，官方 pack 目录风格）：单披风 `cape.json + cape.png [ + persona.zip ]`；多披风 `pack.json + textures/*.png`。文件夹名参与稳定 UUID 派生（与同名 ZIP 同身份）。
 - **ZIP**：内容与文件夹一致的压缩包。
 
-包内可选原生 `persona.zip` 原样直通；纯 PNG 披风由生成器合成 persona 包（确定性 UUID、内容寻址版本，重启不丢身份，改图自动换版本）。扫描在后台线程完成，改包后重启游戏生效。
+包内可选原生 `persona.zip` 原样直通；纯 PNG 披风由生成器合成 persona 包（确定性 UUID、内容寻址版本，重启不丢身份，改图自动换版本）。披风扫描在启动时完成，改包后重启游戏生效。
 
 ### 高分辨率说明
 
-自定义披风样式支持任意分辨率 PNG。但引擎的 persona 合成器为披风固定 64x32 图集槽位（`PersonaTextureComposer`，meta schema 无任何尺寸/UV 字段，HD 源会被客户端裁剪或丢弃——GeyserMC 亦独立确认），鞘翅正常是因为它走资源包几何声明尺寸归一化。因此默认 `canonical` 模式按 alpha 加权块平均降采样到 64x32 官方规格，保证玩家背面与鞘翅都正确显示；`original` 仅作实验对比。
+自定义披风样式支持任意分辨率 PNG。但引擎的 persona 合成器为披风固定 64x32 图集槽位（`PersonaTextureComposer`，meta schema 无任何尺寸/UV 字段，HD 源会被客户端裁剪或丢弃——GeyserMC 亦独立确认），鞘翅正常是因为它走资源包几何声明尺寸归一化。因此统一按 alpha 加权块平均降采样到 64×32 官方规格，保持游戏 Persona 纹理采样兼容性。
 
 ### 日志
 
-默认安静：启动状态与扫描摘要各一行（`discovered / loaded / failed / items`），失败包以 warn 单独输出原因。横幅、逐包注册、规则清单与请求遥测全部为 debug 级——排查时将 `log_level` 调至 `debug`/`trace`，或把 `cosmetics.json` 的 `debug.verbose` 打开。
+默认安静：启动状态与扫描摘要各一行（`discovered / loaded / failed / items`），失败包以 warn 单独输出原因。横幅、逐包注册、规则清单与请求遥测全部为 debug 级——排查时将 `log_level` 调至 `debug`/`trace`，。
 
 ## 部署
 
