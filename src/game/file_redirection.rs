@@ -255,7 +255,7 @@ pub fn install(config: &Config, game_dir: &Path) -> bool {
     prepare_rule_targets(&state);
     let rule_count = state.rules.len();
     for (index, rule) in state.rules.iter().enumerate() {
-        logging::scoped_info_message(
+        logging::scoped_debug_message(
             "file-redirection",
             &format!(
                 "rule[{index}] priority=longest-first kind={} source={} target={} target_namespace={:?}",
@@ -296,7 +296,10 @@ pub fn install(config: &Config, game_dir: &Path) -> bool {
     logging::scoped_info_message(
         "file-redirection",
         &format!(
-            "installed {installed} hooks with {rule_count} rules | coverage=KernelBase+kernel32+ntdll | namespace=preserved | lexical_canonicalization=enabled | overlap=longest-first | hook_reentry=tls-bypass | hook_parent_creation=create-dispositions-only | redirect_log_limit={REDIRECT_LOG_LIMIT}"
+            "file redirection active mode={} rules={} custom={} hooks={installed}",
+            if config.enable_redirection { "instance-data" } else { "custom-only" },
+            rule_count,
+            config.file_redirections.len()
         ),
     );
     true
@@ -941,8 +944,42 @@ fn expected_existing_file_miss(disposition: u32, error: u32) -> bool {
     disposition == 3 && matches!(error, 2 | 3)
 }
 
+const FILE_ATTRIBUTE_DIRECTORY_BIT: u32 = 0x10;
+const FILE_FLAG_BACKUP_SEMANTICS_BIT: u32 = 0x0200_0000;
+
+fn path_kind_for_diagnostics(path: PCWSTR) -> &'static str {
+    let trampoline = ORIGINAL_GET_FILE_ATTRIBUTES_W.load(Ordering::Acquire);
+    if trampoline == 0 || path.is_null() {
+        return "unknown";
+    }
+    let original: GetFileAttributesWFn = unsafe { mem::transmute(trampoline) };
+    let attributes = unsafe { original(path) };
+    if attributes == u32::MAX {
+        let error = unsafe { GetLastError() }.0;
+        return if matches!(error, 2 | 3) {
+            "absent"
+        } else if error == 5 {
+            "access-denied"
+        } else {
+            "unknown"
+        };
+    }
+    if attributes & FILE_ATTRIBUTE_DIRECTORY_BIT != 0 {
+        "directory"
+    } else {
+        "file"
+    }
+}
+
+fn opening_directory_as_file(disposition: u32, flags: Option<u32>, error: u32) -> bool {
+    disposition == 3
+        && error == 5
+        && flags.is_some_and(|flags| flags & FILE_FLAG_BACKUP_SEMANTICS_BIT == 0)
+}
+
 fn log_redirected_create_result(
     api: &str,
+    requested: PCWSTR,
     redirected: Option<&RedirectedWidePath>,
     creation_disposition: u32,
     desired_access: u32,
@@ -971,6 +1008,28 @@ fn log_redirected_create_result(
                 "file-redirection",
                 &format!("redirect open-existing probe missing {details}"),
             );
+        } else if opening_directory_as_file(
+            creation_disposition,
+            flags_and_attributes,
+            last_error.0,
+        ) {
+            // Opening a directory without FILE_FLAG_BACKUP_SEMANTICS fails
+            // even without file redirection. Compare the original and target
+            // kinds before treating ERROR_ACCESS_DENIED as a real regression.
+            let source_kind = path_kind_for_diagnostics(requested);
+            let target_kind = path_kind_for_diagnostics(PCWSTR(redirected.wide.as_ptr()));
+            let kinds = format!("source_kind={source_kind} target_kind={target_kind}");
+            if source_kind == "directory" && target_kind == "directory" {
+                logging::scoped_debug_message(
+                    "file-redirection",
+                    &format!("directory opened without FILE_FLAG_BACKUP_SEMANTICS {details} {kinds}"),
+                );
+            } else {
+                logging::scoped_warn_message(
+                    "file-redirection",
+                    &format!("redirect directory access discrepancy {details} {kinds}"),
+                );
+            }
         } else {
             logging::scoped_warn_message(
                 "file-redirection",
@@ -1023,6 +1082,7 @@ unsafe extern "system" fn detour_create_file_w(
     );
     log_redirected_create_result(
         "CreateFileW",
+        filename,
         redirected.as_ref(),
         creation_disposition.0,
         desired_access,
@@ -1069,6 +1129,7 @@ unsafe extern "system" fn detour_create_file_from_app_w(
     );
     log_redirected_create_result(
         "CreateFileFromAppW",
+        filename,
         redirected.as_ref(),
         creation_disposition,
         desired_access,
@@ -1104,6 +1165,7 @@ unsafe extern "system" fn detour_create_file2(
     );
     log_redirected_create_result(
         "CreateFile2",
+        filename,
         redirected.as_ref(),
         creation_disposition.0,
         desired_access,
@@ -1144,6 +1206,7 @@ unsafe extern "system" fn detour_create_file2_from_app_w(
     );
     log_redirected_create_result(
         "CreateFile2FromAppW",
+        filename,
         redirected.as_ref(),
         creation_disposition,
         desired_access,
@@ -1811,6 +1874,15 @@ mod tests {
             game_dir: PathBuf::from(r"C:\Games\Minecraft"),
             rules,
         }
+    }
+
+    #[test]
+    fn directory_open_without_backup_semantics_is_a_specific_case() {
+        assert!(opening_directory_as_file(3, Some(0x80), 5));
+        assert!(!opening_directory_as_file(3, Some(0x0200_0080), 5));
+        assert!(!opening_directory_as_file(3, None, 5));
+        assert!(!opening_directory_as_file(3, Some(0x80), 32));
+        assert!(!opening_directory_as_file(4, Some(0x80), 5));
     }
 
     #[test]
