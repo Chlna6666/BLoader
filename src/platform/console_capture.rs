@@ -49,6 +49,9 @@ static CRT_STDOUT: AtomicUsize = AtomicUsize::new(0);
 static CRT_STDERR: AtomicUsize = AtomicUsize::new(0);
 static CRT_FWRITE_READY: AtomicBool = AtomicBool::new(false);
 static CRT_FWRITE_INSTALLING: AtomicBool = AtomicBool::new(false);
+static UCRT_FILENO: AtomicUsize = AtomicUsize::new(0);
+static UCRT_OSFHANDLE: AtomicUsize = AtomicUsize::new(0);
+static MSVCRT_OSFHANDLE: AtomicUsize = AtomicUsize::new(0);
 static UCRT_WRITE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 static MSVCRT_WRITE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 static UCRT_WRITE_READY: AtomicBool = AtomicBool::new(false);
@@ -66,6 +69,7 @@ thread_local! {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetConsoleMode(handle: *mut c_void, mode: *mut u32) -> i32;
+    fn GetFileType(handle: *mut c_void) -> u32;
     fn MultiByteToWideChar(
         code_page: u32,
         flags: u32,
@@ -78,6 +82,8 @@ unsafe extern "system" {
 type WriteFn = unsafe extern "system" fn(*mut c_void, *const c_void, u32, *mut u32, *mut c_void) -> i32;
 type FwriteFn = unsafe extern "C" fn(*const c_void, usize, usize, *mut c_void) -> usize;
 type CrtWriteFn = unsafe extern "C" fn(i32, *const c_void, u32) -> i32;
+type CrtOsfHandleFn = unsafe extern "C" fn(i32) -> isize;
+type CrtFilenoFn = unsafe extern "C" fn(*mut c_void) -> i32;
 type CrtIobFn = unsafe extern "C" fn(i32) -> *mut c_void;
 
 pub fn with_passthrough<T>(f: impl FnOnce() -> T) -> T {
@@ -132,6 +138,12 @@ pub fn install_crt_fwrite_capture() {
     let Some(fwrite_address) = (unsafe { GetProcAddress(module, PCSTR(b"fwrite\0".as_ptr())) }) else {
         return;
     };
+    let Some(fileno_address) = (unsafe { GetProcAddress(module, PCSTR(b"_fileno\0".as_ptr())) }) else {
+        return;
+    };
+    let Some(osfhandle_address) = (unsafe { GetProcAddress(module, PCSTR(b"_get_osfhandle\0".as_ptr())) }) else {
+        return;
+    };
     let get_iob: CrtIobFn = unsafe { std::mem::transmute(iob_address) };
     let stdout_stream = unsafe { get_iob(1) };
     let stderr_stream = unsafe { get_iob(2) };
@@ -146,6 +158,8 @@ pub fn install_crt_fwrite_capture() {
             CRT_FWRITE_ORIGINAL.store(original as usize, Ordering::Release);
             CRT_STDOUT.store(stdout_stream as usize, Ordering::Release);
             CRT_STDERR.store(stderr_stream as usize, Ordering::Release);
+            UCRT_FILENO.store(fileno_address as usize, Ordering::Release);
+            UCRT_OSFHANDLE.store(osfhandle_address as usize, Ordering::Release);
             match unsafe { MinHook::enable_hook(target) } {
                 Ok(()) => {
                     CRT_FWRITE_READY.store(true, Ordering::Release);
@@ -159,6 +173,8 @@ pub fn install_crt_fwrite_capture() {
                     CRT_FWRITE_ORIGINAL.store(0, Ordering::Release);
                     CRT_STDOUT.store(0, Ordering::Release);
                     CRT_STDERR.store(0, Ordering::Release);
+                    UCRT_FILENO.store(0, Ordering::Release);
+                    UCRT_OSFHANDLE.store(0, Ordering::Release);
                     logging::scoped_debug_message(
                         "console-capture",
                         &format!("optional CRT fwrite capture unavailable: {error:?}"),
@@ -203,15 +219,23 @@ pub fn install_crt_write_capture() {
         }
         let Ok(module) = (unsafe { GetModuleHandleW(dll) }) else { continue };
         let Some(address) = (unsafe { GetProcAddress(module, PCSTR(b"_write\0".as_ptr())) }) else { continue };
+        let Some(osfhandle_address) = (unsafe { GetProcAddress(module, PCSTR(b"_get_osfhandle\0".as_ptr())) }) else { continue };
+        let osfhandle = if std::ptr::eq(original, &UCRT_WRITE_ORIGINAL) {
+            &UCRT_OSFHANDLE
+        } else {
+            &MSVCRT_OSFHANDLE
+        };
         let target = address as *const () as *mut c_void;
         match unsafe { MinHook::create_hook(target, detour) } {
             Ok(trampoline) => {
                 original.store(trampoline as usize, Ordering::Release);
+                osfhandle.store(osfhandle_address as usize, Ordering::Release);
                 match unsafe { MinHook::enable_hook(target) } {
                     Ok(()) => { ready.store(true, Ordering::Release); }
                     Err(error) => {
                         let _ = unsafe { MinHook::remove_hook(target) };
                         original.store(0, Ordering::Release);
+                        osfhandle.store(0, Ordering::Release);
                         logging::scoped_debug_message("console-capture",
                             &format!("CRT _write observer enable failed: {error:?}"));
                     }
@@ -224,15 +248,15 @@ pub fn install_crt_write_capture() {
 }
 
 unsafe extern "C" fn intercept_ucrt_write(fd: i32, data: *const c_void, len: u32) -> i32 {
-    unsafe { observe_crt_write(&UCRT_WRITE_ORIGINAL, &UCRT_WRITE_READY, fd, data, len) }
+    unsafe { observe_crt_write(&UCRT_WRITE_ORIGINAL, &UCRT_WRITE_READY, &UCRT_OSFHANDLE, fd, data, len) }
 }
 
 unsafe extern "C" fn intercept_msvcrt_write(fd: i32, data: *const c_void, len: u32) -> i32 {
-    unsafe { observe_crt_write(&MSVCRT_WRITE_ORIGINAL, &MSVCRT_WRITE_READY, fd, data, len) }
+    unsafe { observe_crt_write(&MSVCRT_WRITE_ORIGINAL, &MSVCRT_WRITE_READY, &MSVCRT_OSFHANDLE, fd, data, len) }
 }
 
 unsafe fn observe_crt_write(
-    trampoline: &AtomicUsize, ready: &AtomicBool, fd: i32,
+    trampoline: &AtomicUsize, ready: &AtomicBool, osfhandle: &AtomicUsize, fd: i32,
     data: *const c_void, len: u32,
 ) -> i32 {
     let address = trampoline.load(Ordering::Acquire);
@@ -247,7 +271,9 @@ unsafe fn observe_crt_write(
     let _guard = DetourGuard;
     let written = unsafe { original(fd, data, len) };
     let last_error = unsafe { GetLastError() };
-    if written > 0 && (written as usize) <= MAX_WRITE {
+    if written > 0 && (written as usize) <= MAX_WRITE
+        && crt_fd_has_console_transport(fd, osfhandle)
+    {
         let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, written as usize) };
         if !bytes.contains(&0) {
             let _ = std::panic::catch_unwind(|| {
@@ -258,6 +284,38 @@ unsafe fn observe_crt_write(
     }
     unsafe { SetLastError(last_error) };
     written
+}
+
+/// Only CONOUT$/console handles and anonymous or named pipes are eligible.
+/// FILE_TYPE_DISK is never an output capture source, even when stdout was
+/// explicitly redirected to a .log file.
+fn live_console_transport(handle: *mut c_void) -> bool {
+    if handle.is_null() || handle as usize == usize::MAX { return false; }
+    match unsafe { GetFileType(handle) } {
+        3 => true, // FILE_TYPE_PIPE
+        2 => {
+            let mut mode = 0;
+            unsafe { GetConsoleMode(handle, &mut mode) != 0 }
+        }
+        _ => false, // FILE_TYPE_DISK, FILE_TYPE_UNKNOWN, failure
+    }
+}
+
+fn crt_fd_has_console_transport(fd: i32, osfhandle: &AtomicUsize) -> bool {
+    let address = osfhandle.load(Ordering::Acquire);
+    if address == 0 || !matches!(fd, 1 | 2) { return false; }
+    let get_osfhandle: CrtOsfHandleFn = unsafe { std::mem::transmute(address) };
+    let handle = unsafe { get_osfhandle(fd) };
+    if handle == -1 || handle == -2 { return false; }
+    live_console_transport(handle as *mut c_void)
+}
+
+fn ucrt_stream_has_console_transport(stream: *mut c_void) -> bool {
+    let address = UCRT_FILENO.load(Ordering::Acquire);
+    if address == 0 { return false; }
+    let fileno: CrtFilenoFn = unsafe { std::mem::transmute(address) };
+    let fd = unsafe { fileno(stream) };
+    crt_fd_has_console_transport(fd, &UCRT_OSFHANDLE)
 }
 
 fn bounded_crt_write_length(size: usize, count: usize) -> Option<usize> {
@@ -291,7 +349,7 @@ unsafe extern "C" fn intercept_crt_fwrite(
     // when the external CRT stdout is invalid or points to a closed pipe.
     let result = unsafe { original(data, size, count, stream) };
     let last_error = unsafe { GetLastError() };
-    if !data.is_null() && result > 0 {
+    if !data.is_null() && result > 0 && ucrt_stream_has_console_transport(stream) {
         if let Some(length) = bounded_crt_write_length(size, result) {
             let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, length) };
             // No attempt is made to parse binary output or arbitrary FILE*.
@@ -402,7 +460,7 @@ fn redirected_std_handle(handle: *mut c_void) -> bool {
     if !stdout.is_some_and(|value| value.0 == handle)
         && !stderr.is_some_and(|value| value.0 == handle) { return false; }
     let mut mode = 0;
-    unsafe { GetConsoleMode(handle, &mut mode) == 0 }
+    unsafe { GetConsoleMode(handle, &mut mode) == 0 } && live_console_transport(handle)
 }
 
 /// Resolves the module behind the detour caller. `FramesToSkip=2` skips this
