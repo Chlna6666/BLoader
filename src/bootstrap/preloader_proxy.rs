@@ -204,7 +204,7 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
             logging::scoped_info_message(
                 "preloader",
                 &format!(
-                    "External loader observation | LeviLamina.dll={} | native_console_capture={} | file_log_relay={} | external_mods=delegated",
+                    "External loader observation | LeviLamina.dll={} | native_console_capture={} | relay_path={} | external_mods=delegated",
                     if module_by_name("LeviLamina.dll").is_some() {
                         "present"
                     } else {
@@ -215,11 +215,7 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
                     } else {
                         "inactive"
                     },
-                    if logging::console_is_ready() {
-                        "logs/latest.log"
-                    } else {
-                        "waiting_for_console"
-                    },
+                    "logs/latest.log",
                 ),
             );
             logging::write_bootstrap_marker(&format!(
