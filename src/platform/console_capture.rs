@@ -10,7 +10,7 @@
 
 use core::ffi::c_void;
 use std::cell::{Cell, RefCell};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use minhook::MinHook;
 use windows::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
@@ -32,6 +32,8 @@ struct PendingConsoleLine {
 const CP_ACP: u32 = 0;
 static ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
+static OBSERVED_FRAGMENTS: AtomicU64 = AtomicU64::new(0);
+static OBSERVED_LINES: AtomicU64 = AtomicU64::new(0);
 static ORIGINAL_W: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_A: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_FILE: AtomicUsize = AtomicUsize::new(0);
@@ -74,6 +76,14 @@ pub fn with_passthrough<T>(f: impl FnOnce() -> T) -> T {
 /// file relay remains the fallback for other output transports.
 pub fn is_active() -> bool {
     READY.load(Ordering::Acquire)
+}
+
+/// Actual native console traffic, not the presence of the MinHook trampolines.
+pub fn capture_counts() -> (u64, u64) {
+    (
+        OBSERVED_FRAGMENTS.load(Ordering::Relaxed),
+        OBSERVED_LINES.load(Ordering::Relaxed),
+    )
 }
 
 pub fn install() {
@@ -211,6 +221,7 @@ fn capture(_handle: *mut c_void, s: &str, resolve_scope: impl FnOnce() -> Option
     if s.is_empty() {
         return true;
     }
+    OBSERVED_FRAGMENTS.fetch_add(1, Ordering::Relaxed);
     PENDING_CONSOLE_LINE.with(|cell| {
         let mut pending = cell.borrow_mut();
         // A single colourful log line may use dozens of WriteConsole calls.
@@ -239,6 +250,7 @@ fn capture(_handle: *mut c_void, s: &str, resolve_scope: impl FnOnce() -> Option
                 pending.scope_checked = false;
             }
             if !line.is_empty() {
+                OBSERVED_LINES.fetch_add(1, Ordering::Relaxed);
                 logging::captured_console_output_from(attribution.as_deref(), &line);
             }
         }
