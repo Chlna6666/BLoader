@@ -1006,7 +1006,11 @@ pub unsafe fn load_mods(game_dir: &Path) {
     let mut discovered = discover_mods(&mods_dir, false);
     discovered.hot.extend(discover_mods(&game_dir.join("mods"), true).hot);
     if discovered.hot.is_empty() {
-        logging::info_message("No post-OEP BLoader mods found (mod-preload phase already completed).");
+        // Absence of BLoader-owned mod-native entries says nothing about
+        // PreLoader/LeviLamina, whose manifests and lifecycle are delegated.
+        // This routine is an internal scheduler detail, not a user-facing
+        // "no mods installed" result.
+        logging::debug_message("No additional BLoader-owned post-OEP mods; external loader modules are not counted.");
         return;
     }
     spawn_hot_mod_loader(discovered.hot);
