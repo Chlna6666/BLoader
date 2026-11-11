@@ -71,7 +71,7 @@ static CONSOLE_BACKLOG: OnceLock<Mutex<VecDeque<ConsoleBacklogRecord>>> = OnceLo
 static CONSOLE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CONSOLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// The same logical record may be seen from the native console, CRT pipes,
-/// OutputDebugString, logger callback and the shared file relay. Keep a
+/// OutputDebugString and logger callbacks. Keep a
 /// per-channel occurrence counter, rather than dropping *all* equal lines
 /// in the same second (which suppresses genuine repeated errors).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,7 +310,7 @@ pub fn captured_mod_output(mod_name: &str, mod_id: &str, stream: &str, message: 
         .or_else(|| parse_levilamina_console_line(&sanitized))
     {
         // The same logical line usually also arrives through the console hook
-        // or the latest.log relay; route it through the shared forwarded-record
+        // from another live output channel; route through the shared forwarded-record
         // path so the dedupe journal sees it and the console shows it once.
         if forward_captured_record(CapturedRecord {
             timestamp_full: external.timestamp_full,
@@ -594,7 +594,7 @@ fn flush_early_events() {
     };
     if !file_io_policy::writes_allowed() { return; }
     for event in entries {
-        // Avoid duplicate console output from the external log tailer.
+        // Preserve early events without replaying them as captured native output.
         let text = format!(
             "EARLY [{}] [{}] [{}] {}\r\n",
             event.timestamp, level_label(event.level), event.scope, event.message
@@ -1084,8 +1084,7 @@ fn parse_external_structured_line(line: &str) -> Option<ExternalStructuredLine> 
     let level = external_level(level_token)?;
 
     let raw_timestamp = header.strip_suffix(level_token)?.trim();
-    // Win32 console loggers commonly omit the date, while the file relay
-    // includes it. Normalize both before the current-session cutoff check.
+    // Win32 loggers may omit dates. Normalize before the session cutoff check.
     let timestamp_full = if raw_timestamp.len() >= 8
         && raw_timestamp.as_bytes().get(2) == Some(&b':')
         && raw_timestamp.as_bytes().get(5) == Some(&b':')
@@ -1288,7 +1287,7 @@ fn level_rank(level: Level) -> u8 {
 }
 
 // Preserve millisecond timestamps in events/files but keep the interactive
-// console compact. External log history may also supply fractional seconds.
+// console compact. Native structured loggers may supply fractional seconds.
 fn compact_console_clock(timestamp: &str) -> &str {
     let clock = timestamp.split_whitespace().last().unwrap_or(timestamp);
     clock.get(..8).unwrap_or(clock)
@@ -1738,7 +1737,7 @@ const CONSOLE_QUEUE_LIMIT: usize = 8192;
 const CONSOLE_BATCH_LIMIT: usize = 128;
 const CONSOLE_REORDER_WINDOW: Duration = Duration::from_millis(24);
 
-/// A late file-relay record cannot rewind the already rendered console clock.
+/// A delayed native output record cannot rewind the already rendered console clock.
 /// The true event time is preserved both in its file entry and a late marker.
 fn console_display_time(actual: &str, last: &mut String) -> (String, bool) {
     let event_second = actual.get(..19).unwrap_or(actual);
