@@ -1007,7 +1007,7 @@ unsafe extern "system" fn on_send(
         logger(&format!(
             "LOCAL_ASSET_RESPONSE_READY method={method} status={status} bytes={body_bytes} content_length={declared_bytes} async={async_request} (game acceptance unverified)"
         ));
-        if async_request && !queue_synthetic_notice(h, AsyncNotice::SendComplete { context: ctx }) {
+        if async_request && !queue_replay_notice(h, AsyncNotice::SendComplete { context: ctx }) {
             warn_log("local asset callback could not be dispatched; aborting synthetic response");
             SetLastError(8); // ERROR_NOT_ENOUGH_MEMORY
             return 0;
@@ -1076,7 +1076,7 @@ unsafe extern "system" fn on_send(
                 logger(&format!(
                     "request #{request_id}: LOCAL_CATALOG_SYNTHETIC item_uuid={known_id} status=200 bytes={byte_count} upstream_request=skipped async={async_request}"
                 ));
-                if async_request && !queue_synthetic_notice(h, AsyncNotice::SendComplete { context: ctx }) {
+                if async_request && !queue_replay_notice(h, AsyncNotice::SendComplete { context: ctx }) {
                     warn_log("local catalog callback could not be dispatched; aborting synthetic response");
                     SetLastError(8); // ERROR_NOT_ENOUGH_MEMORY
                     return 0;
@@ -1388,10 +1388,10 @@ unsafe fn capture_worker(handle: usize, receiver: mpsc::Receiver<AsyncReadEvent>
 // Reuse the capture worker for asynchronous client notifications as well.
 // WinHttpReadData must return before its READ_COMPLETE callback is delivered:
 // inline replay callbacks recursively entered libHttpClient on prior builds.
-// Synthetic local ZIP, thumbnail and catalog replies never trigger a second
-// network read. Their WinHTTP completion callbacks are dispatched by one shared
-// worker, rather than recursively calling libHttpClient from our detours or
-// allocating one OS thread per thumbnail request.
+// Local synthetic resources and intercepted native catalog replies share a
+// single completion dispatcher. A native catalog replay is NOT synthetic: it
+// still needs async READ_COMPLETE and DATA_AVAILABLE delivery, otherwise
+// WinHttpReadData reports failure after consuming the replay buffer.
 struct SyntheticNotice {
     handle: usize,
     request_id: u64,
@@ -1399,12 +1399,18 @@ struct SyntheticNotice {
 }
 static SYNTHETIC_DISPATCH: OnceLock<Option<mpsc::Sender<SyntheticNotice>>> = OnceLock::new();
 
-fn queue_synthetic_notice(h: H, event: AsyncNotice) -> bool {
+fn replay_can_dispatch(async_session: bool, closing: bool, has_replay: bool) -> bool {
+    async_session && !closing && has_replay
+}
+
+fn queue_replay_notice(h: H, event: AsyncNotice) -> bool {
     let handle = state_key(h);
     let request_id = {
         let state = tables().lock().unwrap_or_else(|e| e.into_inner());
         let Some(req) = state.requests.get(&handle) else { return false };
-        if !req.synthetic || req.closing || !req.async_session { return false; }
+        if !replay_can_dispatch(req.async_session, req.closing, req.replay.is_some()) {
+            return false;
+        }
         req.id
     };
     let dispatcher = SYNTHETIC_DISPATCH.get_or_init(|| {
@@ -1429,7 +1435,7 @@ unsafe fn synthetic_callback_worker(receiver: mpsc::Receiver<SyntheticNotice>) {
     while let Ok(SyntheticNotice { handle, request_id, event }) = receiver.recv() {
         let active = tables().lock().unwrap_or_else(|e| e.into_inner())
             .requests.get(&handle)
-            .is_some_and(|req| req.id == request_id && req.synthetic && !req.closing);
+             .is_some_and(|req| req.id == request_id && replay_can_dispatch(req.async_session, req.closing, req.replay.is_some()));
         if active {
             deliver_replay_notice(handle as H, event);
         }
@@ -1756,7 +1762,7 @@ unsafe extern "system" fn on_receive(h: H, reserved: H) -> B {
             .map(|r| (r.async_session, r.callback_context))
     };
     if let Some((async_req, context)) = synthetic {
-        if async_req && !queue_synthetic_notice(h, AsyncNotice::Headers { context }) {
+        if async_req && !queue_replay_notice(h, AsyncNotice::Headers { context }) {
             SetLastError(8); // ERROR_NOT_ENOUGH_MEMORY
             return 0;
         }
@@ -2007,7 +2013,7 @@ unsafe extern "system" fn on_read(h: H, buffer: H, cap: u32, out: *mut u32) -> B
             let queued = if let Some(sender) = dispatch {
                 sender.send(notice).is_ok()
             } else {
-                queue_synthetic_notice(h, notice)
+                queue_replay_notice(h, notice)
             };
             if !queued {
                 warn_log("cape replay read completion could not be queued");
@@ -2046,7 +2052,7 @@ unsafe extern "system" fn on_available(h: H, out: *mut u32) -> B {
             let queued = if let Some(sender) = dispatch {
                 sender.send(notice).is_ok()
             } else {
-                queue_synthetic_notice(h, notice)
+                queue_replay_notice(h, notice)
             };
             if !queued {
                 warn_log("cape replay available completion could not be queued");
@@ -2260,6 +2266,15 @@ unsafe extern "system" fn on_close(h: H) -> B {
 #[cfg(test)]
 mod isolation_tests {
     use super::*;
+    #[test]
+    fn async_native_catalog_replay_can_dispatch_without_synthetic_flag() {
+        // catalog_fast_response fills req.replay on a native WinHTTP handle.
+        assert!(replay_can_dispatch(true, false, true));
+        assert!(!replay_can_dispatch(true, false, false));
+        assert!(!replay_can_dispatch(true, true, true));
+        assert!(!replay_can_dispatch(false, false, true));
+    }
+
     #[test]
     fn synthetic_headers_support_names_and_standard_status() {
         assert_eq!(
