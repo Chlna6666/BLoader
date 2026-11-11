@@ -466,7 +466,7 @@ fn redirected_std_handle(handle: *mut c_void) -> bool {
     if !stdout.is_some_and(|value| value.0 == handle)
         && !stderr.is_some_and(|value| value.0 == handle) { return false; }
     let mut mode = 0;
-    unsafe { GetConsoleMode(handle, &mut mode) == 0 } && live_console_transport(handle)
+    (unsafe { GetConsoleMode(handle, &mut mode) == 0 }) && live_console_transport(handle)
 }
 
 /// Resolves the module behind the detour caller. `FramesToSkip=2` skips this
