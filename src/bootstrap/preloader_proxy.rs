@@ -56,6 +56,14 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
         crate::bootstrap::xuser_bridge::publish_pending_logs();
     }
 
+    // Capture native WriteConsoleA/W and console WriteFile output before
+    // PreLoader and LeviLamina start their own logger threads. The console
+    // hook observes writes without rebinding any third-party CRT FILE*.
+    // The latest.log relay remains an independent fallback for file-only logs.
+    if logging::console_is_ready() {
+        crate::platform::console_capture::install();
+    }
+
     let started = Instant::now();
     let mut candidates = discover_candidates(game_dir);
     candidates.sort_by(|a, b| a.path.cmp(&b.path));
@@ -67,9 +75,6 @@ pub unsafe fn try_load(game_dir: &Path) -> PreloaderProxySummary {
                 "preloader",
                 "PreLoader.dll exists but BLoader metadata is missing/invalid: expected mods/PreLoader/bloader.json type=preloader-bootstrap. DLL untouched.",
             );
-        }
-        if logging::console_is_ready() {
-            crate::platform::console_capture::install();
         }
         logging::write_bootstrap_marker("preloader.early.not_found");
         return PreloaderProxySummary {
