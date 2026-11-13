@@ -668,12 +668,6 @@ fn standard_pack_manifest(
                 .filter(|value| !value.is_empty())
                 .unwrap_or(folder)
                 .to_string();
-            let texture = files
-                .members
-                .keys()
-                .find(|name| name.to_ascii_lowercase().ends_with(".png"))
-                .cloned()
-                .unwrap_or_else(|| "cape.png".to_string());
             (
                 uuid_from(folder.as_bytes(), "pack"),
                 display,
@@ -1669,6 +1663,7 @@ mod tests {
     fn generated_persona_uses_cosmos_bundle_and_encrypted_index() {
         let data = experimental_persona_png(
             "Local Test",
+            "Test Artist",
             "11111111-2222-4333-8444-555555555555",
             "66666666-2222-4333-8444-555555555555",
             &dummy_png(),
