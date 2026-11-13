@@ -1494,9 +1494,9 @@ mod tests {
         assert!(cape.persona_rgba_normalized);
         let module = uuid_from(id.as_bytes(), "resource");
         let pack = uuid_from(id.as_bytes(), "pack");
-        let version = generated_pack_version("HD", "Author", &original, [1, 0, 0]);
+        let version = generated_pack_version("HD", "Player", &original, [1, 0, 0]);
         let expected =
-            crate::cosmetics::persona_pack::generate("HD", "Author", &pack, &module, &compatible, version)
+            crate::cosmetics::persona_pack::generate("HD", "Player", &pack, &module, &compatible, version)
                 .unwrap();
         let served = cape
             .assets
