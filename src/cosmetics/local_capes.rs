@@ -371,13 +371,20 @@ fn valid_uuid(id: &str) -> bool {
 // when their texture or generated metadata has changed. Keep the product
 // ID and pack UUID stable; only the generated pack's content version changes.
 // Native user-provided Persona versions are never replaced.
-fn generated_pack_version(name: &str, png: &[u8], author_version: [u32; 3]) -> [u32; 3] {
+fn generated_pack_version(
+    name: &str,
+    author: &str,
+    png: &[u8],
+    author_version: [u32; 3],
+) -> [u32; 3] {
     let mut hash = Sha256::new();
-    hash.update(b"Cosmetics/generated-persona-cache-version/v3");
+    hash.update(b"Cosmetics/generated-persona-cache-version/v4");
     hash.update(author_version[0].to_le_bytes());
     hash.update(author_version[1].to_le_bytes());
     hash.update(author_version[2].to_le_bytes());
     hash.update(name.as_bytes());
+    hash.update([0]);
+    hash.update(author.as_bytes());
     hash.update([0]);
     hash.update(png);
     let d = hash.finalize();
@@ -492,16 +499,55 @@ fn validate_native(bytes: &[u8]) -> Result<NativeIdentity, String> {
 }
 fn experimental_persona_png(
     name: &str,
+    author: &str,
     pack_uuid: &str,
     module_uuid: &str,
     png: &[u8],
     version: [u32; 3],
 ) -> Result<Vec<u8>, String> {
-    super::persona_pack::generate(name, pack_uuid, module_uuid, png, version)
+    super::persona_pack::generate(name, author, pack_uuid, module_uuid, png, version)
 }
 
 fn name_ok(input: &str) -> bool {
     !input.is_empty() && input.chars().count() <= 90 && !input.chars().any(char::is_control)
+}
+
+/// Empty authors are unspecified; malformed metadata is not silently discarded.
+fn author_value(value: &Value) -> Result<Option<String>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let author = value.as_str().ok_or("author must be a string")?.trim();
+    if author.is_empty() {
+        return Ok(None);
+    }
+    if !name_ok(author) {
+        return Err("invalid author".into());
+    }
+    Ok(Some(author.to_owned()))
+}
+
+/// Resource/skin pack convention: metadata.authors stores pack creators.
+fn manifest_author(manifest: &Value) -> Result<Option<String>, String> {
+    let Some(authors) = manifest.pointer("/metadata/authors") else {
+        return author_value(&manifest["metadata"]["author"]);
+    };
+    let names = authors
+        .as_array()
+        .ok_or("metadata.authors must be an array")?
+        .iter()
+        .map(|value| {
+            author_value(value)?.ok_or_else(|| "metadata.authors contains an empty name".to_owned())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let joined = names.join(", ");
+    if !name_ok(&joined) {
+        return Err("combined metadata.authors exceeds 90 characters".into());
+    }
+    Ok(Some(joined))
 }
 // Format v1 multi-cape archives declare a persistent package UUID, a stable
 // per-cape key, and a version. No UUID is randomly generated at runtime.
@@ -564,11 +610,13 @@ fn standard_pack_manifest(
     }
     let sheet: Value =
         serde_json::from_slice(cape).map_err(|e| format!("cape.json invalid: {e}"))?;
+    // Preserve the default author even when a bare descriptor becomes capes[].
+    let sheet_author = author_value(&sheet["author"])?;
     // Two accepted layouts: the v1 pack (manifest.json + cape.json) and a
     // single-cape folder (cape.json + texture, no manifest). The single-cape
     // form derives its pack UUID from the folder name so the identity stays
     // stable across restarts and renames of the parent directory.
-    let (id, name, version) = match files.get("manifest.json") {
+    let (id, name, version, header_author) = match files.get("manifest.json") {
         Some(manifest) => {
             if manifest.len() > MAX_MANIFEST {
                 return Err("cape manifest too large".into());
@@ -605,7 +653,8 @@ fn standard_pack_manifest(
                 })
                 .collect::<Result<Vec<_>, _>>()?
                 .join(".");
-            (id, name, version)
+            let author = manifest_author(&header)?;
+            (id, name, version, author)
         }
         None => {
             // Bare folder layout: cape.json is a plain descriptor
@@ -629,6 +678,7 @@ fn standard_pack_manifest(
                 uuid_from(folder.as_bytes(), "pack"),
                 display,
                 "1.0.0".to_string(),
+                None,
             )
         }
     };
@@ -667,6 +717,10 @@ fn standard_pack_manifest(
             .map(|(_, value)| value.trim().to_owned())
             .filter(|value| !value.is_empty())
     };
+    let author = sheet_author
+        .or(header_author)
+        .or_else(|| localized(&format!("capepack.{key}.by")))
+        .unwrap_or_default();
     let entries = sheet["capes"].as_array().ok_or("cape list missing")?;
     let capes = entries
         .iter()
@@ -676,6 +730,7 @@ fn standard_pack_manifest(
                 .ok_or("cape localization_name missing")?;
             // texture stays optional: persona-only capes carry persona_zip instead.
             let texture = entry["texture"].as_str();
+            let cape_author = author_value(&entry["author"])?;
             let display = localized(&format!("cape.{key}.{stable}"))
                 .or_else(|| {
                     entry["name"]
@@ -693,7 +748,7 @@ fn standard_pack_manifest(
                 .cloned()
                 .unwrap_or(Value::Null);
             Ok(
-                serde_json::json!({"id":stable,"name":display,"texture":texture,
+                serde_json::json!({"id":stable,"name":display,"author":cape_author,"texture":texture,
             "icon":entry["icon"],"persona_zip":entry["persona_zip"],"uuid":entry["item_uuid"],
             "rarity":entry["rarity"],"startDate":start_date}),
             )
@@ -701,7 +756,7 @@ fn standard_pack_manifest(
         .collect::<Result<Vec<Value>, String>>()?;
     serde_json::to_vec(&serde_json::json!({"format_version":1,"id":id,
         "name":localized(&format!("capepack.{key}")).unwrap_or_else(||name.to_owned()),
-        "version":version,"capes":capes}))
+        "author":author,"version":version,"capes":capes}))
     .map_err(|e| e.to_string())
 }
 const MAX_CAPES_PER_PACK: usize = 64;
@@ -976,10 +1031,10 @@ impl Registry {
             return Err("cape pack must contain 1..64 capes".into());
         }
         let version = version_parts(&pack.version)?;
-        let author = if pack.author.is_empty() {
+        let author = if pack.author.trim().is_empty() {
             "Player"
         } else {
-            pack.author.as_str()
+            pack.author.trim()
         };
         if !name_ok(author) {
             return Err("invalid package author".into());
@@ -1006,6 +1061,7 @@ impl Registry {
             let author = cape
                 .author
                 .as_deref()
+                .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .unwrap_or(author);
             let texture = cape.texture.as_deref();
@@ -1098,6 +1154,7 @@ impl Registry {
         let generated_version = if original.is_none() {
             Some(generated_pack_version(
                 &name,
+                author,
                 png.as_deref().ok_or("missing cape PNG")?,
                 version,
             ))
@@ -1135,6 +1192,7 @@ impl Registry {
                 persona_texture_dims = Some(tex_dims);
                 experimental_persona_png(
                     &name,
+                    author,
                     &generated_pack_uuid,
                     &module_uuid,
                     &texture,
@@ -1442,9 +1500,9 @@ mod tests {
         assert!(cape.persona_rgba_normalized);
         let module = uuid_from(id.as_bytes(), "resource");
         let pack = uuid_from(id.as_bytes(), "pack");
-        let version = generated_pack_version("HD", &original, [1, 0, 0]);
+        let version = generated_pack_version("HD", "Author", &original, [1, 0, 0]);
         let expected =
-            crate::cosmetics::persona_pack::generate("HD", &pack, &module, &compatible, version)
+            crate::cosmetics::persona_pack::generate("HD", "Author", &pack, &module, &compatible, version)
                 .unwrap();
         let served = cape
             .assets
@@ -1550,6 +1608,7 @@ mod tests {
         );
         assert_eq!(reg.generated_persona_payloads, 1);
         assert_eq!(reg.items[0]["title"], "Red Cape");
+        assert_eq!(reg.items[0]["creatorName"], "Player");
         assert_eq!(reg.items[0]["ownership"], "Purchased");
         let id = reg.items[0]["id"].as_str().unwrap();
         let catalog: Value = serde_json::from_slice(reg.catalogs.get(id).unwrap()).unwrap();
@@ -1947,15 +2006,16 @@ mod tests {
     #[test]
     fn generated_persona_version_is_content_addressed_and_stable() {
         let image = dummy_png();
-        let v = generated_pack_version("Example", &image, [1, 0, 0]);
+        let v = generated_pack_version("Example", "Artist", &image, [1, 0, 0]);
         assert_ne!(
             v,
             [1, 0, 0],
             "generated version must not hit obsolete cache"
         );
-        assert_eq!(v, generated_pack_version("Example", &image, [1, 0, 0]));
-        assert_ne!(v, generated_pack_version("Renamed", &image, [1, 0, 0]));
-        assert_ne!(v, generated_pack_version("Example", &image, [1, 0, 1]));
+        assert_eq!(v, generated_pack_version("Example", "Artist", &image, [1, 0, 0]));
+        assert_ne!(v, generated_pack_version("Renamed", "Artist", &image, [1, 0, 0]));
+        assert_ne!(v, generated_pack_version("Example", "Other Artist", &image, [1, 0, 0]));
+        assert_ne!(v, generated_pack_version("Example", "Artist", &image, [1, 0, 1]));
         assert_eq!(version_string(v).split('.').count(), 3);
         let id = "11111111-2222-4333-8444-555555555555".to_string();
         let make = |data: Vec<u8>| {
@@ -2002,6 +2062,7 @@ mod tests {
         assert_eq!(registered.item["packIdentity"][0]["version"], expected);
         assert_eq!(manifest["header"]["version"], json!(v));
         assert_eq!(manifest["modules"][0]["version"], json!(v));
+        assert_eq!(manifest["metadata"]["authors"], json!(["Artist"]));
     }
     #[test]
     fn resource_urls_change_with_generated_persona_content_not_item_identity() {
@@ -2256,7 +2317,7 @@ mod tests {
         // no manifest, no cape list, just a name and the texture next to it.
         fs::write(
             dir.join("cape.json"),
-            r#"{"name":"共享披风","author":"Player"}"#,
+            r#"{"name":"共享披风","author":"Single Artist"}"#,
         )
         .unwrap();
         fs::write(dir.join("cape.png"), dummy_png()).unwrap();
@@ -2269,6 +2330,10 @@ mod tests {
             reg.diagnostics
         );
         assert_eq!(reg.items.len(), 1);
+        assert_eq!(reg.items[0]["creatorName"], "Single Artist");
+        let id = reg.items[0]["id"].as_str().unwrap();
+        let catalog: Value = serde_json::from_slice(reg.catalogs.get(id).unwrap()).unwrap();
+        assert_eq!(catalog["data"]["Item"]["DisplayProperties"]["creatorName"], "Single Artist");
 
         // Stable identity: scanning again yields the same item UUID.
         let again = Registry::scan(&[root.clone()], "en_US");
@@ -2341,6 +2406,103 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn per_cape_author_and_manifest_authors_are_used_for_folder_offers() {
+        let root = std::env::temp_dir().join(format!("cosmetics_authors_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("capes").join("Authors");
+        fs::create_dir_all(&dir).unwrap();
+        let manifest = json!({
+            "format_version": 1,
+            "header": {"name":"Authors","uuid":TEST_PACK_UUID,"version":[1,0,0]},
+            "modules": [{"type":"cape_pack","uuid":TEST_MODULE_UUID,"version":[1,0,0]}],
+            "metadata": {"authors":["Pack Artist", "Coauthor"]}
+        });
+        let sheet = json!({
+            "localization_name":"authors",
+            "capes":[
+                {"localization_name":"first","texture":"first.png"},
+                {"localization_name":"second","texture":"second.png","author":"Cape Artist"}
+            ]
+        });
+        fs::write(dir.join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::write(dir.join("cape.json"), serde_json::to_vec(&sheet).unwrap()).unwrap();
+        fs::write(dir.join("first.png"), dummy_png()).unwrap();
+        fs::write(dir.join("second.png"), dummy_png()).unwrap();
+        let reg = Registry::scan(&[root.clone()], "en_US");
+        assert_eq!((reg.accepted, reg.rejected, reg.items.len()), (1, 0, 2), "{:?}", reg.diagnostics);
+        for (item, expected) in reg.items.iter().zip(["Pack Artist, Coauthor", "Cape Artist"]) {
+            assert_eq!(item["creatorName"], expected);
+            let id = item["id"].as_str().unwrap();
+            let catalog: Value = serde_json::from_slice(reg.catalogs.get(id).unwrap()).unwrap();
+            assert_eq!(catalog["data"]["Item"]["DisplayProperties"]["creatorName"], expected);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn zip_pack_author_and_per_cape_author_have_independent_precedence() {
+        let root = std::env::temp_dir().join(format!("cosmetics_zipauthors_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("capes")).unwrap();
+        let manifest = json!({
+            "format_version":1,
+            "header":{"name":"Authors","uuid":TEST_PACK_UUID,"version":[1,0,0]},
+            "modules":[{"type":"cape_pack","uuid":TEST_MODULE_UUID,"version":[1,0,0]}],
+            "metadata":{"authors":["Manifest Artist"]}
+        });
+        let sheet = json!({
+            "localization_name":"authors",
+            "author":"Pack Studio",
+            "capes":[
+                {"localization_name":"first","texture":"cape.png"},
+                {"localization_name":"second","texture":"cape.png","author":"  Individual Artist  "}
+            ]
+        });
+        let mut zip = ZipWriter::new(File::create(root.join("capes/authors.zip")).unwrap());
+        let options = SimpleFileOptions::default();
+        for (path, data) in [
+            ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
+            ("cape.json", serde_json::to_vec(&sheet).unwrap()),
+            ("cape.png", dummy_png()),
+        ] {
+            zip.start_file(path, options).unwrap();
+            zip.write_all(&data).unwrap();
+        }
+        zip.finish().unwrap();
+        let reg = Registry::scan(&[root.clone()], "en_US");
+        assert_eq!((reg.accepted, reg.rejected, reg.items.len()), (1, 0, 2), "{:?}", reg.diagnostics);
+        assert_eq!(reg.items[0]["creatorName"], "Pack Studio");
+        assert_eq!(reg.items[1]["creatorName"], "Individual Artist");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn localized_pack_author_and_invalid_per_cape_author() {
+        let mut files = PackFiles { members: BTreeMap::new() };
+        let manifest = json!({
+            "format_version":1,
+            "header":{"name":"Example","uuid":TEST_PACK_UUID,"version":[1,0,0]},
+            "modules":[{"type":"cape_pack","uuid":TEST_MODULE_UUID,"version":[1,0,0]}]
+        });
+        files.members.insert("manifest.json".into(), serde_json::to_vec(&manifest).unwrap());
+        files.members.insert(
+            "cape.json".into(),
+            br#"{"localization_name":"example","capes":[{"localization_name":"red","texture":"cape.png"}]}"#.to_vec(),
+        );
+        files.members.insert("texts/en_US.lang".into(), b"capepack.example.by=English Author\n".to_vec());
+        files.members.insert("texts/zh_CN.lang".into(), "capepack.example.by=中文作者\n".as_bytes().to_vec());
+        let output = standard_pack_manifest(&files, "zh_CN", None).unwrap();
+        let pack: PackManifest = serde_json::from_slice(&output).unwrap();
+        assert_eq!(pack.author, "中文作者");
+        files.members.insert(
+            "cape.json".into(),
+            br#"{"localization_name":"example","capes":[{"localization_name":"red","texture":"cape.png","author":123}]}"#.to_vec(),
+        );
+        assert!(standard_pack_manifest(&files, "zh_CN", None).is_err());
+    }
+
     #[test]
     fn multi_cape_folder_pack_registers_all_items() {
         let root = std::env::temp_dir().join(format!("cosmetics_dirmulti_{}", std::process::id()));

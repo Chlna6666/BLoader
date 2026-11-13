@@ -107,6 +107,7 @@ pub fn bundle_pack(inner: &[u8]) -> Result<Vec<u8>, String> {
 }
 pub fn generate(
     name: &str,
+    author: &str,
     pack_uuid: &str,
     module_uuid: &str,
     png: &[u8],
@@ -119,7 +120,8 @@ pub fn generate(
         "format_version":1,
         "header":{"name":name,"description":"Cosmetics local Persona cape",
                   "uuid":pack_uuid,"version":version},
-        "modules":[{"type":"persona_piece","uuid":module_uuid,"version":version}]
+        "modules":[{"type":"persona_piece","uuid":module_uuid,"version":version}],
+        "metadata":{"authors":[author]}
     });
     let manifest_bytes = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
     let meta = json!({
@@ -204,7 +206,7 @@ mod tests {
         let id = "11111111-2222-4333-8444-555555555555";
         let module = "66666666-2222-4333-8444-555555555555";
         let png = b"PNG image placeholder";
-        let bytes = generate("Test Cape", id, module, png, [1, 0, 0]).unwrap();
+        let bytes = generate("Test Cape", "Cape Studio", id, module, png, [1, 0, 0]).unwrap();
         let mut outer = ZipArchive::new(Cursor::new(&bytes)).unwrap();
         assert_eq!(outer.len(), 1);
         let mut nested = Vec::new();
@@ -217,6 +219,7 @@ mod tests {
         let manifest: Value =
             serde_json::from_reader(pack.by_name("manifest.json").unwrap()).unwrap();
         assert_eq!(manifest["header"]["uuid"], id);
+        assert_eq!(manifest["metadata"]["authors"], json!(["Cape Studio"]));
         let mut content_bytes = Vec::new();
         pack.by_name("contents.json")
             .unwrap()
@@ -261,7 +264,7 @@ mod tests {
         }
         assert_eq!(
             bytes,
-            generate("Test Cape", id, module, png, [1, 0, 0]).unwrap()
+            generate("Test Cape", "Cape Studio", id, module, png, [1, 0, 0]).unwrap()
         );
     }
 }

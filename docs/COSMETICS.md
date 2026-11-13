@@ -105,37 +105,113 @@ mode 一览：`append_array`（身份去重追加，披风页走分区注入并�
 ≤128 MiB 资产。PNG 要求 ≤2048×2048、完整可解码；纯 PNG 披风的 UV 需为 64×32
 整数倍等比（如 128×64、256×128），否则拒绝。三种包形式：
 
-### 5.1 官方风格包（推荐，`参考游戏官方自己的`）
+### 5.1 多披风合集（推荐）
+
+BLoader 参考基岩版资源包 / 皮肤包的清单设计：使用 `manifest.json` 管理包身份和
+`metadata.authors`，以 `cape.json` 列出披风。但 `cape_pack`、`cape.json`
+属于 **BLoader 自定义扩展**，不是原生 `skin_pack`、`skins.json` 格式。
 
 ```text
-<包名>/
-├── manifest.json   {"format_version":1,
-│                    "header":{"uuid":"<固定UUID>","name":"...","version":[1,0,0]},
-│                    "modules":[{"type":"cape_pack"}]}          ← 恰好 1 个 cape_pack 模块
-├── cape.json       {"localization_name":"<包键>","capes":[
-│                      {"localization_name":"<稳定键>","texture":"textures/x.png",
-│                       "icon":"textures/icon.png",       ← 可选，方形自定义缩略图
-│                       "persona_zip":"...",              ← 可选，原生包直通
-│                       "item_uuid":"...",                ← 可选，固定商品 UUID
-│                       "rarity":"rare","start_date":"2026-01-02T03:04:05Z"}]}
-├── textures/*.png
-└── texts/zh_CN.lang  cape.<包键>.<稳定键>=显示名
-                      capepack.<包键>=包显示名       ← 缺省回退 en_US.lang
+MyCapes/
+├── manifest.json
+├── cape.json
+├── textures/
+│   ├── red.png
+│   └── blue.png
+└── texts/
+    ├── en_US.lang
+    └── zh_CN.lang
 ```
 
-显示名经 `default_locale`（回退 en_US）本地化；`texture` 可省略（persona-only）。
+`manifest.json`（整个包使用一个作者）：
 
-### 5.2 多披风 pack.json 形式
+```json
+{
+  "format_version": 1,
+  "header": {
+    "name": "My Capes",
+    "uuid": "11111111-2222-4333-8444-555555555555",
+    "version": [1, 0, 0]
+  },
+  "modules": [
+    {
+      "type": "cape_pack",
+      "uuid": "66666666-7777-4888-8999-000000000001",
+      "version": [1, 0, 0]
+    }
+  ],
+  "metadata": {
+    "authors": ["Pack Artist"]
+  }
+}
+```
 
-`pack.json`：`{"format_version":1,"id":"<固定UUID>","name","author","version":"1.0.0",
-"capes":[{"id":"<稳定键>","name","texture","icon","persona_zip","uuid","rarity","startDate"}]}`，
-纹理路径相对包根，1..64 披风，任一披风失败整包拒绝（无部分注册）。
+`cape.json`（允许每个披风覆盖合集作者）：
 
-### 5.3 单披风 cape.json 形式
+```json
+{
+  "localization_name": "my_capes",
+  "capes": [
+    {
+      "localization_name": "red",
+      "texture": "textures/red.png"
+    },
+    {
+      "localization_name": "blue",
+      "texture": "textures/blue.png",
+      "author": "Another Artist"
+    }
+  ]
+}
+```
 
-`cape.json{"name","author","id?","rarity?","startDate?"} + cape.png`（或仅
-`persona.zip`），ZIP 与解包文件夹等价；ZIP 文件名 stem / 文件夹名参与身份派生，
-因此**同名 ZIP 与文件夹共享身份、自动去重**（先注册者胜出）。
+也可以直接在 `cape.json` 顶层写 `"author": "Shared Studio"`，
+用作所有未写 `capes[].author` 的披风作者。
+`metadata.authors: ["Alice", "Bob"]` 显示为 `Alice, Bob`，
+因为商品 `creatorName` 是单个字符串。支持单作者简写
+`"metadata": {"author": "Artist"}`。
+
+`cape.json` 条目还可选 `icon`（自定义缩略图）、`persona_zip`
+（原生资源直通）、`item_uuid`（固定商品 UUID）、`rarity`、
+`start_date`。仅使用 Persona 资源时可省略 `texture`。
+路径相对包根，合集每包 1..64 件披风，失败时整包拒绝。
+
+### 5.2 作者解析顺序
+
+1. `capes[].author`：每件披风自己的作者；
+2. `cape.json` 顶层 `author`：合集默认作者；
+3. `manifest.json` 的 `metadata.authors`（或单作者 `metadata.author`）；
+4. `texts/<locale>.lang` 的 `capepack.<包键>.by`：参考原版皮肤包 `.by` 的本地化方案；
+5. 作者全部缺失时才使用 `Player`。
+
+示例 `texts/zh_CN.lang`：
+
+```ini
+capepack.my_capes=我的披风合集
+capepack.my_capes.by=中文作者
+cape.my_capes.red=红色披风
+cape.my_capes.blue=蓝色披风
+```
+
+本地化文件优先当前 `default_locale`，缺失时回退 `en_US.lang`。
+作者值会去除前后空格；空值视为缺省；无效类型、控制字符或超出 90 字符
+则拒绝包，而不是静默显示 `Player`。所有作者会写入
+本地 Offer `creatorName`、Catalog `DisplayProperties.creatorName`；
+纯 PNG 生成的 Persona 包也写入 `manifest.json metadata.authors`。
+作者变更不改变商品 UUID，但会刷新生成资源版本/URL，避免游戏缓存旧署名。
+
+### 5.3 无 manifest 的单披风文件夹
+
+仅一个披风时可使用文件夹 `cape.json + cape.png` 或
+`cape.json + persona.zip`：
+
+```json
+{"name": "共享披风", "author": "Independent Artist"}
+```
+
+文件夹名称派生包 UUID，显示名称与作者直接读取 `cape.json`。
+ZIP 建议使用 5.1 的完整清单格式。旧版开发期 `pack.json`
+格式已停用，不会自动兼容。
 
 ### 5.4 身份派生（确定性，无运行时随机）
 
@@ -143,14 +219,14 @@ mode 一览：`append_array`（身份去重追加，披风页走分区注入并�
 
 | kind | seed | 用途 |
 | --- | --- | --- |
-| `item` | `file_stem\0name\0author` | 单披风商品 |
-| `item-v2` | `pack.id\0cape.id` | 多披风商品（或显式 `uuid`/`item_uuid`） |
+| `item-v2` | `pack.id\0cape.id` | 所有披风商品（或显式 `item_uuid`） |
+| `pack` | 单披风文件夹名 | 无 manifest 的单披风包 UUID |
 | `resource` | item_id | persona 模块 UUID |
 | `pack` | item_id | 生成包 header UUID |
 | `persona-content-v3` | `item_id\0version\0SHA256(persona)\0SHA256(thumbnail)` | 下载资源 UUID（内容寻址：改图自动换 URL/版本，身份不变） |
 
 生成包版本 = `[author_major, u16(d[0..2]), u16(d[2..4])?]`（哈希自
-`generated-persona-cache-version/v3` + 版本 + 名字 + PNG），专用于击穿游戏的
+`generated-persona-cache-version/v4` + 版本 + 名字 + 作者 + PNG），专用于击穿游戏的
 "pack UUID + version" 缓存。
 
 ### 5.5 限额与失败语义

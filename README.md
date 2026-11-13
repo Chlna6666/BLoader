@@ -334,8 +334,12 @@ XUser Bridge 不使用 `config.json` 开关。它只由 BMCBL 为当前 Minecraf
 
 披风包只从**游戏 com.mojang 数据目录**的 `capes/` 加载（GDK `%APPDATA%\Minecraft Bedrock( Preview)\Users\Shared\games\com.mojang`、`C:\Users\Shared\games\com.mojang`、UWP 零售/预览/教育各包 `LocalState\games\com.mojang`；开启文件重定向时自动跟随重定向位置）。每个根同时接受两种形式，按 item UUID 跨根去重：
 
-- **解包文件夹**（推荐，官方 pack 目录风格）：单披风 `cape.json + cape.png [ + persona.zip ]`；多披风 `pack.json + textures/*.png`。文件夹名参与稳定 UUID 派生（与同名 ZIP 同身份）。
-- **ZIP**：内容与文件夹一致的压缩包。
+- **解包文件夹**（推荐）：合集使用 `manifest.json + cape.json + textures/*.png`，单披风可使用 `cape.json + cape.png`。无 manifest 时文件夹名用于派生包 UUID。
+- **ZIP**：使用 `manifest.json + cape.json`；按照包 UUID 和披风稳定键去重。旧版 `pack.json` 不再加载。
+
+披风作者按 `capes[].author` → `cape.json` 顶层 `author` → `manifest.json metadata.authors`
+→ `texts/*.lang` 的 `capepack.<包键>.by` 顺序解析；只有全部缺失时才显示 `Player`。
+既支持整个包共用作者，也支持每件披风独立作者（见 [详细格式](docs/COSMETICS.md#52-作者解析顺序)）。
 
 包内可选原生 `persona.zip` 原样直通；纯 PNG 披风由生成器合成 persona 包（确定性 UUID、内容寻址版本，重启不丢身份，改图自动换版本）。披风扫描在启动时完成，改包后重启游戏生效。
 

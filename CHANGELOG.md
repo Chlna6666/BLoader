@@ -1,3 +1,8 @@
+## Unreleased
+
+- 修复 BLoader 本地披风包作者信息丢失：`manifest.json metadata.authors`、`cape.json` 根级 `author` 与每披风 `author`、本地化 `.by` 署名正确映射至商品及目录 `creatorName`；无作者时才回退 `Player`。
+- 合成 Persona manifest 写入 `metadata.authors`；内容寻址版本纳入作者，防止改作者后旧资源缓存残留。新增文件夹、ZIP、单披风及本地化作者验证，并更新文档。
+
 ## 0.2.110 (2026-11-07)
 
 - 预加载阶段只做**描述符级** stdio 重定向（`_dup` / `_open_osfhandle` / `_dup2`），不再调用 `setvbuf` 与 `_flushall`，也不碰 Win32 标准句柄：原生加载器在加载期间打印的横幅因此能实时进入捕获管道，不再只能事后从日志文件补。0.2.104/105 的失败来自 CRT 全局 stdio 重配置，不是描述符替换本身。
