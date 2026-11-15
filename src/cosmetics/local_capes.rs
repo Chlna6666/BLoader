@@ -164,7 +164,6 @@ pub struct Registry {
     items: Vec<Value>,
     catalogs: HashMap<String, Vec<u8>>,
     assets: HashMap<String, LocalAsset>,
-    package_ranges: Vec<(String, String, Value, std::ops::Range<usize>)>,
     pub diagnostics: Vec<String>,
     pub discovered_packs: usize,
     pub discovered_roots: usize,
@@ -173,14 +172,6 @@ pub struct Registry {
     pub native_payloads: usize,
     pub generated_persona_payloads: usize,
 }
-#[derive(Clone)]
-pub(super) struct CapePackGroup {
-    pub id: String,
-    pub name: String,
-    pub thumbnail: Value,
-    pub items: Vec<Value>,
-}
-
 static REGISTRY: OnceLock<Registry> = OnceLock::new();
 pub fn initialize(roots: &[PathBuf], locale: &str) -> &'static Registry {
     REGISTRY.get_or_init(|| Registry::scan(roots, locale))
@@ -204,14 +195,6 @@ impl Registry {
         Some((&asset.data, asset.kind))
     }
 
-    pub(super) fn groups(&self) -> Vec<CapePackGroup> {
-        self.package_ranges.iter().map(|(id, name, thumbnail, range)| CapePackGroup {
-            id: id.clone(),
-            name: name.clone(),
-            thumbnail: thumbnail.clone(),
-            items: self.items[range.clone()].to_vec(),
-        }).collect()
-    }
 }
 pub fn items() -> &'static [Value] {
     REGISTRY.get().map_or(&[], |r| r.items.as_slice())
@@ -962,7 +945,7 @@ impl Registry {
                 reg.discovered_packs += 1;
                 let result = Self::read_pack(&path, is_dir, locale);
                 match result {
-                    Ok((pack_id, name, pack_icon, entries)) => {
+                    Ok((name, pack_icon, entries)) => {
                         let items = entries.len();
                         let bytes = entries
                             .iter()
@@ -987,7 +970,6 @@ impl Registry {
                             continue;
                         }
                         total += bytes + pack_icon.as_ref().map_or(0, Vec::len);
-                        let first = reg.items.len();
                         for (index, entry) in entries.into_iter().enumerate() {
                             let size = entry.dimensions.map_or("none".to_string(), |(w, h)| {
                                 format!("{w}x{h} scale={}x", w / 64)
@@ -1012,34 +994,17 @@ impl Registry {
                             }
                             reg.items.push(entry.item);
                         }
-                        let thumbnail = if let Some(icon) = pack_icon {
-                            // Pack-level icon is distinct from any cape item's icon.
-                            // Derive a content-addressed route so changing a logo
-                            // cannot display a stale in-game thumbnail.
+                        if let Some(icon) = pack_icon {
+                            // Preserve the optional pack-level icon as an
+                            // addressable, content-keyed asset. It is not an
+                            // equip offer or a synthetic navigation card.
                             let icon_id = uuid_from(&icon, "cape-pack-icon-v1");
                             let icon_path = format!("/thumbnails/{icon_id}.png");
-                            let url = format!("https://{}{}", super::persona::LOCAL_HOST, icon_path);
                             reg.assets.entry(icon_path).or_insert(LocalAsset {
                                 data: icon,
                                 kind: AssetType::Png,
                             });
-                            json!({"tag":"Thumbnail","type":"Thumbnail","url":url,
-                                "urlWithResolution":url})
-                        } else {
-                            reg.items[first]["thumbnail"].clone()
-                        };
-                        // Multiple imported packages may share the manifest pack
-                        // UUID while containing distinct stable cape item IDs.
-                        // Keep the existing per-cape de-duplication and derive
-                        // a unique navigation identity from both values.
-                        let first_item = reg.items[first]["id"].as_str().unwrap_or_default();
-                        let navigation_seed = format!("{pack_id}\0{first_item}");
-                        let navigation_id = uuid_from(
-                            navigation_seed.as_bytes(), "cape-pack-navigation-v1"
-                        );
-                        reg.package_ranges.push((
-                            navigation_id, name.clone(), thumbnail, first..reg.items.len()
-                        ));
+                        }
                         reg.accepted += 1;
                         reg.diagnostics.push(format!(
                             "CAPE_VALIDATED {label}: {name} capes={items} identity=stable payloads=registered"));
@@ -1059,7 +1024,7 @@ impl Registry {
         path: &Path,
         is_dir: bool,
         locale: &str,
-    ) -> Result<(String, String, Option<Vec<u8>>, Vec<PreparedCape>), String> {
+    ) -> Result<(String, Option<Vec<u8>>, Vec<PreparedCape>), String> {
         let files = if is_dir {
             PackFiles::from_dir(path)?
         } else {
@@ -1161,7 +1126,7 @@ impl Registry {
             }
             entries.push(prepared);
         }
-        Ok((pack.id, pack.name, pack_icon, entries))
+        Ok((pack.name, pack_icon, entries))
     }
 
     fn prepare_cape(
@@ -1768,7 +1733,7 @@ mod tests {
         assert!(archive.by_name("signatures.json").is_ok());
     }
     #[test]
-    fn pack_icon_is_used_only_for_package_navigation() {
+    fn pack_icon_is_validated_and_registered_without_navigation() {
         let root = std::env::temp_dir().join(format!(
             "bloader-pack-icon-{}", std::process::id()
         ));
@@ -1789,12 +1754,14 @@ mod tests {
         zip.finish().unwrap();
         let registry = Registry::scan(&[root.clone()], "en_US");
         assert_eq!(registry.accepted, 1, "{:?}", registry.diagnostics);
-        let group = &registry.groups()[0];
-        assert_eq!(group.name, "Icon Pack");
-        assert_ne!(group.thumbnail, registry.items[0]["thumbnail"]);
-        let url = group.thumbnail["url"].as_str().unwrap();
-        let path = url.strip_prefix("https://cosmetics.invalid").unwrap();
-        assert_eq!(registry.asset_bytes(path).unwrap().0, icon.get_ref());
+        let icon_id = uuid_from(icon.get_ref(), "cape-pack-icon-v1");
+        let path = format!("/thumbnails/{icon_id}.png");
+        assert_eq!(registry.asset_bytes(&path).unwrap().0, icon.get_ref());
+        assert_ne!(
+            registry.items[0]["thumbnail"]["url"],
+            format!("https://cosmetics.invalid{path}")
+        );
+        assert_eq!(registry.items.len(), 1, "pack icon must not become an offer");
         let _ = fs::remove_dir_all(root);
     }
 

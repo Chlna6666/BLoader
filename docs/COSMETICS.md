@@ -182,9 +182,10 @@ MyCapes/
 `manifest.json` 字段。要求为可完整解码的**正方形 PNG**，长宽均不超过
 2048、文件不超过 8 MiB；格式不合法将拒绝整个披风包。
 这是包级图标，**不会替代** `capes[].icon`（单个披风的缩略图）。
-缺少 `pack_icon.png` 时，包卡片自动回退为首件披风的缩略图。
-本地披风包也能使用该文件；社区列表的包卡片通过 BLoader 内存虚拟
-`/thumbnails/` URL 获取图标，不让游戏直接访问 CDN。
+缺少 `pack_icon.png` 时不影响任何披风的正常展示。
+包图标作为可选的包级资源参与解析、校验与内容寻址注册；
+当前更衣室直接展示每件披风，不会为该文件生成无法装备的包卡片。
+单件披风仍优先使用 `capes[].icon`，否则使用由贴图生成的缩略图。
 
 ### 5.2 作者解析顺序
 
@@ -309,10 +310,13 @@ y=1..17 ×scale）最近邻缩放后合成 64×64 人体模型画布，或使用
 `headerComp+itemListComp` 的 GridList 模板行，收集既有 id（去重），可选执行
 显式 allowlist 的所有权投影，然后按来源分桶注入三个新分区
 官方目录披风 / 社区披风 / 本地披风（本地优先；空分区省略；分隔行克隆 VerticalLineDivider）。
-社区披风**只创建一个原生横向列表**，按有效披风数量进行自适应展示：
-每包 1～2 件时直接展示披风（可直接选择），3～64 件时仅展示一张包导航卡片
-（优先 `pack_icon.png`，否则回退首件披风图标），点击后进入该包的子页面。
-不同包不会各占据一整行；大量小包也不会造成大量无实际内容的子页面。
+社区披风与本地披风**使用同一种普通 GridList / itemListComp 商品区块**：
+把 CDN 中所有已经成功解析的披风按原始 Offer / Persona 数据逐件注入“社区披风”
+这一个分区（最多 512 件，按商品 ID 去重）。无需按包建行、包卡片、专用
+StoreRow 或二级页面；所有条目可直接选中、查看原有作者/品质并装备。
+本地披风优先于同 ID 的社区商品。已拥有的官方内容和权益字段不变。
+根级 `pack_icon.png` 仍按规范校验并作为包级资源登记，但不显示为独立商品，
+也不代替单件披风的 `capes[].icon` 或由披风贴图生成的缩略图。
 标题从 BLoader 内嵌语言资源按 `config.json` 的 `default_locale` 翻译，
 分别使用 `cosmetics.capes.section.official_catalog`、
 `cosmetics.capes.section.community` 和 `cosmetics.capes.section.local`；
@@ -326,6 +330,14 @@ BLoader `config.json` 新增 `"enable_community_capes": true`（默认值）；�
 运行时通过配置热重载关闭时，社区条目会停止被注入，新社区资源请求不再被应答；
 重新打开更衣室页面即可查看新分组。开启后才执行网络同步。
 
+**启动预加载：** BLoader 在游戏 WinHTTP Hook 安装前同步解析上次缓存的社区 ZIP，
+一次性生成商品、缩略图、Catalog 和 Persona 资源；游戏首次打开更衣室时直接读取
+内存中的披风列表，不等待 CDN 或临时解码。首次运行时若没有缓存，则由启动期间
+拉起的后台网络线程异步建立缓存；此时是否能赶上第一次打开更衣室取决于网络，
+不会为了社区服务延迟游戏进入主界面。网络异常时继续使用已预加载的旧缓存；
+远端更新完成后重新打开更衣室即可获取最新列表。关闭
+`enable_community_capes` 时跳过预加载与同步，且不注入社区条目。
+
 后台工作线程通过 Windows WinHTTP 访问
 `https://be-cape-share.roundstudio.top/index.json` 根指针和版本化 `/vN/index.json`
 （不支持根指针的部署回退 `/v1/index.json`），全部使用
@@ -335,15 +347,9 @@ BLoader `config.json` 新增 `"enable_community_capes": true`（默认值）；�
 只允许与 `/pkgs/<包键>.<SHA256前8位>.mccapes` 完全匹配的下载路径，
 下载后校验完整 SHA-256，再放入
 `<BLoader>/cache/community-capes/capes/` 的内容寻址缓存。
-已验证缓存避免重复下载，网络故障保留缓存，社区 ZIP 统一复用本地披风扫描、
+已验证缓存避免重复下载，网络故障保留内存缓存，社区 ZIP 统一复用本地披风扫描、
 尺寸校验、Persona 生成与内存虚拟资产路由；不转发任何远端商品 URL 给游戏。
-不在游戏 WinHTTP 回调或启动主线程中做网络操作。
-首次同步发生在后台，如更衣室已打开，需重新打开以加载最新目录。
-点击包级导航卡片会请求 BLoader 专属的 `BMCBL_Community_<导航UUID>` 页面 ID，
-BLoader 在游戏 WinHTTP 边界直接合成页面 JSON；页面只包括所选包的披风，
-保留游戏原生回退、滚动、缩略图和装备组件。非本地页面请求保持原样透传，
-关闭社区披风后不再注入包卡片及合成社区子页面。
-动态子页面的导航行为仍需对应 Minecraft 版本的游戏内验证。
+所有网络请求均在后台处理，无需伪造 Minecraft 页面 ID 或请求不存在的官方页面。
 
 ## 10. 限制与已知问题
 

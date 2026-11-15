@@ -124,6 +124,16 @@ pub fn install(config: &Config, game_dir: &Path) -> bool {
     // Missing thumbnails can be generated separately in a future cache job.
     winhttp::prepare_local_resources();
 
+    // Synchronously pre-register the last cached community capes before the
+    // first game wardrobe request. Disk I/O only; never wait for the CDN.
+    community_capes::preload(
+        crate::platform::utils::get_loader_directory()
+            .join("cache")
+            .join("community-capes"),
+        config.default_locale.clone(),
+        config.enable_community_capes,
+    );
+
     if let Err(error) = unsafe { winhttp::install() } {
         logging::scoped_error_message(
             "cosmetics",
@@ -132,14 +142,9 @@ pub fn install(config: &Config, game_dir: &Path) -> bool {
         HOOK_INSTALLED.store(false, Ordering::SeqCst);
         return false;
     }
-    // Network sync and cache scanning are isolated on a background worker.
-    community_capes::start(
-        crate::platform::utils::get_loader_directory()
-            .join("cache")
-            .join("community-capes"),
-        config.default_locale.clone(),
-        config.enable_community_capes,
-    );
+    // A cold installation refreshes asynchronously; subsequent launches
+    // already have their cached community registry before the game starts.
+    community_capes::refresh();
     logging::scoped_info_message(
         "cosmetics",
         "local cape resources ready; WinHTTP hooks installed before OEP; config_source=builtin",

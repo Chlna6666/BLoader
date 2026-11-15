@@ -185,7 +185,7 @@ pub fn inject_with_community(
     local: &[Value],
     allowlist: &HashSet<String>,
     identity_key: &str,
-    community_groups: &[super::local_capes::CapePackGroup],
+    community_items: &[Value],
 ) -> Result<SectionStats, String> {
     let rows = root
         .pointer_mut("/result/layout/0/rows")
@@ -241,63 +241,18 @@ pub fn inject_with_community(
             community_new.push(copy)
         }
     }
-    // One top-level Community Capes row. Tiny packs show their capes directly,
-    // while larger packs use one navigation tile leading to their own page.
-    // This avoids both a tall list of tiny packages and unnecessary clicks.
-    let mut community_rows = Vec::new();
-    let mut community_tiles = Vec::new();
-    let imported_community_count = community_new.len();
-    for group in community_groups {
-        let mut items = Vec::new();
-        for item in &group.items {
-            let id = item.get(identity_key).and_then(Value::as_str)
-                .ok_or_else(|| format!("community cape missing {identity_key} string"))?;
-            if seen.insert(id.to_ascii_lowercase()) {
-                items.push(item.clone());
-            }
+    // A single native cape section, identical to the local-cape section:
+    // never synthesize pack tiles, pages, thumbnails or navigation links.
+    // Prefer local and existing owned items when identities overlap.
+    for item in community_items {
+        let id = item.get(identity_key).and_then(Value::as_str)
+            .ok_or_else(|| format!("community cape missing {identity_key} string"))?;
+        if seen.insert(id.to_ascii_lowercase()) {
+            community_new.push(item.clone());
         }
-        if items.is_empty() { continue; }
-        stats.community += items.len();
-        // One- and two-cape packages do not merit a separate page.
-        if items.len() <= 2 {
-            community_new.extend(items);
-            continue;
-        }
-        let page_id = super::community_capes::page_id(&group.id);
-        let first_identity = items[0].get("packIdentity").cloned().unwrap_or_else(|| json!([]));
-        let tile = json!({
-            "id": group.id,
-            "title": group.name,
-            "creatorName": "BLoader",
-            "thumbnailPreviewOnly": true,
-            "contentType": "PersonaDurable",
-            "pieceType": "persona_capes",
-            "packType": "Persona",
-            "ownership": "NotOwned",
-            "rarity": "common",
-            "thumbnail": group.thumbnail,
-            "packIdentity": first_identity,
-            "linksTo": page_id,
-            "linksToInfo": {
-                "linksTo": page_id,
-                "linkType": "pageId",
-                "displayType": "store_layout.character_creator_screen",
-                "navigateInPlace": false
-            },
-            "namedLinksToInfoMap": {
-                "dr.persona_creator_page": {
-                    "linksTo": page_id,
-                    "linkType": "external",
-                    "displayType": "store_layout.character_creator_screen",
-                    "navigateInPlace": false
-                }
-            }
-        });
-        community_tiles.push(tile);
-        community_rows.push(items);
     }
     stats.official = official_new.len();
-    stats.community += imported_community_count;
+    stats.community = community_new.len();
     stats.local = local_new.len();
     if stats.official + stats.community + stats.local == 0 {
         return Ok(stats);
@@ -308,8 +263,7 @@ pub fn inject_with_community(
     // In that case, append the new entries to an existing item list in place,
     // keeping every original item, receipt, and ownership field unchanged.
     let Some(template) = prototype_row(rows) else {
-        let new_count = official_new.len() + community_new.len() + local_new.len()
-            + community_rows.iter().map(Vec::len).sum::<usize>();
+        let new_count = official_new.len() + community_new.len() + local_new.len();
         let Some(component) = rows.iter_mut()
             .filter_map(|row| row.get_mut("components").and_then(Value::as_array_mut))
             .flat_map(|components| components.iter_mut())
@@ -329,7 +283,6 @@ pub fn inject_with_community(
         items.extend(official_new);
         items.extend(community_new);
         items.extend(local_new);
-        items.extend(community_rows.into_iter().flatten());
         let total = items.len();
         let previous = component_map.get("totalItems").and_then(Value::as_u64).unwrap_or(0);
         component_map.insert("totalItems".into(), Value::from(previous.max(total as u64)));
@@ -349,26 +302,11 @@ pub fn inject_with_community(
     let anchor = rows.iter()
         .position(|row| row == &template)
         .ok_or("cape section template disappeared during injection")? + 1;
-    community_new.extend(community_tiles);
     let categories = [
         ("cosmetics.capes.section.official_catalog", official_new),
         ("cosmetics.capes.section.community", community_new),
         ("cosmetics.capes.section.local", local_new),
     ];
-    // StoreRow is the horizontal marketplace carousel. Prefer a native
-    // StoreRow template; if the current game only exposes GridList, use the
-    // same validated component layout with the native StoreRow control ID.
-    let carousel_template = rows.iter()
-        .find(|row| row.get("controlId").and_then(Value::as_str) == Some("StoreRow")
-            && item_components(row).is_some_and(|parts| parts.iter().any(|component|
-                component["type"] == "itemListComp"
-                    && component.get("linksTo").is_none())))
-        .cloned()
-        .unwrap_or_else(|| {
-            let mut row = template.clone();
-            row["controlId"] = Value::String("StoreRow".into());
-            row
-        });
     let mut new_rows = Vec::new();
     for (title_key, items) in categories {
         if items.is_empty() {
@@ -377,15 +315,10 @@ pub fn inject_with_community(
         if let Some(divider) = &divider {
             new_rows.push(divider.clone());
         }
-        // The injected store-row header is a literal string, not a Minecraft
-        // language key. Translate through BLoader's configured locale first.
         let title = crate::platform::i18n::tr(title_key);
-        let source = if title_key == "cosmetics.capes.section.community" {
-            &carousel_template
-        } else {
-            &template
-        };
-        new_rows.push(build_row(source, &title, items)?);
+        // Clone the same native layout template as the local cape list.
+        // A synthetic StoreRow/card has no valid equip navigation here.
+        new_rows.push(build_row(&template, &title, items)?);
     }
     rows.splice(anchor..anchor, new_rows);
     Ok(stats)
@@ -514,59 +447,60 @@ mod tests {
     }
 
     #[test]
-    fn community_uses_one_pack_carousel_and_deduplicates_against_local() {
-        use super::super::local_capes::CapePackGroup;
+    fn community_capes_are_equippable_items_in_one_native_section() {
         let mut root = fixture();
-        let groups = vec![
-            CapePackGroup {
-                id: "11111111-2222-4333-8444-555555555555".into(),
-                name: "Summer Pack".into(),
-                thumbnail: json!({"url":"https://cosmetics.invalid/thumbnails/summer.png"}),
-                items: vec![
-                    json!({"id":"remote-a","ownership":"Purchased"}),
-                    json!({"id":"remote-b","ownership":"Purchased"}),
-                    json!({"id":"remote-d","ownership":"Purchased"}),
-                ],
-            },
-            CapePackGroup {
-                id: "66666666-7777-4888-8999-000000000001".into(),
-                name: "Winter Pack".into(),
-                thumbnail: json!({"url":"https://cosmetics.invalid/thumbnails/winter.png"}),
-                items: vec![
-                    json!({"id":"remote-c","ownership":"Purchased"}),
-                    json!({"id":"local","ownership":"Purchased"}),
-                ],
-            },
+        let community = vec![
+            json!({"id":"cape-a","title":"First","ownership":"Purchased","creatorName":"A"}),
+            json!({"id":"cape-b","title":"Second","ownership":"Purchased","creatorName":"B"}),
+            json!({"id":"cape-c","title":"Third","ownership":"Purchased","creatorName":"C"}),
+            json!({"id":"local","title":"Duplicate","ownership":"Purchased","creatorName":"D"}),
         ];
         let stats = inject_with_community(
             &mut root, &[], &[json!({"id":"local","ownership":"Purchased"})],
-            &HashSet::new(), "id", &groups,
+            &HashSet::new(), "id", &community,
         ).unwrap();
         assert_eq!(stats.local, 1);
-        assert_eq!(stats.community, 4);
+        assert_eq!(stats.community, 3);
         let rows = root["result"]["layout"][0]["rows"].as_array().unwrap();
         let sections: Vec<_> = rows.iter()
+            .filter(|row| row["controlId"] == "GridList")
             .filter_map(|row| row.get("components").and_then(Value::as_array))
             .filter(|parts| parts.iter().any(|part| part["type"] == "headerComp"))
             .collect();
-        assert_eq!(sections.len(), 3); // owned + community + local; never per package
-        assert_eq!(rows.iter()
-            .filter(|row| row["controlId"] == "StoreRow").count(), 1);
-        let community = sections[1].iter().find(|part| part["type"] == "itemListComp").unwrap();
-        assert_eq!(community["totalItems"], 2);
-        let tiles = community["items"].as_array().unwrap();
-        // Tiny packs are shown as directly selectable capes first.
-        assert_eq!(tiles[0]["id"], "remote-c");
-        assert!(tiles[0].get("linksTo").is_none());
-        // Only the larger pack creates a navigation card and child page.
-        assert_eq!(tiles[1]["title"], "Summer Pack");
-        assert_eq!(tiles[1]["thumbnail"]["url"],
-                   "https://cosmetics.invalid/thumbnails/summer.png");
-        assert_eq!(tiles[1]["linksToInfo"]["linkType"], "pageId");
-        assert!(tiles[1]["linksTo"].as_str().unwrap().starts_with("BMCBL_Community_"));
+        assert_eq!(sections.len(), 3); // owned, community, local
+        let remote = sections[1].iter().find(|part| part["type"] == "itemListComp").unwrap();
+        assert_eq!(remote["totalItems"], 3);
+        assert_eq!(remote["customStoreRowConfiguration"]["maxOffers"], 3);
+        let items = remote["items"].as_array().unwrap();
+        assert_eq!(items.iter().map(|v| v["id"].as_str().unwrap()).collect::<Vec<_>>(),
+                   vec!["cape-a", "cape-b", "cape-c"]);
+        assert!(items.iter().all(|item| item["ownership"] == "Purchased"
+             && item.get("linksTo").is_none() && item.get("linksToInfo").is_none()));
+        assert_eq!(rows.iter().filter(|r| r["controlId"] == "StoreRow").count(), 0);
         let local = sections[2].iter().find(|part| part["type"] == "itemListComp").unwrap();
-        assert_eq!(local["totalItems"], 1);
         assert_eq!(local["items"][0]["id"], "local");
+    }
+
+    #[test]
+    fn community_large_collection_does_not_create_pack_navigation() {
+        let mut root = fixture();
+        let remote: Vec<_> = (0..32).map(|i| json!({
+            "id": format!("remote-{i}"), "ownership": "Purchased",
+            "pieceType": "persona_capes", "title": format!("Cape {i}")
+        })).collect();
+        let stats = inject_with_community(
+            &mut root, &[], &[], &HashSet::new(), "id", &remote,
+        ).unwrap();
+        assert_eq!(stats.community, 32);
+        let rows = root["result"]["layout"][0]["rows"].as_array().unwrap();
+        assert_eq!(rows.iter().filter(|row| row["controlId"] == "GridList").count(), 2);
+        let section = rows.iter()
+            .filter(|row| row["controlId"] == "GridList")
+            .nth(1).unwrap();
+        let cape_list = section["components"].as_array().unwrap().iter()
+            .find(|comp| comp["type"] == "itemListComp").unwrap();
+        assert_eq!(cape_list["totalItems"], 32);
+        assert_eq!(cape_list["items"].as_array().unwrap().len(), 32);
     }
 
     #[test]

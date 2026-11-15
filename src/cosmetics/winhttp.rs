@@ -257,7 +257,6 @@ fn should_intercept(cfg: &Config, host: &str, path: &str, method: &str) -> bool 
     MASTER_ENABLED.load(Ordering::Acquire)
         && cfg.enabled
         && (host.eq_ignore_ascii_case(persona::LOCAL_HOST)
-            || community_capes::is_page_request(host, path, method)
             || cfg.match_rule(host, path, method).is_some())
 }
 
@@ -929,41 +928,6 @@ unsafe extern "system" fn on_send(
             "request #{id}: REQUEST_CAPTURED route={route} captured={bytes} total={expected} complete={} overflow={overflow}",
             bytes == expected && !overflow
         ));
-    }
-    // Synthetic native navigation pages: a single Community Capes carousel
-    // links to one pack's capes without polluting the main wardrobe vertically.
-    let community_page = {
-        let state = tables().lock().unwrap_or_else(|e| e.into_inner());
-        state.requests.get(&state_key(h)).and_then(|r| {
-            community_capes::is_page_request(&r.host, &r.path, &r.method)
-                .then(|| (r.host.clone(), r.path.clone(), r.method.clone(), r.async_session))
-        })
-    };
-    if let Some((host, path, method, async_request)) = community_page {
-        let result = community_capes::page_response(&host, &path, &method);
-        let status = if result.is_some() { 200 } else { 404 };
-        let bytes = result.unwrap_or_default();
-        let count = bytes.len();
-        {
-            let mut state = tables().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(req) = state.requests.get_mut(&state_key(h)) {
-                req.synthetic = true;
-                req.status = status;
-                req.callback_context = ctx;
-                req.replay = Some(Replay {
-                    bytes, position: 0, head_content_length: None,
-                    complete: true, replaced: true, catalog: false,
-                    zip: false, png: false, strip_encoding: true,
-                    status, delivery_logged: false,
-                });
-            }
-        }
-        logger(&format!("community pack page response status={status} bytes={count} async={async_request}"));
-        if async_request && !queue_replay_notice(h, AsyncNotice::SendComplete { context: ctx }) {
-            SetLastError(8);
-            return 0;
-        }
-        return 1;
     }
     let virtual_resource = {
         let state = tables().lock().unwrap_or_else(|e| e.into_inner());

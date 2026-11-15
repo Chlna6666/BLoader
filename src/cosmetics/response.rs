@@ -355,12 +355,12 @@ pub fn overlay(
             } else {
                 &[]
             };
-            let community_groups = if rule.name == "dressing_room_capes" {
-                super::community_capes::groups()
+            let community_items = if rule.name == "dressing_room_capes" {
+                super::community_capes::items()
             } else {
                 Vec::new()
             };
-            if add.is_empty() && local_items.is_empty() && community_groups.is_empty()
+            if add.is_empty() && local_items.is_empty() && community_items.is_empty()
                 && official_preview_ids.is_empty()
             {
                 return Ok(None);
@@ -368,11 +368,6 @@ pub fn overlay(
             let mut root: Value = serde_json::from_slice(original_body)
                 .map_err(|e| format!("original JSON invalid: {e}"))?;
             if rule.name == "dressing_room_capes" {
-                if !community_groups.is_empty() {
-                    // Preserve a native layout shell for pack-specific pages.
-                    // Never cache game-owned items in generated community pages.
-                    super::community_capes::capture_page_template(&root);
-                }
                 // Respect the original owned cape section. Cosmos itself
                 // creates distinct GridList rows for Vanilla/Custom capes.
                 let result = super::cape_sections::inject_with_community(
@@ -381,7 +376,7 @@ pub fn overlay(
                     local_items,
                     &official_preview_ids,
                     &rule.identity_key,
-                    &community_groups,
+                    &community_items,
                 )?;
                 if !result.changed() {
                     return Ok(None);
