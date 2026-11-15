@@ -1,5 +1,6 @@
 ## Unreleased
 
+- 新增社区披风 CDN：独立 `enable_community_capes` 开关默认开启；WinHTTP 后台增量获取版本化索引和社区 ZIP（UA `BMCBL/1.0.0`、超时、同源限制、下载大小限制与 SHA-256 校验），私有内容寻址缓存和离线回退；社区披风按包进入独立子列表，不再把整个目录平铺。保持本地披风、官方披风及作者/品质逻辑不变，版本升至 0.2.113。
 - 更衣室披风分区标题接入 BLoader 内嵌 i18n（`default_locale`）：本地分区由 `My Local ZIP Capes` 改为“本地披风”，官方目录和社区分区同步翻译；不再将 ZIP 格式暴露为用户分类。保留本地披风元数据、作者和品质逻辑不变。
 - 修复 BLoader 本地披风包作者信息丢失：`manifest.json metadata.authors`、`cape.json` 根级 `author` 与每披风 `author`、本地化 `.by` 署名正确映射至商品及目录 `creatorName`；无作者时才回退 `Player`。
 - 合成 Persona manifest 写入 `metadata.authors`；内容寻址版本纳入作者，防止改作者后旧资源缓存残留。新增文件夹、ZIP、单披风及本地化作者验证，并更新文档。

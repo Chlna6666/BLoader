@@ -122,7 +122,7 @@ BLoader 会把 XUser/BMCBL 通信状态输出到结构化控制台和正常日�
 - VEH/SEH/顶层异常过滤器和原生预加载崩溃归属；
 - 内置中英文 i18n；
 - 文件重定向；
-- 内置披风模块（详见"内置披风模块"章节）；
+- 内置披风模块（本地披风 + 默认开启的社区披风目录；可通过 `config.json` 的 `enable_community_capes=false` 单独关闭社区同步，详见"内置披风模块"章节）；
 - 默认关闭的 WinSock2/NetherNet 网络 Hook；
 - 与 LeviLamina/PreLoader 共存时委托其原生 Mod 生命周期，避免双重装载。
 

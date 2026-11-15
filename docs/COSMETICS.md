@@ -299,11 +299,33 @@ y=1..17 ×scale）最近邻缩放后合成 64×64 人体模型画布，或使用
 `headerComp+itemListComp` 的 GridList 模板行，收集既有 id（去重），可选执行
 显式 allowlist 的所有权投影，然后按来源分桶注入三个新分区
 官方目录披风 / 社区披风 / 本地披风（本地优先；空分区省略；分隔行克隆 VerticalLineDivider）。
+社区披风按来源披风包分组为独立原生子列表（每行最多默认可见六件），避免在更衣室首页平铺整个 CDN 目录。
 标题从 BLoader 内嵌语言资源按 `config.json` 的 `default_locale` 翻译，
 分别使用 `cosmetics.capes.section.official_catalog`、
 `cosmetics.capes.section.community` 和 `cosmetics.capes.section.local`；
 不显示 ZIP 等文件格式信息。幂等：重复注入为零变更。
 永不移除原行、永不克隆 Owned 区的交互按钮组件。
+
+### 社区披风 CDN（默认开启）
+
+BLoader `config.json` 新增 `"enable_community_capes": true`（默认值）；用户可设为
+`false`，不影响本地披风和官方披风。`enable_cosmetics=false` 仍是总开关。
+运行时通过配置热重载关闭时，社区条目会停止被注入，新社区资源请求不再被应答；
+重新打开更衣室页面即可查看新分组。开启后才执行网络同步。
+
+后台工作线程通过 Windows WinHTTP 访问
+`https://be-cape-share.roundstudio.top/index.json` 根指针和版本化 `/vN/index.json`
+（不支持根指针的部署回退 `/v1/index.json`），全部使用
+`User-Agent: BMCBL/1.0.0`。限制 HTTPS 固定域名并禁用重定向；
+解析/连接/发送/接收分别具有超时，读取阶段另有 12 秒截止；
+索引至多 512 KiB、包至多 64 MiB、全局至多 128 包/512 披风及 128 MiB 包容量。
+只允许与 `/pkgs/<包键>.<SHA256前8位>.mccapes` 完全匹配的下载路径，
+下载后校验完整 SHA-256，再放入
+`<BLoader>/cache/community-capes/capes/` 的内容寻址缓存。
+已验证缓存避免重复下载，网络故障保留缓存，社区 ZIP 统一复用本地披风扫描、
+尺寸校验、Persona 生成与内存虚拟资产路由；不转发任何远端商品 URL 给游戏。
+不在游戏 WinHTTP 回调或启动主线程中做网络操作。
+首次同步发生在后台，如更衣室已打开，需重新打开以加载最新目录。
 
 ## 10. 限制与已知问题
 

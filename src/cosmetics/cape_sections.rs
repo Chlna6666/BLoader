@@ -462,6 +462,38 @@ mod tests {
     }
 
     #[test]
+    fn community_packages_are_separate_rows_and_deduplicated_against_local() {
+        let mut root = fixture();
+        let groups = vec![
+            ("Summer Pack".to_owned(), vec![
+                json!({"id":"remote-a","ownership":"Purchased"}),
+                json!({"id":"remote-b","ownership":"Purchased"}),
+            ]),
+            ("Winter Pack".to_owned(), vec![
+                json!({"id":"remote-c","ownership":"Purchased"}),
+                json!({"id":"local","ownership":"Purchased"}),
+            ]),
+        ];
+        let stats = inject_with_community(
+            &mut root, &[], &[json!({"id":"local","ownership":"Purchased"})],
+            &HashSet::new(), "id", &groups,
+        ).unwrap();
+        assert_eq!(stats.local, 1);
+        assert_eq!(stats.community, 3);
+        let rows = root["result"]["layout"][0]["rows"].as_array().unwrap();
+        let groups: Vec<_> = rows.iter()
+            .filter_map(|row| row.get("components").and_then(Value::as_array))
+            .filter(|parts| parts.iter().any(|part| part["type"] == "headerComp"))
+            .collect();
+        assert_eq!(groups.len(), 4); // owned + local + two community package rows
+        let first = groups[2].iter().find(|part| part["type"] == "headerComp").unwrap();
+        assert!(first["text"]["value"].as_str().unwrap().contains("Summer Pack"));
+        let second = groups[3].iter().find(|part| part["type"] == "itemListComp").unwrap();
+        assert_eq!(second["totalItems"], 1);
+        assert_eq!(second["items"][0]["id"], "remote-c");
+    }
+
+    #[test]
     fn only_explicit_allowlist_can_project_official_purchased() {
         let mut root = fixture();
         let item = json!({"id":"cape","creatorName":"Minecraft",
