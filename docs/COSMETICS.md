@@ -298,8 +298,11 @@ y=1..17 ×scale）最近邻缩放后合成 64×64 人体模型画布，或使用
 在响应副本上操作（失败不动原文）：定位 `result.layout[0].rows` 中带
 `headerComp+itemListComp` 的 GridList 模板行，收集既有 id（去重），可选执行
 显式 allowlist 的所有权投影，然后按来源分桶注入三个新分区
-`Official Capes - Catalog Only` / `Community Capes` / `My Local ZIP Capes`
-（本地优先；空分区省略；分隔行克隆 VerticalLineDivider）。幂等：重复注入为零变更。
+官方目录披风 / 社区披风 / 本地披风（本地优先；空分区省略；分隔行克隆 VerticalLineDivider）。
+标题从 BLoader 内嵌语言资源按 `config.json` 的 `default_locale` 翻译，
+分别使用 `cosmetics.capes.section.official_catalog`、
+`cosmetics.capes.section.community` 和 `cosmetics.capes.section.local`；
+不显示 ZIP 等文件格式信息。幂等：重复注入为零变更。
 永不移除原行、永不克隆 Owned 区的交互按钮组件。
 
 ## 10. 限制与已知问题

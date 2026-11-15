@@ -282,19 +282,22 @@ pub fn inject(
         .position(|row| row == &template)
         .ok_or("cape section template disappeared during injection")? + 1;
     let categories = [
-        ("Official Capes - Catalog Only", official_new),
-        ("Community Capes", community_new),
-        ("My Local ZIP Capes", local_new),
+        ("cosmetics.capes.section.official_catalog", official_new),
+        ("cosmetics.capes.section.community", community_new),
+        ("cosmetics.capes.section.local", local_new),
     ];
     let mut new_rows = Vec::new();
-    for (title, items) in categories {
+    for (title_key, items) in categories {
         if items.is_empty() {
             continue;
         }
         if let Some(divider) = &divider {
             new_rows.push(divider.clone());
         }
-        new_rows.push(build_row(&template, title, items)?);
+        // The injected store-row header is a literal string, not a Minecraft
+        // language key. Translate through BLoader's configured locale first.
+        let title = crate::platform::i18n::tr(title_key);
+        new_rows.push(build_row(&template, &title, items)?);
     }
     rows.splice(anchor..anchor, new_rows);
     Ok(stats)
@@ -360,7 +363,12 @@ mod tests {
             })
             .collect();
         assert_eq!(sections.len(), 4);
-        for comp in sections.iter().skip(1) {
+        let section_keys = [
+            "cosmetics.capes.section.official_catalog",
+            "cosmetics.capes.section.community",
+            "cosmetics.capes.section.local",
+        ];
+        for (comp, key) in sections.iter().skip(1).zip(section_keys) {
             let header = comp
                 .iter()
                 .find(|c| c.get("type") == Some(&json!("headerComp")))
@@ -369,7 +377,8 @@ mod tests {
                 .iter()
                 .find(|c| c.get("type") == Some(&json!("itemListComp")))
                 .unwrap();
-            assert!(header["text"]["value"].as_str().unwrap().contains("Capes"));
+            let title = crate::platform::i18n::tr(key);
+            assert_eq!(header["text"]["value"], format!("{title} (1)"));
             assert!(items.get("linksTo").is_none());
             assert_eq!(items["totalItems"], 1);
         }
@@ -405,7 +414,8 @@ mod tests {
         assert_eq!(original["items"][0]["receipt"], "real");
         let components = rows[1]["components"].as_array().unwrap();
         let header = components.iter().find(|c| c["type"] == "headerComp").unwrap();
-        assert!(header["text"]["value"].as_str().unwrap().contains("My Local ZIP Capes"));
+        let title = crate::platform::i18n::tr("cosmetics.capes.section.local");
+        assert_eq!(header["text"]["value"], format!("{title} (1)"));
         let local_list = components.iter().find(|c| c["type"] == "itemListComp").unwrap();
         assert_eq!(local_list["items"].as_array().unwrap().len(), 1);
         assert_eq!(local_list["items"][0]["id"], "local-import");
