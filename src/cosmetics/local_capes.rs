@@ -895,7 +895,6 @@ impl Registry {
     pub fn scan(roots: &[PathBuf], locale: &str) -> Self {
         let mut reg = Self::default();
         let mut item_ids = HashSet::new();
-        let mut pack_ids = HashSet::new();
         let mut asset_ids = HashSet::new();
         let mut total = 0usize;
         for root in roots {
@@ -970,7 +969,7 @@ impl Registry {
                             .flat_map(|entry| entry.assets.iter())
                             .try_fold(0usize, |acc, (_, asset)| acc.checked_add(asset.data.len()))
                             .unwrap_or(usize::MAX);
-                        let duplicate = pack_ids.contains(&pack_id) || entries.iter().any(|entry| {
+                        let duplicate = entries.iter().any(|entry| {
                             item_ids.contains(&entry.id)
                                 || entry
                                     .assets
@@ -988,7 +987,6 @@ impl Registry {
                             continue;
                         }
                         total += bytes + pack_icon.as_ref().map_or(0, Vec::len);
-                        pack_ids.insert(pack_id.clone());
                         let first = reg.items.len();
                         for (index, entry) in entries.into_iter().enumerate() {
                             let size = entry.dimensions.map_or("none".to_string(), |(w, h)| {
@@ -1030,8 +1028,17 @@ impl Registry {
                         } else {
                             reg.items[first]["thumbnail"].clone()
                         };
+                        // Multiple imported packages may share the manifest pack
+                        // UUID while containing distinct stable cape item IDs.
+                        // Keep the existing per-cape de-duplication and derive
+                        // a unique navigation identity from both values.
+                        let first_item = reg.items[first]["id"].as_str().unwrap_or_default();
+                        let navigation_seed = format!("{pack_id}\0{first_item}");
+                        let navigation_id = uuid_from(
+                            navigation_seed.as_bytes(), "cape-pack-navigation-v1"
+                        );
                         reg.package_ranges.push((
-                            pack_id, name.clone(), thumbnail, first..reg.items.len()
+                            navigation_id, name.clone(), thumbnail, first..reg.items.len()
                         ));
                         reg.accepted += 1;
                         reg.diagnostics.push(format!(
