@@ -309,9 +309,10 @@ y=1..17 ×scale）最近邻缩放后合成 64×64 人体模型画布，或使用
 `headerComp+itemListComp` 的 GridList 模板行，收集既有 id（去重），可选执行
 显式 allowlist 的所有权投影，然后按来源分桶注入三个新分区
 官方目录披风 / 社区披风 / 本地披风（本地优先；空分区省略；分隔行克隆 VerticalLineDivider）。
-社区披风**只创建一个原生横向列表**，每个包显示一张导航卡片（优先
-`pack_icon.png`，否则回退首件披风图标），点击进入对应的披风包子页面查看和装备，
-而不是每个包占据一整行。一个包无论有 1 件还是 64 件披风，都只占首页一个卡片。
+社区披风**只创建一个原生横向列表**，按有效披风数量进行自适应展示：
+每包 1～2 件时直接展示披风（可直接选择），3～64 件时仅展示一张包导航卡片
+（优先 `pack_icon.png`，否则回退首件披风图标），点击后进入该包的子页面。
+不同包不会各占据一整行；大量小包也不会造成大量无实际内容的子页面。
 标题从 BLoader 内嵌语言资源按 `config.json` 的 `default_locale` 翻译，
 分别使用 `cosmetics.capes.section.official_catalog`、
 `cosmetics.capes.section.community` 和 `cosmetics.capes.section.local`；
@@ -338,7 +339,7 @@ BLoader `config.json` 新增 `"enable_community_capes": true`（默认值）；�
 尺寸校验、Persona 生成与内存虚拟资产路由；不转发任何远端商品 URL 给游戏。
 不在游戏 WinHTTP 回调或启动主线程中做网络操作。
 首次同步发生在后台，如更衣室已打开，需重新打开以加载最新目录。
-点击包级导航卡片会请求 BLoader 专属的 `BMCBL_Community_<包UUID>` 页面 ID，
+点击包级导航卡片会请求 BLoader 专属的 `BMCBL_Community_<导航UUID>` 页面 ID，
 BLoader 在游戏 WinHTTP 边界直接合成页面 JSON；页面只包括所选包的披风，
 保留游戏原生回退、滚动、缩略图和装备组件。非本地页面请求保持原样透传，
 关闭社区披风后不再注入包卡片及合成社区子页面。
