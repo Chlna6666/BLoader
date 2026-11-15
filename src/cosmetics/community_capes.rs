@@ -51,8 +51,10 @@ pub fn page_id(id: &str) -> String {
 }
 
 pub fn is_page_request(host: &str, path: &str, method: &str) -> bool {
-    if !ENABLED.load(Ordering::Acquire)
-        || !host.eq_ignore_ascii_case("store.mktpl.minecraft-services.net")
+    // Recognize our private page IDs even after community cosmetics is
+    // disabled: an already-visible navigation tile must not send a made-up
+    // BMCBL route to Microsoft's real store service.
+    if !host.eq_ignore_ascii_case("store.mktpl.minecraft-services.net")
         || !(method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("POST"))
     {
         return false;
@@ -79,7 +81,9 @@ pub fn capture_page_template(original: &Value) {
 }
 
 pub fn page_response(host: &str, path: &str, method: &str) -> Option<Vec<u8>> {
-    if !is_page_request(host, path, method) { return None; }
+    if !ENABLED.load(Ordering::Acquire) || !is_page_request(host, path, method) {
+        return None;
+    }
     let page = path.split('?').next()?.strip_prefix("/api/v2.0/layout/pages/")?;
     let group = snapshot()?.groups().into_iter()
         .find(|pack| page_id(&pack.id) == page)?;
