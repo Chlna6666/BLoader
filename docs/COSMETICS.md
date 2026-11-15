@@ -115,6 +115,7 @@ BLoader 参考基岩版资源包 / 皮肤包的清单设计：使用 `manifest.j
 MyCapes/
 ├── manifest.json
 ├── cape.json
+├── pack_icon.png            # 可选：整个披风包的正方形图标
 ├── textures/
 │   ├── red.png
 │   └── blue.png
@@ -175,6 +176,15 @@ MyCapes/
 （原生资源直通）、`item_uuid`（固定商品 UUID）、`rarity`、
 `start_date`。仅使用 Persona 资源时可省略 `texture`。
 路径相对包根，合集每包 1..64 件披风，失败时整包拒绝。
+
+**包图标规范：** 可选的 `pack_icon.png` 固定放在包根（ZIP 根目录或
+解包文件夹根目录），与 `manifest.json` / `cape.json` 同级，不需要新增
+`manifest.json` 字段。要求为可完整解码的**正方形 PNG**，长宽均不超过
+2048、文件不超过 8 MiB；格式不合法将拒绝整个披风包。
+这是包级图标，**不会替代** `capes[].icon`（单个披风的缩略图）。
+缺少 `pack_icon.png` 时，包卡片自动回退为首件披风的缩略图。
+本地披风包也能使用该文件；社区列表的包卡片通过 BLoader 内存虚拟
+`/thumbnails/` URL 获取图标，不让游戏直接访问 CDN。
 
 ### 5.2 作者解析顺序
 
@@ -299,7 +309,9 @@ y=1..17 ×scale）最近邻缩放后合成 64×64 人体模型画布，或使用
 `headerComp+itemListComp` 的 GridList 模板行，收集既有 id（去重），可选执行
 显式 allowlist 的所有权投影，然后按来源分桶注入三个新分区
 官方目录披风 / 社区披风 / 本地披风（本地优先；空分区省略；分隔行克隆 VerticalLineDivider）。
-社区披风按来源披风包分组为独立原生子列表（每行最多默认可见六件），避免在更衣室首页平铺整个 CDN 目录。
+社区披风**只创建一个原生横向列表**，每个包显示一张导航卡片（优先
+`pack_icon.png`，否则回退首件披风图标），点击进入对应的披风包子页面查看和装备，
+而不是每个包占据一整行。一个包无论有 1 件还是 64 件披风，都只占首页一个卡片。
 标题从 BLoader 内嵌语言资源按 `config.json` 的 `default_locale` 翻译，
 分别使用 `cosmetics.capes.section.official_catalog`、
 `cosmetics.capes.section.community` 和 `cosmetics.capes.section.local`；
@@ -326,6 +338,11 @@ BLoader `config.json` 新增 `"enable_community_capes": true`（默认值）；�
 尺寸校验、Persona 生成与内存虚拟资产路由；不转发任何远端商品 URL 给游戏。
 不在游戏 WinHTTP 回调或启动主线程中做网络操作。
 首次同步发生在后台，如更衣室已打开，需重新打开以加载最新目录。
+点击包级导航卡片会请求 BLoader 专属的 `BMCBL_Community_<包UUID>` 页面 ID，
+BLoader 在游戏 WinHTTP 边界直接合成页面 JSON；页面只包括所选包的披风，
+保留游戏原生回退、滚动、缩略图和装备组件。非本地页面请求保持原样透传，
+关闭社区披风后不再注入包卡片及合成社区子页面。
+动态子页面的导航行为仍需对应 Minecraft 版本的游戏内验证。
 
 ## 10. 限制与已知问题
 

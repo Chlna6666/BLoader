@@ -1,7 +1,7 @@
 //! Asynchronous, bounded community cape distribution from the BMCBL CDN.
 //! Network requests never run in a game WinHTTP callback or the loader's OEP path.
 //! Only HTTPS, the fixed CDN host, and content-addressed /pkgs/ URLs are accepted.
-use super::local_capes::{AssetType, Registry};
+use super::local_capes::{AssetType, CapePackGroup, Registry};
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
 use serde_json::Value;
@@ -33,6 +33,63 @@ static REGISTRY: OnceLock<RwLock<Arc<Registry>>> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static WORKER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+// Only the original, trusted dressing-room page becomes the page shell.
+// Package navigation pages contain no upstream account/owned cape rows.
+const PAGE_ID_PREFIX: &str = "BMCBL_Community_";
+const PAGE_ROUTE_PREFIX: &str = "/api/v2.0/layout/pages/BMCBL_Community_";
+struct PageTemplate {
+    shell: Value,
+    row: Value,
+}
+static PAGE_TEMPLATE: OnceLock<RwLock<Option<Arc<PageTemplate>>>> = OnceLock::new();
+fn page_template() -> &'static RwLock<Option<Arc<PageTemplate>>> {
+    PAGE_TEMPLATE.get_or_init(|| RwLock::new(None))
+}
+
+pub fn page_id(id: &str) -> String {
+    format!("{PAGE_ID_PREFIX}{}", id.replace('-', ""))
+}
+
+pub fn is_page_request(host: &str, path: &str, method: &str) -> bool {
+    if !ENABLED.load(Ordering::Acquire)
+        || !host.eq_ignore_ascii_case("store.mktpl.minecraft-services.net")
+        || !(method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("POST"))
+    {
+        return false;
+    }
+    let route = path.split('?').next().unwrap_or(path);
+    let Some(slug) = route.strip_prefix(PAGE_ROUTE_PREFIX) else { return false };
+    slug.len() == 32 && slug.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub fn capture_page_template(original: &Value) {
+    if !ENABLED.load(Ordering::Acquire) || page_template().read().is_some() { return; }
+    let Some(rows) = original.pointer("/result/layout/0/rows").and_then(Value::as_array) else {
+        return;
+    };
+    let Some(row) = super::cape_sections::prototype_row(rows) else { return };
+    let mut shell = original.clone();
+    if let Some(dest) = shell.pointer_mut("/result/layout/0/rows") {
+        *dest = Value::Array(Vec::new());
+        let mut slot = page_template().write();
+        if slot.is_none() {
+            *slot = Some(Arc::new(PageTemplate { shell, row }));
+        }
+    }
+}
+
+pub fn page_response(host: &str, path: &str, method: &str) -> Option<Vec<u8>> {
+    if !is_page_request(host, path, method) { return None; }
+    let page = path.split('?').next()?.strip_prefix("/api/v2.0/layout/pages/")?;
+    let group = snapshot()?.groups().into_iter()
+        .find(|pack| page_id(&pack.id) == page)?;
+    let template = page_template().read().as_ref().cloned()?;
+    let mut shell = template.shell.clone();
+    let row = super::cape_sections::build_row(&template.row, &group.name, group.items).ok()?;
+    *shell.pointer_mut("/result/layout/0/rows")? = Value::Array(vec![row]);
+    serde_json::to_vec(&shell).ok()
+}
+
 fn state() -> &'static RwLock<Arc<Registry>> {
     REGISTRY.get_or_init(|| RwLock::new(Arc::new(Registry::default())))
 }
@@ -58,7 +115,7 @@ pub fn snapshot() -> Option<Arc<Registry>> {
     ENABLED.load(Ordering::Acquire).then(|| Arc::clone(&state().read()))
 }
 
-pub fn groups() -> Vec<(String, Vec<Value>)> {
+pub fn groups() -> Vec<CapePackGroup> {
     snapshot().map_or_else(Vec::new, |registry| registry.groups())
 }
 

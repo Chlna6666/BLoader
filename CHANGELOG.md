@@ -1,5 +1,6 @@
 ## Unreleased
 
+- 补齐披风包根级可选 `pack_icon.png`（正方形 PNG 校验，缺省回退首件披风缩略图）及清单文档；重构社区披风为单一横向包卡片列表 + 按包进入的原生样式子页面，避免一个包只含少量披风时产生大量垂直分区。补充格式与布局测试，版本升至 0.2.114。
 - 新增社区披风 CDN：独立 `enable_community_capes` 开关默认开启；WinHTTP 后台增量获取版本化索引和社区 ZIP（UA `BMCBL/1.0.0`、超时、同源限制、下载大小限制与 SHA-256 校验），私有内容寻址缓存和离线回退；社区披风按包进入独立子列表，不再把整个目录平铺。保持本地披风、官方披风及作者/品质逻辑不变，版本升至 0.2.113。
 - 更衣室披风分区标题接入 BLoader 内嵌 i18n（`default_locale`）：本地分区由 `My Local ZIP Capes` 改为“本地披风”，官方目录和社区分区同步翻译；不再将 ZIP 格式暴露为用户分类。保留本地披风元数据、作者和品质逻辑不变。
 - 修复 BLoader 本地披风包作者信息丢失：`manifest.json metadata.authors`、`cape.json` 根级 `author` 与每披风 `author`、本地化 `.by` 署名正确映射至商品及目录 `creatorName`；无作者时才回退 `Player`。

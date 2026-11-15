@@ -368,6 +368,11 @@ pub fn overlay(
             let mut root: Value = serde_json::from_slice(original_body)
                 .map_err(|e| format!("original JSON invalid: {e}"))?;
             if rule.name == "dressing_room_capes" {
+                if !community_groups.is_empty() {
+                    // Preserve a native layout shell for pack-specific pages.
+                    // Never cache game-owned items in generated community pages.
+                    super::community_capes::capture_page_template(&root);
+                }
                 // Respect the original owned cape section. Cosmos itself
                 // creates distinct GridList rows for Vanilla/Custom capes.
                 let result = super::cape_sections::inject_with_community(

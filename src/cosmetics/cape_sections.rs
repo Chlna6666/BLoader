@@ -25,7 +25,7 @@ fn official_creator(item: &Value) -> bool {
 fn item_components(row: &Value) -> Option<&Vec<Value>> {
     row.get("components")?.as_array()
 }
-fn prototype_row(rows: &[Value]) -> Option<Value> {
+pub(super) fn prototype_row(rows: &[Value]) -> Option<Value> {
     rows.iter()
         .filter(|row| row.get("controlId").and_then(Value::as_str) == Some("GridList"))
         .filter(|row| {
@@ -96,7 +96,7 @@ fn prototype_row(rows: &[Value]) -> Option<Value> {
                 .cloned()
         })
 }
-fn build_row(prototype: &Value, title: &str, items: Vec<Value>) -> Result<Value, String> {
+pub(super) fn build_row(prototype: &Value, title: &str, items: Vec<Value>) -> Result<Value, String> {
     let mut row = prototype.clone();
     let components = row
         .get_mut("components")
@@ -185,7 +185,7 @@ pub fn inject_with_community(
     local: &[Value],
     allowlist: &HashSet<String>,
     identity_key: &str,
-    community_groups: &[(String, Vec<Value>)],
+    community_groups: &[super::local_capes::CapePackGroup],
 ) -> Result<SectionStats, String> {
     let rows = root
         .pointer_mut("/result/layout/0/rows")
@@ -241,21 +241,54 @@ pub fn inject_with_community(
             community_new.push(copy)
         }
     }
-    // One native scrollable row per remote cape package, not a flat 512-item grid.
+    // Keep only one top-level Community Capes row. Each card represents
+    // a pack and navigates to a synthetic, pack-specific dressing-room page.
+    // The game's normal itemListComp supplies horizontal scrolling.
     let mut community_rows = Vec::new();
-    for (pack_name, entries) in community_groups {
-        let mut new_items = Vec::new();
-        for item in entries {
+    let mut community_tiles = Vec::new();
+    for group in community_groups {
+        let mut items = Vec::new();
+        for item in &group.items {
             let id = item.get(identity_key).and_then(Value::as_str)
                 .ok_or_else(|| format!("community cape missing {identity_key} string"))?;
             if seen.insert(id.to_ascii_lowercase()) {
-                new_items.push(item.clone());
+                items.push(item.clone());
             }
         }
-        if !new_items.is_empty() {
-            stats.community += new_items.len();
-            community_rows.push((pack_name.as_str(), new_items));
-        }
+        if items.is_empty() { continue; }
+        let page_id = super::community_capes::page_id(&group.id);
+        let first_identity = items[0].get("packIdentity").cloned().unwrap_or_else(|| json!([]));
+        let tile = json!({
+            "id": group.id,
+            "title": group.name,
+            "creatorName": "BLoader",
+            "thumbnailPreviewOnly": true,
+            "contentType": "PersonaDurable",
+            "pieceType": "persona_capes",
+            "packType": "Persona",
+            "ownership": "NotOwned",
+            "rarity": "common",
+            "thumbnail": group.thumbnail,
+            "packIdentity": first_identity,
+            "linksTo": page_id,
+            "linksToInfo": {
+                "linksTo": page_id,
+                "linkType": "pageId",
+                "displayType": "store_layout.character_creator_screen",
+                "navigateInPlace": false
+            },
+            "namedLinksToInfoMap": {
+                "dr.persona_creator_page": {
+                    "linksTo": page_id,
+                    "linkType": "external",
+                    "displayType": "store_layout.character_creator_screen",
+                    "navigateInPlace": false
+                }
+            }
+        });
+        stats.community += items.len();
+        community_tiles.push(tile);
+        community_rows.push(items);
     }
     stats.official = official_new.len();
     stats.community += community_new.len();
@@ -270,7 +303,7 @@ pub fn inject_with_community(
     // keeping every original item, receipt, and ownership field unchanged.
     let Some(template) = prototype_row(rows) else {
         let new_count = official_new.len() + community_new.len() + local_new.len()
-            + community_rows.iter().map(|(_, items)| items.len()).sum::<usize>();
+            + community_rows.iter().map(Vec::len).sum::<usize>();
         let Some(component) = rows.iter_mut()
             .filter_map(|row| row.get_mut("components").and_then(Value::as_array_mut))
             .flat_map(|components| components.iter_mut())
@@ -290,7 +323,7 @@ pub fn inject_with_community(
         items.extend(official_new);
         items.extend(community_new);
         items.extend(local_new);
-        items.extend(community_rows.into_iter().flat_map(|(_, entries)| entries));
+        items.extend(community_rows.into_iter().flatten());
         let total = items.len();
         let previous = component_map.get("totalItems").and_then(Value::as_u64).unwrap_or(0);
         component_map.insert("totalItems".into(), Value::from(previous.max(total as u64)));
@@ -310,11 +343,26 @@ pub fn inject_with_community(
     let anchor = rows.iter()
         .position(|row| row == &template)
         .ok_or("cape section template disappeared during injection")? + 1;
+    community_new.extend(community_tiles);
     let categories = [
         ("cosmetics.capes.section.official_catalog", official_new),
         ("cosmetics.capes.section.community", community_new),
         ("cosmetics.capes.section.local", local_new),
     ];
+    // StoreRow is the horizontal marketplace carousel. Prefer a native
+    // StoreRow template; if the current game only exposes GridList, use the
+    // same validated component layout with the native StoreRow control ID.
+    let carousel_template = rows.iter()
+        .find(|row| row.get("controlId").and_then(Value::as_str) == Some("StoreRow")
+            && item_components(row).is_some_and(|parts| parts.iter().any(|component|
+                component["type"] == "itemListComp"
+                    && component.get("linksTo").is_none())))
+        .cloned()
+        .unwrap_or_else(|| {
+            let mut row = template.clone();
+            row["controlId"] = Value::String("StoreRow".into());
+            row
+        });
     let mut new_rows = Vec::new();
     for (title_key, items) in categories {
         if items.is_empty() {
@@ -326,14 +374,12 @@ pub fn inject_with_community(
         // The injected store-row header is a literal string, not a Minecraft
         // language key. Translate through BLoader's configured locale first.
         let title = crate::platform::i18n::tr(title_key);
-        new_rows.push(build_row(&template, &title, items)?);
-    }
-    let community_title = crate::platform::i18n::tr("cosmetics.capes.section.community");
-    for (name, entries) in community_rows {
-        if let Some(divider) = &divider {
-            new_rows.push(divider.clone());
-        }
-        new_rows.push(build_row(&template, &format!("{community_title} · {name}"), entries)?);
+        let source = if title_key == "cosmetics.capes.section.community" {
+            &carousel_template
+        } else {
+            &template
+        };
+        new_rows.push(build_row(source, &title, items)?);
     }
     rows.splice(anchor..anchor, new_rows);
     Ok(stats)
@@ -462,17 +508,28 @@ mod tests {
     }
 
     #[test]
-    fn community_packages_are_separate_rows_and_deduplicated_against_local() {
+    fn community_uses_one_pack_carousel_and_deduplicates_against_local() {
+        use super::super::local_capes::CapePackGroup;
         let mut root = fixture();
         let groups = vec![
-            ("Summer Pack".to_owned(), vec![
-                json!({"id":"remote-a","ownership":"Purchased"}),
-                json!({"id":"remote-b","ownership":"Purchased"}),
-            ]),
-            ("Winter Pack".to_owned(), vec![
-                json!({"id":"remote-c","ownership":"Purchased"}),
-                json!({"id":"local","ownership":"Purchased"}),
-            ]),
+            CapePackGroup {
+                id: "11111111-2222-4333-8444-555555555555".into(),
+                name: "Summer Pack".into(),
+                thumbnail: json!({"url":"https://cosmetics.invalid/thumbnails/summer.png"}),
+                items: vec![
+                    json!({"id":"remote-a","ownership":"Purchased"}),
+                    json!({"id":"remote-b","ownership":"Purchased"}),
+                ],
+            },
+            CapePackGroup {
+                id: "66666666-7777-4888-8999-000000000001".into(),
+                name: "Winter Pack".into(),
+                thumbnail: json!({"url":"https://cosmetics.invalid/thumbnails/winter.png"}),
+                items: vec![
+                    json!({"id":"remote-c","ownership":"Purchased"}),
+                    json!({"id":"local","ownership":"Purchased"}),
+                ],
+            },
         ];
         let stats = inject_with_community(
             &mut root, &[], &[json!({"id":"local","ownership":"Purchased"})],
@@ -481,16 +538,25 @@ mod tests {
         assert_eq!(stats.local, 1);
         assert_eq!(stats.community, 3);
         let rows = root["result"]["layout"][0]["rows"].as_array().unwrap();
-        let groups: Vec<_> = rows.iter()
+        let sections: Vec<_> = rows.iter()
             .filter_map(|row| row.get("components").and_then(Value::as_array))
             .filter(|parts| parts.iter().any(|part| part["type"] == "headerComp"))
             .collect();
-        assert_eq!(groups.len(), 4); // owned + local + two community package rows
-        let first = groups[2].iter().find(|part| part["type"] == "headerComp").unwrap();
-        assert!(first["text"]["value"].as_str().unwrap().contains("Summer Pack"));
-        let second = groups[3].iter().find(|part| part["type"] == "itemListComp").unwrap();
-        assert_eq!(second["totalItems"], 1);
-        assert_eq!(second["items"][0]["id"], "remote-c");
+        assert_eq!(sections.len(), 3); // owned + community + local; never per package
+        assert_eq!(rows.iter()
+            .filter(|row| row["controlId"] == "StoreRow").count(), 1);
+        let community = sections[1].iter().find(|part| part["type"] == "itemListComp").unwrap();
+        assert_eq!(community["totalItems"], 2);
+        let tiles = community["items"].as_array().unwrap();
+        assert_eq!(tiles[0]["title"], "Summer Pack");
+        assert_eq!(tiles[0]["thumbnail"]["url"],
+                   "https://cosmetics.invalid/thumbnails/summer.png");
+        assert_eq!(tiles[0]["linksToInfo"]["linkType"], "pageId");
+        assert!(tiles[0]["linksTo"].as_str().unwrap().starts_with("BMCBL_Community_"));
+        assert_eq!(tiles[1]["title"], "Winter Pack");
+        let local = sections[2].iter().find(|part| part["type"] == "itemListComp").unwrap();
+        assert_eq!(local["totalItems"], 1);
+        assert_eq!(local["items"][0]["id"], "local");
     }
 
     #[test]

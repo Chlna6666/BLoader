@@ -164,7 +164,7 @@ pub struct Registry {
     items: Vec<Value>,
     catalogs: HashMap<String, Vec<u8>>,
     assets: HashMap<String, LocalAsset>,
-    package_ranges: Vec<(String, std::ops::Range<usize>)>,
+    package_ranges: Vec<(String, String, Value, std::ops::Range<usize>)>,
     pub diagnostics: Vec<String>,
     pub discovered_packs: usize,
     pub discovered_roots: usize,
@@ -173,6 +173,14 @@ pub struct Registry {
     pub native_payloads: usize,
     pub generated_persona_payloads: usize,
 }
+#[derive(Clone)]
+pub(super) struct CapePackGroup {
+    pub id: String,
+    pub name: String,
+    pub thumbnail: Value,
+    pub items: Vec<Value>,
+}
+
 static REGISTRY: OnceLock<Registry> = OnceLock::new();
 pub fn initialize(roots: &[PathBuf], locale: &str) -> &'static Registry {
     REGISTRY.get_or_init(|| Registry::scan(roots, locale))
@@ -196,9 +204,12 @@ impl Registry {
         Some((&asset.data, asset.kind))
     }
 
-    pub(super) fn groups(&self) -> Vec<(String, Vec<Value>)> {
-        self.package_ranges.iter().map(|(name, range)| {
-            (name.clone(), self.items[range.clone()].to_vec())
+    pub(super) fn groups(&self) -> Vec<CapePackGroup> {
+        self.package_ranges.iter().map(|(id, name, thumbnail, range)| CapePackGroup {
+            id: id.clone(),
+            name: name.clone(),
+            thumbnail: thumbnail.clone(),
+            items: self.items[range.clone()].to_vec(),
         }).collect()
     }
 }
@@ -706,7 +717,8 @@ fn standard_pack_manifest(
         let texture = files
             .members
             .keys()
-            .find(|name| name.to_ascii_lowercase().ends_with(".png"))
+            .find(|name| name.to_ascii_lowercase().ends_with(".png")
+                && !name.eq_ignore_ascii_case("pack_icon.png"))
             .cloned()
             .unwrap_or_else(|| "cape.png".to_string());
         serde_json::json!({
@@ -883,6 +895,7 @@ impl Registry {
     pub fn scan(roots: &[PathBuf], locale: &str) -> Self {
         let mut reg = Self::default();
         let mut item_ids = HashSet::new();
+        let mut pack_ids = HashSet::new();
         let mut asset_ids = HashSet::new();
         let mut total = 0usize;
         for root in roots {
@@ -950,14 +963,14 @@ impl Registry {
                 reg.discovered_packs += 1;
                 let result = Self::read_pack(&path, is_dir, locale);
                 match result {
-                    Ok((name, entries)) => {
+                    Ok((pack_id, name, pack_icon, entries)) => {
                         let items = entries.len();
                         let bytes = entries
                             .iter()
                             .flat_map(|entry| entry.assets.iter())
                             .try_fold(0usize, |acc, (_, asset)| acc.checked_add(asset.data.len()))
                             .unwrap_or(usize::MAX);
-                        let duplicate = entries.iter().any(|entry| {
+                        let duplicate = pack_ids.contains(&pack_id) || entries.iter().any(|entry| {
                             item_ids.contains(&entry.id)
                                 || entry
                                     .assets
@@ -966,14 +979,16 @@ impl Registry {
                         });
                         if duplicate
                             || items > MAX_CAPES.saturating_sub(reg.items.len())
-                            || bytes > MAX_TOTAL_BYTES.saturating_sub(total)
+                            || bytes.saturating_add(pack_icon.as_ref().map_or(0, Vec::len))
+                                > MAX_TOTAL_BYTES.saturating_sub(total)
                         {
                             reg.rejected += 1;
                             reg.diagnostics.push(format!(
                                 "CAPE_REJECTED {label}: duplicate UUID/resource, too many capes or memory limit"));
                             continue;
                         }
-                        total += bytes;
+                        total += bytes + pack_icon.as_ref().map_or(0, Vec::len);
+                        pack_ids.insert(pack_id.clone());
                         let first = reg.items.len();
                         for (index, entry) in entries.into_iter().enumerate() {
                             let size = entry.dimensions.map_or("none".to_string(), |(w, h)| {
@@ -999,7 +1014,25 @@ impl Registry {
                             }
                             reg.items.push(entry.item);
                         }
-                        reg.package_ranges.push((name.clone(), first..reg.items.len()));
+                        let thumbnail = if let Some(icon) = pack_icon {
+                            // Pack-level icon is distinct from any cape item's icon.
+                            // Derive a content-addressed route so changing a logo
+                            // cannot display a stale in-game thumbnail.
+                            let icon_id = uuid_from(&icon, "cape-pack-icon-v1");
+                            let icon_path = format!("/thumbnails/{icon_id}.png");
+                            let url = format!("https://{}{}", super::persona::LOCAL_HOST, icon_path);
+                            reg.assets.entry(icon_path).or_insert(LocalAsset {
+                                data: icon,
+                                kind: AssetType::Png,
+                            });
+                            json!({"tag":"Thumbnail","type":"Thumbnail","url":url,
+                                "urlWithResolution":url})
+                        } else {
+                            reg.items[first]["thumbnail"].clone()
+                        };
+                        reg.package_ranges.push((
+                            pack_id, name.clone(), thumbnail, first..reg.items.len()
+                        ));
                         reg.accepted += 1;
                         reg.diagnostics.push(format!(
                             "CAPE_VALIDATED {label}: {name} capes={items} identity=stable payloads=registered"));
@@ -1019,7 +1052,7 @@ impl Registry {
         path: &Path,
         is_dir: bool,
         locale: &str,
-    ) -> Result<(String, Vec<PreparedCape>), String> {
+    ) -> Result<(String, String, Option<Vec<u8>>, Vec<PreparedCape>), String> {
         let files = if is_dir {
             PackFiles::from_dir(path)?
         } else {
@@ -1045,6 +1078,16 @@ impl Registry {
             return Err("cape pack must contain 1..64 capes".into());
         }
         let version = version_parts(&pack.version)?;
+        // Bedrock-style pack icon at archive root: an optional square PNG.
+        // It is a navigation image, never a cape texture or a Persona icon.
+        let pack_icon = pack_file(&files,
+            files.get("pack_icon.png").map(|_| "pack_icon.png"), MAX_IMAGE, false)?;
+        if let Some(icon) = &pack_icon {
+            let image = validate_png(icon)?;
+            if image.width() != image.height() {
+                return Err("pack_icon.png must be a square PNG".into());
+            }
+        }
         let author = if pack.author.trim().is_empty() {
             "Player"
         } else {
@@ -1111,7 +1154,7 @@ impl Registry {
             }
             entries.push(prepared);
         }
-        Ok((pack.name, entries))
+        Ok((pack.id, pack.name, pack_icon, entries))
     }
 
     fn prepare_cape(
@@ -1717,6 +1760,63 @@ mod tests {
         assert_eq!(&index[4..8], &2614082044u32.to_le_bytes());
         assert!(archive.by_name("signatures.json").is_ok());
     }
+    #[test]
+    fn pack_icon_is_used_only_for_package_navigation() {
+        let root = std::env::temp_dir().join(format!(
+            "bloader-pack-icon-{}", std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("capes")).unwrap();
+        let file = File::create(root.join("capes").join("pack.mccapes")).unwrap();
+        let mut zip = ZipWriter::new(file);
+        write_standard_members(&mut zip, "cape", "Icon Pack", "", Some("cape.png"));
+        let options = SimpleFileOptions::default();
+        zip.start_file("cape.png", options).unwrap();
+        zip.write_all(&dummy_png()).unwrap();
+        let mut icon = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            64, 64, Rgba([4, 8, 16, 255])
+        )).write_to(&mut icon, ImageFormat::Png).unwrap();
+        zip.start_file("pack_icon.png", options).unwrap();
+        zip.write_all(icon.get_ref()).unwrap();
+        zip.finish().unwrap();
+        let registry = Registry::scan(&[root.clone()], "en_US");
+        assert_eq!(registry.accepted, 1, "{:?}", registry.diagnostics);
+        let group = &registry.groups()[0];
+        assert_eq!(group.name, "Icon Pack");
+        assert_ne!(group.thumbnail, registry.items[0]["thumbnail"]);
+        let url = group.thumbnail["url"].as_str().unwrap();
+        let path = url.strip_prefix("https://cosmetics.invalid").unwrap();
+        assert_eq!(registry.asset_bytes(path).unwrap().0, icon.get_ref());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_pack_icon_rejects_the_complete_package() {
+        let root = std::env::temp_dir().join(format!(
+            "bloader-bad-pack-icon-{}", std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("capes")).unwrap();
+        let file = File::create(root.join("capes").join("pack.mccapes")).unwrap();
+        let mut zip = ZipWriter::new(file);
+        write_standard_members(&mut zip, "cape", "Bad Icon", "", Some("cape.png"));
+        let options = SimpleFileOptions::default();
+        zip.start_file("cape.png", options).unwrap();
+        zip.write_all(&dummy_png()).unwrap();
+        let mut icon = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            64, 32, Rgba([4, 8, 16, 255])
+        )).write_to(&mut icon, ImageFormat::Png).unwrap();
+        zip.start_file("pack_icon.png", options).unwrap();
+        zip.write_all(icon.get_ref()).unwrap();
+        zip.finish().unwrap();
+        let registry = Registry::scan(&[root.clone()], "en_US");
+        assert_eq!(registry.accepted, 0);
+        assert_eq!(registry.rejected, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn local_item_metadata_keeps_cosmos_thumbnail_fields() {
         let root = std::env::temp_dir().join(format!("cosmetics_thumbs_{}", std::process::id()));
