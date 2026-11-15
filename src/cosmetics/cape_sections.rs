@@ -241,11 +241,12 @@ pub fn inject_with_community(
             community_new.push(copy)
         }
     }
-    // Keep only one top-level Community Capes row. Each card represents
-    // a pack and navigates to a synthetic, pack-specific dressing-room page.
-    // The game's normal itemListComp supplies horizontal scrolling.
+    // One top-level Community Capes row. Tiny packs show their capes directly,
+    // while larger packs use one navigation tile leading to their own page.
+    // This avoids both a tall list of tiny packages and unnecessary clicks.
     let mut community_rows = Vec::new();
     let mut community_tiles = Vec::new();
+    let imported_community_count = community_new.len();
     for group in community_groups {
         let mut items = Vec::new();
         for item in &group.items {
@@ -256,6 +257,12 @@ pub fn inject_with_community(
             }
         }
         if items.is_empty() { continue; }
+        stats.community += items.len();
+        // One- and two-cape packages do not merit a separate page.
+        if items.len() <= 2 {
+            community_new.extend(items);
+            continue;
+        }
         let page_id = super::community_capes::page_id(&group.id);
         let first_identity = items[0].get("packIdentity").cloned().unwrap_or_else(|| json!([]));
         let tile = json!({
@@ -286,12 +293,11 @@ pub fn inject_with_community(
                 }
             }
         });
-        stats.community += items.len();
         community_tiles.push(tile);
         community_rows.push(items);
     }
     stats.official = official_new.len();
-    stats.community += community_new.len();
+    stats.community += imported_community_count;
     stats.local = local_new.len();
     if stats.official + stats.community + stats.local == 0 {
         return Ok(stats);
@@ -519,6 +525,7 @@ mod tests {
                 items: vec![
                     json!({"id":"remote-a","ownership":"Purchased"}),
                     json!({"id":"remote-b","ownership":"Purchased"}),
+                    json!({"id":"remote-d","ownership":"Purchased"}),
                 ],
             },
             CapePackGroup {
@@ -536,7 +543,7 @@ mod tests {
             &HashSet::new(), "id", &groups,
         ).unwrap();
         assert_eq!(stats.local, 1);
-        assert_eq!(stats.community, 3);
+        assert_eq!(stats.community, 4);
         let rows = root["result"]["layout"][0]["rows"].as_array().unwrap();
         let sections: Vec<_> = rows.iter()
             .filter_map(|row| row.get("components").and_then(Value::as_array))
@@ -553,7 +560,10 @@ mod tests {
                    "https://cosmetics.invalid/thumbnails/summer.png");
         assert_eq!(tiles[0]["linksToInfo"]["linkType"], "pageId");
         assert!(tiles[0]["linksTo"].as_str().unwrap().starts_with("BMCBL_Community_"));
-        assert_eq!(tiles[1]["title"], "Winter Pack");
+        // A pack with just one unique cape shows that cape directly instead
+        // of wasting an entire navigation page.
+        assert_eq!(tiles[1]["id"], "remote-c");
+        assert!(tiles[1].get("linksTo").is_none());
         let local = sections[2].iter().find(|part| part["type"] == "itemListComp").unwrap();
         assert_eq!(local["totalItems"], 1);
         assert_eq!(local["items"][0]["id"], "local");
