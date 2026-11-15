@@ -155,6 +155,7 @@ fn verified_index(bytes: &[u8]) -> Result<Vec<RemotePack>, String> {
         });
         let hash = entry.hash.len() == 64 && entry.hash.bytes().all(|b| b.is_ascii_hexdigit());
         if !stable || !uuid || !hash || entry.name.trim().is_empty() || entry.name.len() > 90
+            || entry.name.chars().any(char::is_control)
             || entry.cape_count == 0 || entry.cape_count > 64
             || !ids.insert(entry.id.clone()) || !uuids.insert(entry.uuid.to_ascii_lowercase())
         {
@@ -233,11 +234,15 @@ fn synchronize(cache: &Path) -> Result<bool, String> {
     let queue = Mutex::new(pending);
     let failures = AtomicUsize::new(0);
     let downloaded = AtomicUsize::new(0);
+    // Enforce the aggregate cache budget before writing each downloaded ZIP,
+    // not only after all downloads have filled the disk.
+    let total_bytes = AtomicUsize::new(bytes_on_disk);
     std::thread::scope(|scope| {
         for _ in 0..DOWNLOAD_WORKERS {
             let queue = &queue;
             let failures = &failures;
             let downloaded = &downloaded;
+            let total_bytes = &total_bytes;
             let folder = &folder;
             scope.spawn(move || loop {
                 if !ENABLED.load(Ordering::Acquire) { break; }
@@ -246,6 +251,12 @@ fn synchronize(cache: &Path) -> Result<bool, String> {
                     let bytes = https_get(&entry.url, PACK_LIMIT)?;
                     if !sha256_hex(&bytes).eq_ignore_ascii_case(&entry.hash) {
                         return Err("download SHA-256 mismatch".into());
+                    }
+                    if total_bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+                        |previous| previous.checked_add(bytes.len())
+                            .filter(|sum| *sum <= TOTAL_PACK_LIMIT)).is_err()
+                    {
+                        return Err("community cache aggregate size limit exceeded".into());
                     }
                     let destination = folder.join(format!("{}.{}.mccapes", entry.id, &entry.hash[..8]));
                     let staging = destination.with_extension("downloading");
