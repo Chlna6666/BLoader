@@ -39,7 +39,12 @@ fn state() -> &'static RwLock<Arc<Registry>> {
 
 pub fn start(cache: PathBuf, locale: String, enabled: bool) {
     let _ = RUNTIME.set(Runtime { cache, locale });
-    set_enabled(enabled);
+    // Config::apply_update runs before install(). It may already have marked
+    // the switch enabled, so a transition-only setter cannot start this worker.
+    ENABLED.store(enabled, Ordering::Release);
+    if enabled {
+        refresh_in_background();
+    }
 }
 
 pub fn set_enabled(enabled: bool) {
