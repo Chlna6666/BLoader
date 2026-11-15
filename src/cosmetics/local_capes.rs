@@ -164,6 +164,7 @@ pub struct Registry {
     items: Vec<Value>,
     catalogs: HashMap<String, Vec<u8>>,
     assets: HashMap<String, LocalAsset>,
+    package_ranges: Vec<(String, std::ops::Range<usize>)>,
     pub diagnostics: Vec<String>,
     pub discovered_packs: usize,
     pub discovered_roots: usize,
@@ -182,6 +183,23 @@ pub fn count() -> usize {
 impl Registry {
     pub fn asset_count(&self) -> usize {
         self.assets.len()
+    }
+
+    pub(super) fn item_count(&self) -> usize { self.items.len() }
+
+    pub(super) fn catalog_bytes(&self, id: &str) -> Option<&[u8]> {
+        self.catalogs.get(&id.to_ascii_lowercase()).map(Vec::as_slice)
+    }
+
+    pub(super) fn asset_bytes(&self, path: &str) -> Option<(&[u8], AssetType)> {
+        let asset = self.assets.get(canonical_asset_path(path))?;
+        Some((&asset.data, asset.kind))
+    }
+
+    pub(super) fn groups(&self) -> Vec<(String, Vec<Value>)> {
+        self.package_ranges.iter().map(|(name, range)| {
+            (name.clone(), self.items[range.clone()].to_vec())
+        }).collect()
     }
 }
 pub fn items() -> &'static [Value] {
@@ -956,6 +974,7 @@ impl Registry {
                             continue;
                         }
                         total += bytes;
+                        let first = reg.items.len();
                         for (index, entry) in entries.into_iter().enumerate() {
                             let size = entry.dimensions.map_or("none".to_string(), |(w, h)| {
                                 format!("{w}x{h} scale={}x", w / 64)
@@ -980,6 +999,7 @@ impl Registry {
                             }
                             reg.items.push(entry.item);
                         }
+                        reg.package_ranges.push((name.clone(), first..reg.items.len()));
                         reg.accepted += 1;
                         reg.diagnostics.push(format!(
                             "CAPE_VALIDATED {label}: {name} capes={items} identity=stable payloads=registered"));

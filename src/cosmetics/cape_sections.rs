@@ -176,6 +176,17 @@ pub fn inject(
     allowlist: &HashSet<String>,
     identity_key: &str,
 ) -> Result<SectionStats, String> {
+    inject_with_community(root, imported, local, allowlist, identity_key, &[])
+}
+
+pub fn inject_with_community(
+    root: &mut Value,
+    imported: &[Value],
+    local: &[Value],
+    allowlist: &HashSet<String>,
+    identity_key: &str,
+    community_groups: &[(String, Vec<Value>)],
+) -> Result<SectionStats, String> {
     let rows = root
         .pointer_mut("/result/layout/0/rows")
         .and_then(Value::as_array_mut)
@@ -230,8 +241,24 @@ pub fn inject(
             community_new.push(copy)
         }
     }
+    // One native scrollable row per remote cape package, not a flat 512-item grid.
+    let mut community_rows = Vec::new();
+    for (pack_name, entries) in community_groups {
+        let mut new_items = Vec::new();
+        for item in entries {
+            let id = item.get(identity_key).and_then(Value::as_str)
+                .ok_or_else(|| format!("community cape missing {identity_key} string"))?;
+            if seen.insert(id.to_ascii_lowercase()) {
+                new_items.push(item.clone());
+            }
+        }
+        if !new_items.is_empty() {
+            stats.community += new_items.len();
+            community_rows.push((pack_name.as_str(), new_items));
+        }
+    }
     stats.official = official_new.len();
-    stats.community = community_new.len();
+    stats.community += community_new.len();
     stats.local = local_new.len();
     if stats.official + stats.community + stats.local == 0 {
         return Ok(stats);
@@ -242,7 +269,8 @@ pub fn inject(
     // In that case, append the new entries to an existing item list in place,
     // keeping every original item, receipt, and ownership field unchanged.
     let Some(template) = prototype_row(rows) else {
-        let new_count = official_new.len() + community_new.len() + local_new.len();
+        let new_count = official_new.len() + community_new.len() + local_new.len()
+            + community_rows.iter().map(|(_, items)| items.len()).sum::<usize>();
         let Some(component) = rows.iter_mut()
             .filter_map(|row| row.get_mut("components").and_then(Value::as_array_mut))
             .flat_map(|components| components.iter_mut())
@@ -262,6 +290,7 @@ pub fn inject(
         items.extend(official_new);
         items.extend(community_new);
         items.extend(local_new);
+        items.extend(community_rows.into_iter().flat_map(|(_, entries)| entries));
         let total = items.len();
         let previous = component_map.get("totalItems").and_then(Value::as_u64).unwrap_or(0);
         component_map.insert("totalItems".into(), Value::from(previous.max(total as u64)));
@@ -298,6 +327,13 @@ pub fn inject(
         // language key. Translate through BLoader's configured locale first.
         let title = crate::platform::i18n::tr(title_key);
         new_rows.push(build_row(&template, &title, items)?);
+    }
+    let community_title = crate::platform::i18n::tr("cosmetics.capes.section.community");
+    for (name, entries) in community_rows {
+        if let Some(divider) = &divider {
+            new_rows.push(divider.clone());
+        }
+        new_rows.push(build_row(&template, &format!("{community_title} · {name}"), entries)?);
     }
     rows.splice(anchor..anchor, new_rows);
     Ok(stats)

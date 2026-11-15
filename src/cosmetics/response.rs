@@ -355,7 +355,14 @@ pub fn overlay(
             } else {
                 &[]
             };
-            if add.is_empty() && local_items.is_empty() && official_preview_ids.is_empty() {
+            let community_groups = if rule.name == "dressing_room_capes" {
+                super::community_capes::groups()
+            } else {
+                Vec::new()
+            };
+            if add.is_empty() && local_items.is_empty() && community_groups.is_empty()
+                && official_preview_ids.is_empty()
+            {
                 return Ok(None);
             }
             let mut root: Value = serde_json::from_slice(original_body)
@@ -363,12 +370,13 @@ pub fn overlay(
             if rule.name == "dressing_room_capes" {
                 // Respect the original owned cape section. Cosmos itself
                 // creates distinct GridList rows for Vanilla/Custom capes.
-                let result = super::cape_sections::inject(
+                let result = super::cape_sections::inject_with_community(
                     &mut root,
                     add,
                     local_items,
                     &official_preview_ids,
                     &rule.identity_key,
+                    &community_groups,
                 )?;
                 if !result.changed() {
                     return Ok(None);
@@ -458,15 +466,15 @@ pub fn overlay(
             // In local-only mode reject all nonlocal product IDs without
             // even opening legacy catalog files.
             if rule.local_only {
-                return match super::local_capes::catalog(&id) {
-                    Some(bytes) => Ok(Some(bytes.to_vec())),
-                    None => Ok(None),
-                };
+                return Ok(super::local_capes::catalog(&id).map(ToOwned::to_owned)
+                    .or_else(|| super::community_capes::catalog(&id)));
             }
             let folder = guarded_path(base, &rule.catalog_directory)?;
             let path = folder.join(format!("{id}.json"));
             let catalog_bytes = if let Some(bytes) = super::local_capes::catalog(&id) {
                 bytes.to_vec()
+            } else if let Some(bytes) = super::community_capes::catalog(&id) {
+                bytes
             } else {
                 match fs::read(&path) {
                     Ok(data) => data,

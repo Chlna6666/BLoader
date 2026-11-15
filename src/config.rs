@@ -79,6 +79,10 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub enable_cosmetics: bool,
 
+    /// Independently toggle the remote community cape catalog.
+    #[serde(default = "default_true")]
+    pub enable_community_capes: bool,
+
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
@@ -145,6 +149,7 @@ impl Default for Config {
             network_verbose: false,
             network_ignore_ports: default_ignore_ports(),
             enable_cosmetics: true,
+            enable_community_capes: true,
             log_level: default_log_level(),
             log_archive_days: default_log_archive_days(),
             default_locale: default_locale(),
@@ -398,6 +403,7 @@ mod tests {
         assert_eq!(parsed.redirection_root, DEFAULT_REDIRECTION_ROOT);
         assert!(parsed.vanilla_skin_pack_redirect.is_none());
         assert_eq!(parsed.log_archive_days, DEFAULT_LOG_ARCHIVE_DAYS);
+        assert!(parsed.enable_community_capes);
     }
 
     #[test]
