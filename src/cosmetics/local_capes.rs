@@ -186,6 +186,9 @@ impl Registry {
 
     pub(super) fn item_count(&self) -> usize { self.items.len() }
 
+    /// All validated cape offers, ready for the game's normal equip list.
+    pub(super) fn item_values(&self) -> &[Value] { &self.items }
+
     pub(super) fn catalog_bytes(&self, id: &str) -> Option<&[u8]> {
         self.catalogs.get(&id.to_ascii_lowercase()).map(Vec::as_slice)
     }
