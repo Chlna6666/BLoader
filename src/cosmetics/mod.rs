@@ -16,6 +16,7 @@
 //! - 高像素披风纹理固定规范到 64x32，避免玩家披风不显示、鞘翅正常。
 pub mod cape_roots;
 pub mod cape_sections;
+mod community_capes;
 pub mod codec;
 pub mod debug;
 pub mod diagnostics;
@@ -131,6 +132,14 @@ pub fn install(config: &Config, game_dir: &Path) -> bool {
         HOOK_INSTALLED.store(false, Ordering::SeqCst);
         return false;
     }
+    // Network sync and cache scanning are isolated on a background worker.
+    community_capes::start(
+        crate::platform::utils::get_loader_directory()
+            .join("cache")
+            .join("community-capes"),
+        config.default_locale.clone(),
+        config.enable_community_capes,
+    );
     logging::scoped_info_message(
         "cosmetics",
         "local cape resources ready; WinHTTP hooks installed before OEP; config_source=builtin",
@@ -141,6 +150,7 @@ pub fn install(config: &Config, game_dir: &Path) -> bool {
 /// config.json 热重载扇出点（Config::apply_update 调用）。
 pub fn update_config(config: &Config) {
     winhttp::set_master_enabled(config.enable_cosmetics);
+    community_capes::set_enabled(config.enable_cosmetics && config.enable_community_capes);
     // 仅在启动装配已尝试过后才提示；bootstrap 里 apply_update 先于 install
     // 执行，此前的状态变化不应触发"需要重启"提示。
     if INSTALL_ATTEMPTED.load(Ordering::SeqCst)

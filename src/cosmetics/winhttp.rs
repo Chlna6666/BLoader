@@ -3,7 +3,7 @@
 //! BLoader 移植版：日志走 BLoader logging（scope=cosmetics），钩子经 `minhook`
 //! crate 安装，运行时装配由 `super::mod` 在 bootstrap 阶段完成。
 use super::response::{Config, Mode};
-use super::{codec, debug, diagnostics, local_capes, persona};
+use super::{codec, community_capes, debug, diagnostics, local_capes, persona};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -752,10 +752,9 @@ unsafe fn catalog_fast_response(h: H) -> bool {
         (r.id, rule, r.request_body.clone(), r.body_overflow)
     };
     let (id, rule, body, overflow) = found;
-    let is_local = super::response::catalog_id(&body)
-        .ok()
-        .and_then(|product| local_capes::catalog(&product))
-        .is_some();
+    let is_local = super::response::catalog_id(&body).ok().is_some_and(|product| {
+        local_capes::catalog(&product).is_some() || community_capes::catalog(&product).is_some()
+    });
     let structure = super::response::catalog_request_state(&body);
     let shape = diagnostics::catalog_shape(&body);
     logger(&format!(
@@ -947,15 +946,16 @@ unsafe extern "system" fn on_send(
                 "local virtual asset refused unsupported method {method}"
             ));
             (Vec::new(), 405)
-        } else if let Some((bytes, kind)) = local_capes::asset(&path) {
+        } else if let Some((bytes, kind)) = local_capes::asset(&path)
+            .map(|(bytes, kind)| (bytes.to_vec(), kind))
+            .or_else(|| community_capes::asset(&path))
+        {
             image = kind == local_capes::AssetType::Png;
             logger(&format!(
-                "local cape virtual resource found kind={kind:?} bytes={} source=memory url=https://{}{}",
-                bytes.len(),
-                persona::LOCAL_HOST,
-                path
+                "cape virtual resource found kind={kind:?} bytes={} source=memory",
+                bytes.len()
             ));
-            (bytes.to_vec(), 200)
+            (bytes, 200)
         } else {
             // All virtual Persona and thumbnail assets must have been
             // registered in memory during the initial Shared/capes scan.
@@ -1023,6 +1023,7 @@ unsafe extern "system" fn on_send(
         if let Some(bytes) =
             eligible_local_catalog(&body, total_len as usize, overflow, max, |id| {
                 local_capes::catalog(id).map(ToOwned::to_owned)
+                    .or_else(|| community_capes::catalog(id))
             })
         {
             let byte_count = bytes.len();
