@@ -555,15 +555,15 @@ mod tests {
         let community = sections[1].iter().find(|part| part["type"] == "itemListComp").unwrap();
         assert_eq!(community["totalItems"], 2);
         let tiles = community["items"].as_array().unwrap();
-        assert_eq!(tiles[0]["title"], "Summer Pack");
-        assert_eq!(tiles[0]["thumbnail"]["url"],
+        // Tiny packs are shown as directly selectable capes first.
+        assert_eq!(tiles[0]["id"], "remote-c");
+        assert!(tiles[0].get("linksTo").is_none());
+        // Only the larger pack creates a navigation card and child page.
+        assert_eq!(tiles[1]["title"], "Summer Pack");
+        assert_eq!(tiles[1]["thumbnail"]["url"],
                    "https://cosmetics.invalid/thumbnails/summer.png");
-        assert_eq!(tiles[0]["linksToInfo"]["linkType"], "pageId");
-        assert!(tiles[0]["linksTo"].as_str().unwrap().starts_with("BMCBL_Community_"));
-        // A pack with just one unique cape shows that cape directly instead
-        // of wasting an entire navigation page.
-        assert_eq!(tiles[1]["id"], "remote-c");
-        assert!(tiles[1].get("linksTo").is_none());
+        assert_eq!(tiles[1]["linksToInfo"]["linkType"], "pageId");
+        assert!(tiles[1]["linksTo"].as_str().unwrap().starts_with("BMCBL_Community_"));
         let local = sections[2].iter().find(|part| part["type"] == "itemListComp").unwrap();
         assert_eq!(local["totalItems"], 1);
         assert_eq!(local["items"][0]["id"], "local");
