@@ -13,8 +13,8 @@ use std::thread;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
 use windows::Win32::System::LibraryLoader::{
-    GetModuleHandleW, GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+    GetModuleHandleW, GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_APPLICATION_DIR,
+    LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
 use windows::core::{PCSTR, PCWSTR};
 
@@ -108,7 +108,7 @@ pub fn load(spec: &ModuleSpec, plugins_root: &Path, session: &Arc<Session>) -> R
     let requested = wide(path.as_os_str());
     let handle = unsafe {
         LoadLibraryExW(PCWSTR(requested.as_ptr()), None,
-            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)
+            LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)
     }.map_err(|_| "LOAD_FAILED")?;
     let resolved = utils::get_module_path(handle.0 as usize);
     if resolved.as_os_str().is_empty() ||
