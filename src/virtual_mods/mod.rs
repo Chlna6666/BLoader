@@ -5,6 +5,7 @@ mod protocol;
 mod transport;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
@@ -32,6 +33,7 @@ pub struct Session {
     inflight: AtomicUsize,
     closed: AtomicBool,
     max_frame: usize,
+    plugins_root: PathBuf,
     plan: Vec<ModuleSpec>,
     loaded: Mutex<HashMap<String, Arc<NativeModule>>>,
 }
@@ -108,6 +110,7 @@ fn negotiate() -> Result<Option<(Arc<Session>, Connection)>, String> {
         inflight: AtomicUsize::new(0),
         closed: AtomicBool::new(false),
         max_frame: welcome.max_frame_bytes,
+        plugins_root: PathBuf::from(plan.plugins_root),
         plan: plan.modules,
         loaded: Mutex::new(HashMap::new()),
     });
@@ -163,7 +166,7 @@ impl Session {
             return;
         }
         self.status(module, "validating", false, None);
-        match loader::load(module, self) {
+        match loader::load(module, &self.plugins_root, self) {
             Ok(Loaded::NoRpc) => self.status(module, "loaded_no_rpc", false, None),
             Ok(Loaded::Rpc(runtime)) => {
                 self.loaded.lock().unwrap_or_else(|error| error.into_inner())
