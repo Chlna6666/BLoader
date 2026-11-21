@@ -119,7 +119,8 @@ pub struct ModuleSpec {
     pub size_bytes: u64,
     pub platform: String,
     pub phase: String,
-    pub staged_path: String,
+    /// Relative to the installed BMCBL plugin directory; never an absolute path.
+    pub relative_path: String,
 }
 
 impl ModuleSpec {
@@ -130,8 +131,7 @@ impl ModuleSpec {
             && (1..=MAX_MODULE_BYTES).contains(&self.size_bytes)
             && self.platform == "windows-x86_64"
             && matches!(self.phase.as_str(), "preload" | "ready")
-            && self.staged_path.len() <= 2048
-            && !self.staged_path.contains('\0')
+            && valid_mod_relative_path(&self.relative_path)
     }
 }
 
@@ -142,6 +142,9 @@ pub struct LaunchPlan {
     pub message_type: String,
     pub seq: String,
     pub session_id: String,
+    /// An absolute Windows path to the already-installed BMCBL/plugins directory.
+    /// On Wine/Proton, the host translates its Linux path using the active prefix.
+    pub plugins_root: String,
     pub modules: Vec<ModuleSpec>,
 }
 
@@ -238,7 +241,10 @@ pub struct ModEvent<'a> {
 
 pub fn check_plan(plan: &LaunchPlan, session_id: &str, last_seq: u64) -> Result<u64, String> {
     use std::collections::{HashMap, HashSet};
-    if plan.message_type != "launch_plan" || plan.session_id != session_id || plan.modules.len() > MAX_MODULES {
+    if plan.message_type != "launch_plan" || plan.session_id != session_id || plan.modules.len() > MAX_MODULES
+        || plan.plugins_root.is_empty() || plan.plugins_root.len() > 2048
+        || plan.plugins_root.contains('\0')
+    {
         return Err("INVALID_PLAN: invalid type, session or module count".into());
     }
     let next = parse_sequence(&plan.seq, last_seq)?;
@@ -257,6 +263,36 @@ pub fn check_plan(plan: &LaunchPlan, session_id: &str, last_seq: u64) -> Result<
     Ok(next)
 }
 
+
+pub fn valid_mod_relative_path(path: &str) -> bool {
+    if path.len() > 512 || !path.starts_with("game-mods/")
+        || !path.to_ascii_lowercase().ends_with(".dll")
+        || path.contains('\\') || path.contains(':') || path.contains('\0')
+        || path.bytes().any(|byte| matches!(byte, b'<' | b'>' | b'|' | b'?' | b'*' | b'"'))
+    {
+        return false;
+    }
+    let mut count = 0;
+    for part in path.split('/') {
+        count += 1;
+        if part.is_empty() || matches!(part, "." | "..") || part.ends_with('.')
+            || part.ends_with(' ') || part.bytes().any(|ch| ch < 0x20)
+        {
+            return false;
+        }
+        let stem = part.split('.').next().unwrap_or_default();
+        let upper = stem.to_ascii_uppercase();
+        if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" |
+            "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" |
+            "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" |
+            "LPT7" | "LPT8" | "LPT9")
+        {
+            return false;
+        }
+    }
+    count >= 2
+}
+
 fn io_error(error: io::Error) -> String { format!("SESSION_CLOSED: {error}") }
 
 #[cfg(test)]
@@ -270,6 +306,13 @@ mod tests {
         assert!(valid_id("example-mod"));
         assert!(!valid_sha256(&"A".repeat(64)));
         assert!(valid_uuid("e64a40d8-47d4-49dc-85bb-68588a40ef1b"));
+        assert!(valid_mod_relative_path("game-mods/example.dll"));
+        assert!(valid_mod_relative_path("game-mods/native/example.dll"));
+        assert!(!valid_mod_relative_path("../game-mods/example.dll"));
+        assert!(!valid_mod_relative_path("game-mods/../example.dll"));
+        assert!(!valid_mod_relative_path("game-mods/CON.dll"));
+        assert!(!valid_mod_relative_path("game-mods\\example.dll"));
+        assert!(!valid_mod_relative_path("game-mods/example.dll:stream"));
     }
     #[test]
     fn bounded_frames() {
