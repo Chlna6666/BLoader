@@ -1,7 +1,7 @@
 //! Verified native DLL loading and optional BLoaderModEntryV1 registration.
 //! Native modules execute with full Minecraft-process privileges, not WASM isolation.
 use std::collections::HashSet;
-use std::ffi::{c_void, CString};
+use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
@@ -93,8 +93,9 @@ impl NativeModule {
     }
 }
 
-pub fn load(spec: &ModuleSpec, session: &Arc<Session>) -> Result<Loaded, &'static str> {
-    let (path, _file_lock) = verify_artifact(spec)?;
+pub fn load(spec: &ModuleSpec, plugins_root: &Path, session: &Arc<Session>) -> Result<Loaded, &'static str> {
+    // Keep a read-only handle open until LoadLibraryExW finishes. No duplicated DLL or staging tree.
+    let (path, _file_lock) = verify_artifact(spec, plugins_root)?;
     let leaf = path.file_name().ok_or("FILE_UNSAFE")?;
     let leaf_wide = wide(leaf);
     // Refuse ambiguous base-name collisions, including DLLs loaded by another Mod.
@@ -199,34 +200,58 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
         left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy()))
 }
 
-/// Open without FILE_SHARE_WRITE or FILE_SHARE_DELETE, keep the exact file open
-/// through LoadLibraryExW. Reject reparse points in every existing ancestor.
-fn verify_artifact(spec: &ModuleSpec) -> Result<(PathBuf, File), &'static str> {
-    if !spec.valid() {
+/// Load the DLL from the installed plugin root:
+/// <BMCBL>/plugins/<plugin_id>/game-mods/<relative DLL>.
+/// `plugins_root` is supplied by the authenticated launcher, never by a Mod.
+/// Open without FILE_SHARE_WRITE or FILE_SHARE_DELETE, keep that exact file handle
+/// until LoadLibraryExW returns. No additional install/staging/copy occurs here.
+fn verify_artifact(
+    spec: &ModuleSpec,
+    plugins_root: &Path,
+) -> Result<(PathBuf, File), &'static str> {
+    if !spec.valid() || !protocol::valid_mod_relative_path(&spec.relative_path) {
         return Err("INVALID_PLAN");
     }
-    let path = Path::new(&spec.staged_path);
-    if !path.is_absolute() || !path.components().any(|part| part.as_os_str()
-        .to_string_lossy().eq_ignore_ascii_case("mod-stage"))
-        || !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
+    if !plugins_root.is_absolute() || plugins_root.file_name()
+        .is_none_or(|name| !name.to_string_lossy().eq_ignore_ascii_case("plugins"))
     {
         return Err("FILE_UNSAFE");
     }
-    let mut cursor = PathBuf::new();
-    for part in path.components() {
-        if matches!(part, Component::ParentDir | Component::CurDir) {
-            return Err("FILE_UNSAFE");
-        }
-        cursor.push(part);
-        if let Ok(metadata) = fs::symlink_metadata(&cursor) {
-            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                return Err("FILE_UNSAFE");
-            }
-        }
+
+    // All managed module paths must stay under the exact directory assigned to
+    // their plugin identity. The authenticated BMCBL host provides this root;
+    // a plugin cannot substitute an absolute DLL path in the launch plan.
+    let plugin_root = plugins_root.join(&spec.plugin_id);
+    let module_path = plugin_root.join(&spec.relative_path);
+    if !module_path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dll")) {
+        return Err("FILE_UNSAFE");
     }
-    let path = fs::canonicalize(path).map_err(|_| "FILE_UNSAFE")?;
+
+    // Reject NTFS junctions and reparse points throughout the plugin subtree.
+    // The Wine drive mapping may itself use a symlink, so do not scan parents
+    // *above* plugins_root; canonicalize the complete root before comparison.
+    reject_reparse_point(plugins_root)?;
+    reject_reparse_point(&plugin_root)?;
+    let mut checked = plugin_root.clone();
+    for part in spec.relative_path.split('/') {
+        checked.push(part);
+        reject_reparse_point(&checked)?;
+    }
+
+    let root = fs::canonicalize(plugins_root).map_err(|_| "FILE_UNSAFE")?;
+    let plugin = fs::canonicalize(&plugin_root).map_err(|_| "FILE_UNSAFE")?;
+    let path = fs::canonicalize(&module_path).map_err(|_| "FILE_UNSAFE")?;
+    if !same_or_child(&plugin, &root.join(&spec.plugin_id)) ||
+        !same_or_child(&path, &plugin.join("game-mods")) ||
+        path == plugin.join("game-mods")
+    {
+        return Err("FILE_UNSAFE");
+    }
+
     let mut file = OpenOptions::new()
-        .read(true).share_mode(FILE_SHARE_READ_ONLY).open(&path)
+        .read(true)
+        .share_mode(FILE_SHARE_READ_ONLY)
+        .open(&path)
         .map_err(|_| "FILE_UNSAFE")?;
     if file.metadata().map_err(|_| "FILE_UNSAFE")?.len() != spec.size_bytes {
         return Err("HASH_MISMATCH");
@@ -243,6 +268,25 @@ fn verify_artifact(spec: &ModuleSpec) -> Result<(PathBuf, File), &'static str> {
         return Err("HASH_MISMATCH");
     }
     Ok((path, file))
+}
+
+fn reject_reparse_point(path: &Path) -> Result<(), &'static str> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| "FILE_UNSAFE")?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err("FILE_UNSAFE");
+    }
+    Ok(())
+}
+
+fn same_or_child(candidate: &Path, root: &Path) -> bool {
+    // Windows paths are normally case-insensitive. Compare components, not
+    // string prefixes (C:\plugins\id must not match C:\plugins\id-other).
+    let lhs = candidate.components().collect::<Vec<_>>();
+    let rhs = root.components().collect::<Vec<_>>();
+    lhs.len() >= rhs.len() && lhs.iter().zip(rhs.iter()).all(|(left, right)| {
+        left.as_os_str().to_string_lossy().to_lowercase()
+            == right.as_os_str().to_string_lossy().to_lowercase()
+    })
 }
 
 fn pe_x64_dll(bytes: &[u8]) -> bool {
@@ -293,6 +337,14 @@ unsafe extern "C" fn native_emit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn component_boundary_blocks_sibling_plugins() {
+        let root = Path::new(r"C:BMCBLpluginsplugin-a");
+        assert!(same_or_child(Path::new(r"C:BMCBLpluginsplugin-agame-modsexample.dll"), root));
+        assert!(!same_or_child(Path::new(r"C:BMCBLpluginsplugin-a-evilexample.dll"), root));
+        assert!(!same_or_child(Path::new(r"C:BMCBLpluginsplugin-bexample.dll"), root));
+    }
+
     #[test]
     fn rejects_non_pe_payloads_and_incomplete_headers() {
         assert!(!pe_x64_dll(b"MZ"));
