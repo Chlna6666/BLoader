@@ -18,6 +18,7 @@ mod cosmetics;
 mod game;
 mod loader;
 mod platform;
+mod virtual_mods;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DllMain(
@@ -112,6 +113,9 @@ fn run_bootstrap_sequence(execution_mode: &'static str) -> bool {
         "bootstrap.xuser_bridge.premain.begin execution={execution_mode} loader_lock=released"
     ));
     crate::bootstrap::xuser_bridge::initialize_before_mods();
+    if !config.disable_mod_loading {
+        crate::virtual_mods::initialize();
+    }
     crate::platform::logging::write_bootstrap_marker(&format!(
         "bootstrap.xuser_bridge.premain.done execution={execution_mode} loader_lock=released"
     ));
@@ -205,6 +209,7 @@ unsafe fn prepare_premain_preloads(
         preloader_summary.discovered, preloader_summary.state,
     ));
 
+    crate::virtual_mods::load_preloads(execution_mode);
     crate::platform::logging::write_bootstrap_marker(&format!(
         "bootstrap.native_preload.premain.begin execution={execution_mode}"
     ));
@@ -398,6 +403,7 @@ unsafe fn bootstrap(
             "bootstrap.mods.load.begin execution={execution_mode} serial=true"
         ));
         crate::loader::load_mods(&game_dir);
+        crate::virtual_mods::schedule_ready();
         crate::platform::logging::write_bootstrap_marker(&format!(
             "bootstrap.mods.load.done execution={execution_mode} serial=true"
         ));
