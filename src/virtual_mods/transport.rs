@@ -209,6 +209,12 @@ fn connect_wine() -> Result<Option<AuthenticatedConnection>, String> {
     let result = authenticate_loopback(&mut stream, &document.session_id, &secret);
     secret.zeroize();
     result?;
+    // Deadlines apply to the authentication handshake only. A persistent
+    // Mod session is idle between asynchronous status and RPC messages.
+    stream.set_read_timeout(None)
+        .map_err(|_| "SESSION_CLOSED: restore persistent receive mode")?;
+    stream.set_write_timeout(None)
+        .map_err(|_| "SESSION_CLOSED: restore persistent send mode")?;
     Ok(Some(AuthenticatedConnection {
         stream: Connection::Loopback(stream),
         transport: "authenticated-loopback",
