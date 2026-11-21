@@ -33,6 +33,7 @@ pub struct Session {
     inflight: AtomicUsize,
     closed: AtomicBool,
     max_frame: usize,
+    last_plan_seq: u64,
     plugins_root: PathBuf,
     plan: Vec<ModuleSpec>,
     loaded: Mutex<HashMap<String, Arc<NativeModule>>>,
@@ -110,6 +111,7 @@ fn negotiate() -> Result<Option<(Arc<Session>, Connection)>, String> {
         inflight: AtomicUsize::new(0),
         closed: AtomicBool::new(false),
         max_frame: welcome.max_frame_bytes,
+        last_plan_seq: incoming,
         plugins_root: PathBuf::from(plan.plugins_root),
         plan: plan.modules,
         loaded: Mutex::new(HashMap::new()),
@@ -121,13 +123,11 @@ fn negotiate() -> Result<Option<(Arc<Session>, Connection)>, String> {
         accepted,
         rejected: Vec::new(),
     })?;
-    // Only a single read worker owns inbound seq numbers after the launch plan.
-    session.incoming_initial(incoming);
+    // The read worker starts after the exact accepted launch plan sequence.
     Ok(Some((session, reader)))
 }
 
 impl Session {
-    fn incoming_initial(&self, _seq: u64) {} // The plan is always seq=2 in v1.
 
     fn next_sequence(&self) -> String {
         protocol::sequence(self.next_seq.fetch_add(1, Ordering::AcqRel))
@@ -186,7 +186,7 @@ impl Session {
     }
 
     fn read_loop(self: Arc<Self>, mut reader: Connection) {
-        let mut incoming_seq = 2_u64;
+        let mut incoming_seq = self.last_plan_seq;
         loop {
             let frame = match protocol::read_frame(&mut reader, self.max_frame) {
                 Ok(frame) => frame,
