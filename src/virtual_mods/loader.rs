@@ -339,10 +339,10 @@ mod tests {
     use super::*;
     #[test]
     fn component_boundary_blocks_sibling_plugins() {
-        let root = Path::new(r"C:BMCBLpluginsplugin-a");
-        assert!(same_or_child(Path::new(r"C:BMCBLpluginsplugin-agame-modsexample.dll"), root));
-        assert!(!same_or_child(Path::new(r"C:BMCBLpluginsplugin-a-evilexample.dll"), root));
-        assert!(!same_or_child(Path::new(r"C:BMCBLpluginsplugin-bexample.dll"), root));
+        let root = Path::new(r"C:/BMCBL/plugins/plugin-a");
+        assert!(same_or_child(Path::new(r"C:/BMCBL/plugins/plugin-a/game-mods/example.dll"), root));
+        assert!(!same_or_child(Path::new(r"C:/BMCBL/plugins/plugin-a-evil/example.dll"), root));
+        assert!(!same_or_child(Path::new(r"C:/BMCBL/plugins/plugin-b/example.dll"), root));
     }
 
     #[test]
