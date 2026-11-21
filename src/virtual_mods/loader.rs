@@ -181,6 +181,7 @@ pub fn load(spec: &ModuleSpec, plugins_root: &Path, session: &Arc<Session>) -> R
                         .unwrap_or_else(|error| error.into_inner()).remove(&work.request) {
                         if let Some(session) = weak.upgrade() {
                             session.send_response(&id, &generation, work.request, None, Some("MODULE_UNAVAILABLE"));
+                            session.finish_inflight();
                         }
                     }
                 }
@@ -315,6 +316,7 @@ unsafe extern "C" fn native_reply(
     // SAFETY: the module promises its borrowed input is valid until this call returns.
     let body = if len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(bytes, len as usize) } };
     session.send_response(&context.module, &context.generation, request, Some(body), None);
+    session.finish_inflight();
     0
 }
 
