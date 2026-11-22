@@ -453,10 +453,11 @@ fn sanitize_file_component(value: &str) -> String {
 pub fn set_console_handle(handle: HANDLE) {
     let _ = CONSOLE_HANDLE.set(SendHandle(handle));
     CONSOLE_FORCE_ANSI.store(false, Ordering::Release);
-    enable_console_ansi(handle);
-    // A GetConsoleMode syscall for every formatted line was unnecessary.
-    // Refresh only when the host console sink is initialized.
-    CONSOLE_ANSI_ENABLED.store(query_console_ansi(handle), Ordering::Release);
+    // The host may be the legacy Windows Console Host, which cannot enable
+    // virtual terminal processing. Only the actual negotiated mode can
+    // authorize ANSI sequences; a console handle alone is not sufficient.
+    let ansi_enabled = enable_console_ansi(handle);
+    CONSOLE_ANSI_ENABLED.store(ansi_enabled, Ordering::Release);
     write_bootstrap_marker(&format!(
         "logging.console.ready handle=0x{:X} ansi={} banner_owner=console-branding",
         handle.0 as usize,
@@ -465,17 +466,23 @@ pub fn set_console_handle(handle: HANDLE) {
     flush_console_backlog();
 }
 
-/// Installs a non-console stream (for example a Windows Terminal named-pipe
-/// mirror) as the interactive output sink. ANSI is forced because GetConsoleMode
-/// is not defined for pipe handles.
+/// Installs an external output stream. On actual console handles the
+/// operating system negotiates VT support; a pipe has no GetConsoleMode and
+/// may use ANSI only if its creator explicitly negotiated that capability
+/// and passed ansi=true. The default remains plain text.
 pub fn set_console_stream_handle(handle: HANDLE, ansi: bool) {
     let _ = CONSOLE_HANDLE.set(SendHandle(handle));
-    CONSOLE_FORCE_ANSI.store(ansi, Ordering::Release);
-    CONSOLE_ANSI_ENABLED.store(ansi, Ordering::Release);
+    let actual_ansi = if query_console_mode(handle).is_some() {
+        enable_console_ansi(handle)
+    } else {
+        ansi
+    };
+    CONSOLE_FORCE_ANSI.store(actual_ansi, Ordering::Release);
+    CONSOLE_ANSI_ENABLED.store(actual_ansi, Ordering::Release);
     write_bootstrap_marker(&format!(
         "logging.console.stream.ready handle=0x{:X} ansi={} banner_owner=console-branding",
         handle.0 as usize,
-        ansi,
+        actual_ansi,
     ));
     flush_console_backlog();
 }
@@ -1923,35 +1930,41 @@ fn console_supports_ansi() -> bool {
         || CONSOLE_ANSI_ENABLED.load(Ordering::Acquire)
 }
 
-fn query_console_ansi(handle: HANDLE) -> bool {
+fn query_console_mode(handle: HANDLE) -> Option<CONSOLE_MODE> {
     if handle.is_invalid() {
-        return false;
+        return None;
     }
-    unsafe {
-        let mut mode = CONSOLE_MODE(0);
-        if GetConsoleMode(handle, &mut mode).is_ok() {
-            return (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING)
-                == ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-        }
-    }
-    false
+    let mut mode = CONSOLE_MODE(0);
+    unsafe { GetConsoleMode(handle, &mut mode) }.ok()?;
+    Some(mode)
 }
 
-fn enable_console_ansi(handle: HANDLE) {
-    if handle.is_invalid() {
-        return;
-    }
+fn vt_mode_enabled(mode: CONSOLE_MODE) -> bool {
+    (mode & (ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+        == (ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+}
 
-    unsafe {
-        let mut mode = CONSOLE_MODE(0);
-        if GetConsoleMode(handle, &mut mode).is_ok() {
-            let desired = mode
-                | ENABLE_PROCESSED_OUTPUT
-                | ENABLE_WRAP_AT_EOL_OUTPUT
-                | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-            let _ = SetConsoleMode(handle, desired);
-        }
+fn query_console_ansi(handle: HANDLE) -> bool {
+    query_console_mode(handle).is_some_and(vt_mode_enabled)
+}
+
+fn enable_console_ansi(handle: HANDLE) -> bool {
+    let Some(mode) = query_console_mode(handle) else {
+        return false;
+    };
+    if vt_mode_enabled(mode) {
+        return true;
     }
+    let desired = mode
+        | ENABLE_PROCESSED_OUTPUT
+        | ENABLE_WRAP_AT_EOL_OUTPUT
+        | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    // Windows 7/8 and some third-party console hosts reject this mode.
+    // Do not print literal escape codes when the request is unsupported.
+    if unsafe { SetConsoleMode(handle, desired) }.is_err() {
+        return false;
+    }
+    query_console_ansi(handle)
 }
 
 fn write_debug_string(line: &str) {
@@ -2100,5 +2113,20 @@ mod external_line_tests {
         assert_eq!(parsed.timestamp_full, "2026-10-30 20:25:10.932");
         assert_eq!(parsed.timestamp_clock, "20:25:10.932");
         assert_eq!(parsed.message, "test message");
+    }
+}
+
+#[cfg(test)]
+mod console_capability_tests {
+    use super::*;
+
+    #[test]
+    fn vt_requires_processed_output_and_virtual_terminal_support() {
+        assert!(!vt_mode_enabled(CONSOLE_MODE(0)));
+        assert!(!vt_mode_enabled(ENABLE_PROCESSED_OUTPUT));
+        assert!(!vt_mode_enabled(ENABLE_VIRTUAL_TERMINAL_PROCESSING));
+        assert!(vt_mode_enabled(
+            ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        ));
     }
 }

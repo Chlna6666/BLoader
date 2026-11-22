@@ -553,7 +553,10 @@ fn console_has_vt(handle: HANDLE) -> bool {
     unsafe {
         let mut mode = CONSOLE_MODE(0);
         GetConsoleMode(handle, &mut mode).is_ok()
-            && (mode.0 & ENABLE_VIRTUAL_TERMINAL_PROCESSING.0) != 0
+            // Legacy consoles must get plain banner output, not raw escape
+            // sequences. VT rendering also requires processed output.
+            && (mode.0 & (ENABLE_VIRTUAL_TERMINAL_PROCESSING.0 | ENABLE_PROCESSED_OUTPUT.0))
+                == (ENABLE_VIRTUAL_TERMINAL_PROCESSING.0 | ENABLE_PROCESSED_OUTPUT.0)
     }
 }
 

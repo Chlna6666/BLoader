@@ -41,3 +41,7 @@ Windows Terminal 设置、文件编码或原生 Mod 的输出行为。
 5. 运行 cargo test --locked，并在 Windows 上做 GDK/Windows Terminal 实机回归。
 
 注意：已有乱码文本如果已在上游被错误解码并替换字符，输出端无法复原丢失的信息。
+
+## ANSI/VT 彩色兼容
+
+真实控制台需要支持并成功启用 `ENABLE_VIRTUAL_TERMINAL_PROCESSING`，同时必须启用 `ENABLE_PROCESSED_OUTPUT` 才会输出颜色。旧版 Console Host 不支持这些模式时，BLoader 自动输出无 ESC 转义的纯文本（日志内容与 Unicode 编码保持不变）。外部管道无法使用 `GetConsoleMode` 探测，必须由创建该管道的宿主明确确认 ANSI 支持后才能启用；默认不假设支持。

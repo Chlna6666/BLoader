@@ -1,5 +1,8 @@
 ## Unreleased
 
+- 0.2.119：Win32 真实控制台仅在 ENABLE_PROCESSED_OUTPUT 和 ENABLE_VIRTUAL_TERMINAL_PROCESSING 实际就绪后输出 ANSI 色彩；旧版 Windows/不兼容 Console Host 自动回退纯文本日志和启动横幅。外部管道只有在调用方明确确认 ANSI 能力时输出颜色，不按 Windows 版本号猜测。
+- 此次仅调整控制台能力协商和颜色回退，不改变 UTF-16/UTF-8/传统代码页解码路径和原生 Mod 归因。
+
 - 0.2.118：修复非 UTF-8 Windows 控制台的中文/日文乱码。真实控制台的 BLoader 日志和启动横幅统一采用 WriteConsoleW (UTF-16)，Windows Terminal 管道仍传输原样 UTF-8，不更改 Minecraft/Mod 的全局控制台代码页。
 - 原生 WriteConsoleA、WriteConsoleW（含跨调用 UTF-16 代理项）、WriteFile、OutputDebugStringA、CRT fwrite/_write 和 stdout/stderr 捕获按生产者的控制台代码页或系统 ANSI 代码页解码；先拼接分片再解码，保留 UTF-8/GBK/Shift-JIS 等多字节字符完整性。支持 UTF-16 BOM 管道，并提供可选 BLOADER_LOG_CODE_PAGE 覆盖非标准原生代码页。
 - 更新编码测试与 docs/CONSOLE_ENCODING.md；无法仅凭无 BOM 字节可靠自动识别所有传统编码，未对来源不明的字节流作不可靠的编码猜测。
