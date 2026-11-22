@@ -9,7 +9,8 @@ Windows Terminal 非控制台管道保留 UTF-8，ANSI/VT 颜色序列按原样�
 | 来源 | 处理方式 |
 | --- | --- |
 | BLoader 日志、早期横幅 | 如果 GetConsoleMode 成功，使用 WriteConsoleW；否则使用 WriteFile UTF-8 |
-| Win32 WriteConsoleW | 已是 UTF-16，转换为 Rust Unicode，按完整逻辑行缓冲 |
+| Win32 WriteConsoleW | 已是 UTF-16，跨调用缓冲代理项，完整逻辑行转换为 Rust Unicode |
+| OutputDebugStringA/W | A 使用原生代码页解码；W 使用 UTF-16 |
 | Win32 WriteConsoleA、控制台 WriteFile | 完整 UTF-8 优先；否则按 GetConsoleOutputCP，依次回退系统 ANSI/OEM |
 | 第三方 CRT fwrite/_write、重定向字节流 | 完整 UTF-8 优先；否则按系统 ANSI；支持手动覆盖与回退 |
 | BLoader 捕获的匿名 stdout/stderr 管道 | 按行缓冲，不切断 UTF-8/DBCS 字符；识别 UTF-8 BOM、UTF-16 LE/BE BOM 及具有明确 NUL 模式的 BOM-less UTF-16 |

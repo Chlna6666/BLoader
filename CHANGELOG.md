@@ -1,7 +1,7 @@
 ## Unreleased
 
 - 0.2.118：修复非 UTF-8 Windows 控制台的中文/日文乱码。真实控制台的 BLoader 日志和启动横幅统一采用 WriteConsoleW (UTF-16)，Windows Terminal 管道仍传输原样 UTF-8，不更改 Minecraft/Mod 的全局控制台代码页。
-- 原生 WriteConsoleA、WriteFile、CRT fwrite/_write 和 stdout/stderr 捕获按生产者的控制台代码页或系统 ANSI 代码页解码；先拼接分片再解码，保留 UTF-8/GBK/Shift-JIS 等多字节字符完整性。支持 UTF-16 BOM 管道，并提供可选 BLOADER_LOG_CODE_PAGE 覆盖非标准原生代码页。
+- 原生 WriteConsoleA、WriteConsoleW（含跨调用 UTF-16 代理项）、WriteFile、OutputDebugStringA、CRT fwrite/_write 和 stdout/stderr 捕获按生产者的控制台代码页或系统 ANSI 代码页解码；先拼接分片再解码，保留 UTF-8/GBK/Shift-JIS 等多字节字符完整性。支持 UTF-16 BOM 管道，并提供可选 BLOADER_LOG_CODE_PAGE 覆盖非标准原生代码页。
 - 更新编码测试与 docs/CONSOLE_ENCODING.md；无法仅凭无 BOM 字节可靠自动识别所有传统编码，未对来源不明的字节流作不可靠的编码猜测。
 
 - 修复社区披风无法点击：完全移除包导航卡片、合成子页面及相关 WinHTTP 路由；所有远端披风作为普通可装备商品统一注入一个社区分区，沿用本地披风 GridList 布局、作者/品质和 Persona 流程。

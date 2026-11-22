@@ -17,6 +17,7 @@ pub enum ByteSource {
 enum StreamFormat {
     Undecided,
     Bytes,
+    Utf8,
     Utf16Le,
     Utf16Be,
 }
@@ -94,7 +95,18 @@ pub fn decode_bytes(bytes: &[u8], source: ByteSource) -> String {
             return decoded;
         }
     }
-    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    if let Some(payload) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8_lossy(payload).into_owned();
+    }
+    // An explicit source code page takes precedence over UTF-8 auto-detection;
+    // some legacy byte sequences also happen to be valid UTF-8.
+    if source == ByteSource::Native {
+        if let Some(page) = explicit_native_code_page() {
+            if let Some(decoded) = decode_code_page(bytes, page) {
+                return decoded;
+            }
+        }
+    }
     if let Ok(utf8) = std::str::from_utf8(bytes) {
         return utf8.to_string();
     }
@@ -143,7 +155,7 @@ impl TextLineBuffer {
             self.format = StreamFormat::Utf16Be;
             self.pending.drain(..2);
         } else if self.pending.starts_with(&[0xEF, 0xBB, 0xBF]) {
-            self.format = StreamFormat::Bytes;
+            self.format = StreamFormat::Utf8;
             self.pending.drain(..3);
         } else {
             // A BOM-less UTF-16 stream with mostly ASCII characters has
@@ -153,9 +165,13 @@ impl TextLineBuffer {
             let pairs = sample.len() / 2;
             let even_zero = sample.iter().step_by(2).filter(|byte| **byte == 0).count();
             let odd_zero = sample.iter().skip(1).step_by(2).filter(|byte| **byte == 0).count();
-            self.format = if pairs >= 4 && odd_zero * 4 >= pairs * 3 && even_zero == 0 {
+            let likely_le = (pairs >= 2 && odd_zero == pairs && even_zero == 0)
+                || (pairs >= 4 && odd_zero * 4 >= pairs * 3 && even_zero == 0);
+            let likely_be = (pairs >= 2 && even_zero == pairs && odd_zero == 0)
+                || (pairs >= 4 && even_zero * 4 >= pairs * 3 && odd_zero == 0);
+            self.format = if likely_le {
                 StreamFormat::Utf16Le
-            } else if pairs >= 4 && even_zero * 4 >= pairs * 3 && odd_zero == 0 {
+            } else if likely_be {
                 StreamFormat::Utf16Be
             } else {
                 StreamFormat::Bytes
@@ -169,6 +185,7 @@ impl TextLineBuffer {
                 .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
             StreamFormat::Utf16Be => decode_utf16(bytes, false)
                 .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
+            StreamFormat::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
             StreamFormat::Undecided | StreamFormat::Bytes => decode_bytes(bytes, self.source),
         };
         text.trim_end_matches(|ch| ch == '\r' || ch == '\n')
@@ -196,7 +213,7 @@ impl TextLineBuffer {
                         (character == 10).then_some((index + 1) * 2)
                     })
                 }
-                StreamFormat::Bytes => self.pending.iter().position(|byte| *byte == b'\n')
+                StreamFormat::Bytes | StreamFormat::Utf8 => self.pending.iter().position(|byte| *byte == b'\n')
                     .map(|index| index + 1),
                 StreamFormat::Undecided => None,
             };
@@ -226,6 +243,7 @@ mod tests {
     #[test]
     fn utf8_and_utf16_bom_round_trip() {
         assert_eq!(decode_bytes("中文日本語".as_bytes(), ByteSource::Native), "中文日本語");
+        assert_eq!(decode_bytes(&[0xEF, 0xBB, 0xBF, 0xE4, 0xB8, 0xAD], ByteSource::Native), "中");
         assert_eq!(decode_bytes(&[0xFF, 0xFE, 0x2D, 0x4E, 0x87, 0x65], ByteSource::Native), "中文");
         assert_eq!(decode_bytes(&[0xFE, 0xFF, 0x4E, 0x2D, 0x65, 0x87], ByteSource::Native), "中文");
     }

@@ -35,6 +35,7 @@ struct PendingConsoleLine {
 
 enum ConsoleFragment {
     Unicode(String),
+    Utf16(Vec<u16>),
     Encoded(Vec<u8>, ByteSource),
 }
 static ATTEMPTED: AtomicBool = AtomicBool::new(false);
@@ -489,6 +490,7 @@ fn caller_scope() -> Option<String> {
 fn append_fragment(pending: &mut PendingConsoleLine, fragment: ConsoleFragment) {
     let length = match &fragment {
         ConsoleFragment::Unicode(text) => text.len(),
+        ConsoleFragment::Utf16(wide) => wide.len().saturating_mul(2),
         ConsoleFragment::Encoded(bytes, _) => bytes.len(),
     };
     pending.length += length;
@@ -496,6 +498,12 @@ fn append_fragment(pending: &mut PendingConsoleLine, fragment: ConsoleFragment) 
         ConsoleFragment::Unicode(text) => {
             if let Some(ConsoleFragment::Unicode(previous)) = pending.fragments.last_mut() {
                 previous.push_str(text);
+                return;
+            }
+        }
+        ConsoleFragment::Utf16(wide) => {
+            if let Some(ConsoleFragment::Utf16(previous)) = pending.fragments.last_mut() {
+                previous.extend_from_slice(wide);
                 return;
             }
         }
@@ -516,6 +524,7 @@ fn render_fragments(fragments: &[ConsoleFragment]) -> String {
     for fragment in fragments {
         match fragment {
             ConsoleFragment::Unicode(value) => text.push_str(value),
+            ConsoleFragment::Utf16(wide) => text.push_str(&String::from_utf16_lossy(wide)),
             ConsoleFragment::Encoded(bytes, source) => {
                 text.push_str(&text_encoding::decode_bytes(bytes, *source));
             }
@@ -538,6 +547,7 @@ fn emit_completed_line(pending: &mut PendingConsoleLine) {
 #[derive(Clone, Copy)]
 enum IncomingFragment<'a> {
     Unicode(&'a str),
+    Utf16(&'a [u16]),
     Encoded(&'a [u8], ByteSource),
 }
 
@@ -547,8 +557,10 @@ fn capture_fragment(
 ) -> bool {
     match fragment {
         IncomingFragment::Unicode(text) if text.contains('\0') => return false,
+        IncomingFragment::Utf16(wide) if wide.contains(&0) => return false,
         IncomingFragment::Encoded(bytes, _) if bytes.contains(&0) => return false,
         IncomingFragment::Unicode(text) if text.is_empty() => return true,
+        IncomingFragment::Utf16(wide) if wide.is_empty() => return true,
         IncomingFragment::Encoded(bytes, _) if bytes.is_empty() => return true,
         _ => {}
     }
@@ -576,6 +588,18 @@ fn capture_fragment(
             IncomingFragment::Unicode(text) => {
                 for part in text.split_inclusive('\n') {
                     push_part(ConsoleFragment::Unicode(part.to_string()), part.ends_with('\n'));
+                }
+            }
+            IncomingFragment::Utf16(wide) => {
+                let mut start = 0usize;
+                for (index, code_unit) in wide.iter().enumerate() {
+                    if *code_unit == 10 {
+                        push_part(ConsoleFragment::Utf16(wide[start..=index].to_vec()), true);
+                        start = index + 1;
+                    }
+                }
+                if start < wide.len() {
+                    push_part(ConsoleFragment::Utf16(wide[start..].to_vec()), false);
                 }
             }
             IncomingFragment::Encoded(bytes, source) => {
@@ -619,6 +643,14 @@ fn capture_bytes(
     capture_fragment(IncomingFragment::Encoded(bytes, source), resolve_scope)
 }
 
+fn capture_wide(
+    _handle: *mut c_void,
+    wide: &[u16],
+    resolve_scope: impl FnOnce() -> Option<String>,
+) -> bool {
+    capture_fragment(IncomingFragment::Utf16(wide), resolve_scope)
+}
+
 /// Clears the per-thread detour marker when the outermost detour returns.
 struct DetourGuard;
 
@@ -636,13 +668,10 @@ unsafe extern "system" fn intercept_w(h: *mut c_void, data: *const c_void, len: 
     IN_DETOUR.with(|cell| cell.set(true));
     let _guard = DetourGuard;
     if !data.is_null() && len > 0 && (len as usize) <= MAX_WRITE && eligible(h) {
-        let text = {
-            let slice = unsafe { std::slice::from_raw_parts(data as *const u16, len as usize) };
-            String::from_utf16_lossy(slice)
-        };
-        // Attribution must be captured here, not inside the closure: the
-        // backtrace walk skips exactly two frames (helper + detour).
-        if std::panic::catch_unwind(|| capture(h, &text, caller_scope)).unwrap_or(false) {
+        let wide = unsafe { std::slice::from_raw_parts(data as *const u16, len as usize) };
+        // Retain UTF-16 code units across writes: a surrogate pair can be
+        // divided between two native WriteConsoleW calls.
+        if std::panic::catch_unwind(|| capture_wide(h, wide, caller_scope)).unwrap_or(false) {
             if !count.is_null() { unsafe { *count = len }; }
             return 1;
         }
@@ -789,6 +818,14 @@ mod tests {
         append_fragment(&mut pending, ConsoleFragment::Encoded(vec![0xE4, 0xB8], ByteSource::Native));
         append_fragment(&mut pending, ConsoleFragment::Encoded(vec![0xAD, b'\n'], ByteSource::Native));
         assert_eq!(render_fragments(&pending.fragments), "[Mod] 中\n");
+    }
+
+    #[test]
+    fn surrogate_pair_split_between_native_writes_is_preserved() {
+        let mut pending = PendingConsoleLine::default();
+        append_fragment(&mut pending, ConsoleFragment::Utf16(vec![0xD83D]));
+        append_fragment(&mut pending, ConsoleFragment::Utf16(vec![0xDE80, 10]));
+        assert_eq!(render_fragments(&pending.fragments), "🚀\n");
     }
 
     #[test]
