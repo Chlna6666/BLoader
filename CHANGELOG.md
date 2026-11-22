@@ -1,5 +1,9 @@
 ## Unreleased
 
+- 0.2.118：修复非 UTF-8 Windows 控制台的中文/日文乱码。真实控制台的 BLoader 日志和启动横幅统一采用 WriteConsoleW (UTF-16)，Windows Terminal 管道仍传输原样 UTF-8，不更改 Minecraft/Mod 的全局控制台代码页。
+- 原生 WriteConsoleA、WriteFile、CRT fwrite/_write 和 stdout/stderr 捕获按生产者的控制台代码页或系统 ANSI 代码页解码；先拼接分片再解码，保留 UTF-8/GBK/Shift-JIS 等多字节字符完整性。支持 UTF-16 BOM 管道，并提供可选 BLOADER_LOG_CODE_PAGE 覆盖非标准原生代码页。
+- 更新编码测试与 docs/CONSOLE_ENCODING.md；无法仅凭无 BOM 字节可靠自动识别所有传统编码，未对来源不明的字节流作不可靠的编码猜测。
+
 - 修复社区披风无法点击：完全移除包导航卡片、合成子页面及相关 WinHTTP 路由；所有远端披风作为普通可装备商品统一注入一个社区分区，沿用本地披风 GridList 布局、作者/品质和 Persona 流程。
 - 启动时优先同步预加载已缓存的社区披风（在 WinHTTP Hook 安装前完成内存商品/资源注册），后台并发更新 CDN 不阻塞游戏启动；保留 pack_icon.png 包级资源解析但不再用作导航商品。版本升至 0.2.115。
 - 补齐披风包根级可选 `pack_icon.png`（正方形 PNG 校验，缺省回退首件披风缩略图）及清单文档；重构社区披风为单一横向包卡片列表 + 按包进入的原生样式子页面，避免一个包只含少量披风时产生大量垂直分区。补充格式与布局测试，版本升至 0.2.114。

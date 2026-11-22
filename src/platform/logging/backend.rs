@@ -32,6 +32,11 @@ use crate::platform::{file_io_policy, i18n};
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn OutputDebugStringW(output: *const u16);
+    #[link_name = "WriteConsoleW"]
+    fn write_console_w_raw(
+        handle: HANDLE, text: *const u16, chars: u32,
+        written: *mut u32, reserved: *mut core::ffi::c_void,
+    ) -> i32;
 }
 
 const CONSOLE_BACKLOG_LIMIT: usize = 4096;
@@ -1872,13 +1877,39 @@ fn write_bytes_to_console_locked(bytes: &[u8]) {
     }
 
     crate::platform::console_capture::with_passthrough(|| {
-        let mut offset = 0usize;
-        while offset < bytes.len() {
-            unsafe {
+        let mut console_mode = CONSOLE_MODE(0);
+        if unsafe { GetConsoleMode(handle, &mut console_mode) }.is_ok() {
+            // A real console accepts UTF-16 regardless of its active OEM/ANSI
+            // code page. Changing the process code page would break native Mods.
+            let text = String::from_utf8_lossy(bytes);
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            let mut offset = 0;
+            while offset < wide.len() {
+                // Keep Win32 console writes small and never split a surrogate pair.
+                let mut end = (offset + 8192).min(wide.len());
+                if end < wide.len() && (0xD800..=0xDBFF).contains(&wide[end - 1]) {
+                    end -= 1;
+                }
+                let mut written = 0u32;
+                if unsafe {
+                    write_console_w_raw(
+                        handle, wide[offset..end].as_ptr(), (end - offset) as u32,
+                        &mut written, std::ptr::null_mut(),
+                    )
+                } == 0 || written == 0 {
+                    break;
+                }
+                offset += written as usize;
+            }
+        } else {
+            // Windows Terminal bridge / redirected pipes consume UTF-8 bytes.
+            // Never send UTF-16 to non-console handles.
+            let mut offset = 0usize;
+            while offset < bytes.len() {
                 let mut written = 0;
-                if WriteFile(handle, Some(&bytes[offset..]), Some(&mut written), None).is_err()
-                    || written == 0
-                {
+                if unsafe {
+                    WriteFile(handle, Some(&bytes[offset..]), Some(&mut written), None)
+                }.is_err() || written == 0 {
                     break;
                 }
                 offset += written as usize;

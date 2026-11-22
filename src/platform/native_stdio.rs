@@ -14,7 +14,7 @@ use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId};
 use windows::core::{PCSTR, PCWSTR};
 
-use crate::platform::{logging, mod_diagnostics};
+use crate::platform::{logging, mod_diagnostics, text_encoding::{ByteSource, TextLineBuffer}};
 use mod_diagnostics::ModIdentity;
 
 const O_TEXT: i32 = 0x4000;
@@ -201,58 +201,36 @@ fn spawn_pipe_reader(mut file: File, identity: Option<ModIdentity>, stream: &'st
     let _ = thread::Builder::new()
         .name(format!("bloader-stdio-pipe-{stream}"))
         .spawn(move || {
-            let mut pending = Vec::<u8>::new();
+            let mut decoder = TextLineBuffer::new(ByteSource::Native);
             let mut buffer = [0u8; 8192];
             loop {
                 match file.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(read) => {
-                        pending.extend_from_slice(&buffer[..read]);
-                        drain_lines(&mut pending, identity.clone(), stream);
-                        if pending.len() > 64 * 1024 {
-                            let line = String::from_utf8_lossy(&pending)
-                                .trim_matches(char::from(0))
-                                .trim()
-                                .to_string();
-                            if !line.is_empty() {
+                        for line in decoder.push(&buffer[..read]) {
+                            if !line.trim().is_empty() {
                                 queue_or_emit(identity.clone(), stream, &line);
                             }
-                            pending.clear();
+                        }
+                        // Bound untrusted Mod output without cutting a
+                        // multi-byte character at an arbitrary read boundary.
+                        if decoder.buffered_len() > 64 * 1024 {
+                            if let Some(line) = decoder.finish() {
+                                if !line.trim().is_empty() {
+                                    queue_or_emit(identity.clone(), stream, &line);
+                                }
+                            }
                         }
                     }
                     Err(_) => break,
                 }
             }
-            if !pending.is_empty() {
-                let line = String::from_utf8_lossy(&pending)
-                    .trim_matches(char::from(0))
-                    .trim()
-                    .to_string();
-                if !line.is_empty() {
+            if let Some(line) = decoder.finish() {
+                if !line.trim().is_empty() {
                     queue_or_emit(identity, stream, &line);
                 }
             }
         });
-}
-
-fn drain_lines(pending: &mut Vec<u8>, identity: Option<ModIdentity>, stream: &str) {
-    let mut consumed = 0usize;
-    for (index, value) in pending.iter().enumerate() {
-        if *value != b'\n' {
-            continue;
-        }
-        let line = String::from_utf8_lossy(&pending[consumed..index])
-            .trim_end_matches('\r')
-            .trim_matches(char::from(0))
-            .to_string();
-        if !line.trim().is_empty() {
-            queue_or_emit(identity.clone(), stream, &line);
-        }
-        consumed = index + 1;
-    }
-    if consumed > 0 {
-        pending.drain(..consumed);
-    }
 }
 
 fn queue_or_emit(identity: Option<ModIdentity>, stream: &str, line: &str) {

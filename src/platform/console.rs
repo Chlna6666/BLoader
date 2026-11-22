@@ -45,6 +45,11 @@ unsafe extern "system" {
     fn set_console_screen_buffer_size_raw(handle: *mut core::ffi::c_void, size: RawCoord) -> i32;
     #[link_name = "AttachConsole"]
     fn attach_console_raw(process_id: u32) -> i32;
+    #[link_name = "WriteConsoleW"]
+    fn write_console_w_raw(
+        handle: HANDLE, text: *const u16, chars: u32,
+        written: *mut u32, reserved: *mut core::ffi::c_void,
+    ) -> i32;
 }
 
 /// Lightweight pre-main probe. It only reads the existing JSON and never
@@ -555,6 +560,31 @@ fn console_has_vt(handle: HANDLE) -> bool {
 fn write_all_handle(handle: HANDLE, mut bytes: &[u8]) -> bool {
     if handle.is_invalid() {
         return false;
+    }
+    let mut mode = CONSOLE_MODE(0);
+    if unsafe { GetConsoleMode(handle, &mut mode) }.is_ok() {
+        // The early banner is also UTF-8 text; it runs before the regular
+        // logging sink is attached and must not depend on the console code page.
+        let text = String::from_utf8_lossy(bytes);
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let mut offset = 0;
+        while offset < wide.len() {
+            let mut end = (offset + 8192).min(wide.len());
+            if end < wide.len() && (0xD800..=0xDBFF).contains(&wide[end - 1]) {
+                end -= 1;
+            }
+            let mut written = 0u32;
+            if unsafe {
+                write_console_w_raw(
+                    handle, wide[offset..end].as_ptr(), (end - offset) as u32,
+                    &mut written, std::ptr::null_mut(),
+                )
+            } == 0 || written == 0 {
+                return false;
+            }
+            offset += written as usize;
+        }
+        return true;
     }
     while !bytes.is_empty() {
         let mut written = 0u32;

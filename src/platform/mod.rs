@@ -11,4 +11,5 @@ pub mod mod_diagnostics;
 pub mod native_stdio;
 pub mod runtime_environment;
 pub mod startup_diagnostics;
+pub mod text_encoding;
 pub mod utils;

@@ -18,7 +18,7 @@ use minhook::MinHook;
 use windows::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::core::{PCSTR, w};
-use crate::platform::logging;
+use crate::platform::{logging, text_encoding::{self, ByteSource}};
 
 const MAX_WRITE: usize = 64 * 1024;
 const MAX_FRAGMENT_BUFFER: usize = 128 * 1024;
@@ -27,11 +27,16 @@ const MAX_FRAGMENT_BUFFER: usize = 128 * 1024;
 /// multiple WriteConsole calls. Keep the fragments until the newline arrives.
 #[derive(Default)]
 struct PendingConsoleLine {
-    text: String,
+    fragments: Vec<ConsoleFragment>,
+    length: usize,
     scope: Option<String>,
     scope_checked: bool,
 }
-const CP_ACP: u32 = 0;
+
+enum ConsoleFragment {
+    Unicode(String),
+    Encoded(Vec<u8>, ByteSource),
+}
 static ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
 static OBSERVED_FRAGMENTS: AtomicU64 = AtomicU64::new(0);
@@ -70,14 +75,6 @@ thread_local! {
 unsafe extern "system" {
     fn GetConsoleMode(handle: *mut c_void, mode: *mut u32) -> i32;
     fn GetFileType(handle: *mut c_void) -> u32;
-    fn MultiByteToWideChar(
-        code_page: u32,
-        flags: u32,
-        input: *const u8,
-        input_len: i32,
-        output: *mut u16,
-        output_len: i32,
-    ) -> i32;
 }
 type WriteFn = unsafe extern "system" fn(*mut c_void, *const c_void, u32, *mut u32, *mut c_void) -> i32;
 type FwriteFn = unsafe extern "C" fn(*const c_void, usize, usize, *mut c_void) -> usize;
@@ -277,8 +274,7 @@ unsafe fn observe_crt_write(
         let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, written as usize) };
         if !bytes.contains(&0) {
             let _ = std::panic::catch_unwind(|| {
-                let decoded = decode_ansi(bytes);
-                capture(std::ptr::null_mut(), &decoded, caller_scope);
+                capture_bytes(std::ptr::null_mut(), bytes, ByteSource::Native, caller_scope);
             });
         }
     }
@@ -361,8 +357,7 @@ unsafe extern "C" fn intercept_crt_fwrite(
             // No attempt is made to parse binary output or arbitrary FILE*.
             if !bytes.contains(&0) {
                 let _ = std::panic::catch_unwind(|| {
-                    let decoded = decode_ansi(bytes);
-                    let _ = capture(std::ptr::null_mut(), &decoded, caller_scope);
+                    let _ = capture_bytes(std::ptr::null_mut(), bytes, ByteSource::Native, caller_scope);
                 });
             }
         }
@@ -488,82 +483,140 @@ fn caller_scope() -> Option<String> {
     logging::scope_for_frames(&addresses)
 }
 
-/// ANSI console writes are not necessarily UTF-8; decode with the system code
-/// page so native loaders printing localized text do not turn into mojibake.
-fn decode_ansi(bytes: &[u8]) -> String {
-    if let Ok(text) = std::str::from_utf8(bytes) {
-        return text.to_string();
+/// Native callers may split UTF-8, GBK, or Shift-JIS characters between
+/// WriteConsoleA/WriteFile/fwrite calls. Retain encoded bytes until a complete
+/// logical line is available, rather than decoding each fragment separately.
+fn append_fragment(pending: &mut PendingConsoleLine, fragment: ConsoleFragment) {
+    let length = match &fragment {
+        ConsoleFragment::Unicode(text) => text.len(),
+        ConsoleFragment::Encoded(bytes, _) => bytes.len(),
+    };
+    pending.length += length;
+    match &fragment {
+        ConsoleFragment::Unicode(text) => {
+            if let Some(ConsoleFragment::Unicode(previous)) = pending.fragments.last_mut() {
+                previous.push_str(text);
+                return;
+            }
+        }
+        ConsoleFragment::Encoded(bytes, source) => {
+            if let Some(ConsoleFragment::Encoded(previous, existing)) = pending.fragments.last_mut() {
+                if existing == source {
+                    previous.extend_from_slice(bytes);
+                    return;
+                }
+            }
+        }
     }
-    unsafe {
-        let needed = MultiByteToWideChar(
-            CP_ACP,
-            0,
-            bytes.as_ptr(),
-            bytes.len() as i32,
-            std::ptr::null_mut(),
-            0,
-        );
-        if needed <= 0 {
-            return String::from_utf8_lossy(bytes).to_string();
+    pending.fragments.push(fragment);
+}
+
+fn render_fragments(fragments: &[ConsoleFragment]) -> String {
+    let mut text = String::new();
+    for fragment in fragments {
+        match fragment {
+            ConsoleFragment::Unicode(value) => text.push_str(value),
+            ConsoleFragment::Encoded(bytes, source) => {
+                text.push_str(&text_encoding::decode_bytes(bytes, *source));
+            }
         }
-        let mut buffer = vec![0u16; needed as usize];
-        let written = MultiByteToWideChar(
-            CP_ACP,
-            0,
-            bytes.as_ptr(),
-            bytes.len() as i32,
-            buffer.as_mut_ptr(),
-            needed,
-        );
-        if written <= 0 {
-            return String::from_utf8_lossy(bytes).to_string();
-        }
-        String::from_utf16_lossy(&buffer[..written as usize])
+    }
+    text
+}
+
+fn emit_completed_line(pending: &mut PendingConsoleLine) {
+    let fragments = std::mem::take(&mut pending.fragments);
+    pending.length = 0;
+    let text = render_fragments(&fragments);
+    let line = text.trim_end_matches('\n').trim_end_matches('\r');
+    if !line.is_empty() {
+        OBSERVED_LINES.fetch_add(1, Ordering::Relaxed);
+        logging::captured_console_output_from(pending.scope.as_deref(), line);
     }
 }
 
-fn capture(_handle: *mut c_void, s: &str, resolve_scope: impl FnOnce() -> Option<String>) -> bool {
-    if s.contains('\0') {
-        return false;
-    }
-    if s.is_empty() {
-        return true;
+#[derive(Clone, Copy)]
+enum IncomingFragment<'a> {
+    Unicode(&'a str),
+    Encoded(&'a [u8], ByteSource),
+}
+
+fn capture_fragment(
+    fragment: IncomingFragment<'_>,
+    resolve_scope: impl FnOnce() -> Option<String>,
+) -> bool {
+    match fragment {
+        IncomingFragment::Unicode(text) if text.contains('\0') => return false,
+        IncomingFragment::Encoded(bytes, _) if bytes.contains(&0) => return false,
+        IncomingFragment::Unicode(text) if text.is_empty() => return true,
+        IncomingFragment::Encoded(bytes, _) if bytes.is_empty() => return true,
+        _ => {}
     }
     OBSERVED_FRAGMENTS.fetch_add(1, Ordering::Relaxed);
     PENDING_CONSOLE_LINE.with(|cell| {
         let mut pending = cell.borrow_mut();
-        // A single colourful log line may use dozens of WriteConsole calls.
-        // Stack walking and module attribution are only needed for its first
-        // fragment, not for every subsequent ANSI/text write.
         if !pending.scope_checked {
             pending.scope = resolve_scope();
             pending.scope_checked = true;
         }
-        pending.text.push_str(s);
-
-        // Never let a logger that does not terminate a line grow memory forever.
-        if pending.text.len() > MAX_FRAGMENT_BUFFER {
-            pending.text.clear();
-            pending.scope = None;
-            pending.scope_checked = false;
-            return;
-        }
-
-        while let Some(end) = pending.text.find('\n') {
-            let line = pending.text[..end].trim_end_matches('\r').to_string();
-            pending.text.drain(..=end);
-            let attribution = pending.scope.clone();
-            if pending.text.is_empty() {
+        let mut push_part = |part: ConsoleFragment, line_end: bool| {
+            append_fragment(&mut pending, part);
+            if pending.length > MAX_FRAGMENT_BUFFER {
+                pending.fragments.clear();
+                pending.length = 0;
                 pending.scope = None;
                 pending.scope_checked = false;
+                return;
             }
-            if !line.is_empty() {
-                OBSERVED_LINES.fetch_add(1, Ordering::Relaxed);
-                logging::captured_console_output_from(attribution.as_deref(), &line);
+            if line_end {
+                emit_completed_line(&mut pending);
             }
+        };
+        match fragment {
+            IncomingFragment::Unicode(text) => {
+                for part in text.split_inclusive('\n') {
+                    push_part(ConsoleFragment::Unicode(part.to_string()), part.ends_with('\n'));
+                }
+            }
+            IncomingFragment::Encoded(bytes, source) => {
+                let mut start = 0usize;
+                for (index, byte) in bytes.iter().enumerate() {
+                    if *byte == b'\n' {
+                        push_part(
+                            ConsoleFragment::Encoded(bytes[start..=index].to_vec(), source),
+                            true,
+                        );
+                        start = index + 1;
+                    }
+                }
+                if start < bytes.len() {
+                    push_part(ConsoleFragment::Encoded(bytes[start..].to_vec(), source), false);
+                }
+            }
+        }
+        if pending.fragments.is_empty() {
+            pending.scope = None;
+            pending.scope_checked = false;
         }
     });
     true
+}
+
+fn capture(
+    _handle: *mut c_void,
+    text: &str,
+    resolve_scope: impl FnOnce() -> Option<String>,
+) -> bool {
+    capture_fragment(IncomingFragment::Unicode(text), resolve_scope)
+}
+
+fn capture_bytes(
+    _handle: *mut c_void,
+    bytes: &[u8],
+    source: ByteSource,
+    resolve_scope: impl FnOnce() -> Option<String>,
+) -> bool {
+    capture_fragment(IncomingFragment::Encoded(bytes, source), resolve_scope)
 }
 
 /// Clears the per-thread detour marker when the outermost detour returns.
@@ -605,11 +658,10 @@ unsafe extern "system" fn intercept_a(h: *mut c_void, data: *const c_void, len: 
     IN_DETOUR.with(|cell| cell.set(true));
     let _guard = DetourGuard;
     if !data.is_null() && len > 0 && (len as usize) <= MAX_WRITE && eligible(h) {
-        let text = {
-            let slice = unsafe { std::slice::from_raw_parts(data as *const u8, len as usize) };
-            decode_ansi(slice)
-        };
-        if std::panic::catch_unwind(|| capture(h, &text, caller_scope)).unwrap_or(false) {
+        let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, len as usize) };
+        if std::panic::catch_unwind(|| {
+            capture_bytes(h, bytes, ByteSource::Console, caller_scope)
+        }).unwrap_or(false) {
             if !count.is_null() { unsafe { *count = len }; }
             return 1;
         }
@@ -644,8 +696,9 @@ unsafe extern "system" fn intercept_file(h: *mut c_void, data: *const c_void, le
         return unsafe { call_original(&ORIGINAL_FILE, h, data, len, count, overlapped) };
     }
     if is_console {
-        let decoded = decode_ansi(bytes);
-        if std::panic::catch_unwind(|| capture(h, &decoded, caller_scope)).unwrap_or(false) {
+        if std::panic::catch_unwind(|| {
+            capture_bytes(h, bytes, ByteSource::Console, caller_scope)
+        }).unwrap_or(false) {
             if !count.is_null() { unsafe { *count = len }; }
             return 1;
         }
@@ -661,8 +714,7 @@ unsafe extern "system" fn intercept_file(h: *mut c_void, data: *const c_void, le
         if written > 0 {
             let output = &bytes[..written as usize];
             let _ = std::panic::catch_unwind(|| {
-                let decoded = decode_ansi(output);
-                capture(h, &decoded, caller_scope);
+                capture_bytes(h, output, ByteSource::Native, caller_scope);
             });
         }
     }
@@ -731,11 +783,18 @@ mod tests {
     }
 
     #[test]
-    fn ansi_decoding_keeps_utf8_and_never_panics_on_invalid_bytes() {
-        // Valid UTF-8 round-trips unchanged; non-UTF-8 bytes fall back to the
-        // system code page instead of panicking.
-        assert_eq!(decode_ansi("版本".as_bytes()), "版本");
-        let decoded = decode_ansi(&[0xB0, 0xE6, 0xB1, 0xBE]);
+    fn native_byte_fragments_are_combined_before_decoding() {
+        let mut pending = PendingConsoleLine::default();
+        append_fragment(&mut pending, ConsoleFragment::Unicode("[Mod] ".into()));
+        append_fragment(&mut pending, ConsoleFragment::Encoded(vec![0xE4, 0xB8], ByteSource::Native));
+        append_fragment(&mut pending, ConsoleFragment::Encoded(vec![0xAD, b'\n'], ByteSource::Native));
+        assert_eq!(render_fragments(&pending.fragments), "[Mod] 中\n");
+    }
+
+    #[test]
+    fn utf8_and_legacy_decoding_remain_available() {
+        assert_eq!(text_encoding::decode_bytes("版本".as_bytes(), ByteSource::Native), "版本");
+        let decoded = text_encoding::decode_bytes(&[0xB0, 0xE6, 0xB1, 0xBE], ByteSource::Native);
         assert!(!decoded.is_empty());
     }
 }
