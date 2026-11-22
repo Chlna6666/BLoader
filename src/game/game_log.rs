@@ -17,7 +17,7 @@ use windows::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::core::{s, w};
 
-use crate::platform::logging;
+use crate::platform::{logging, text_encoding::{self, ByteSource}};
 
 static ORIGINAL_A: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_W: AtomicUsize = AtomicUsize::new(0);
@@ -82,8 +82,11 @@ unsafe extern "system" fn detour_output_debug_string_a(text: *const u8) {
     if let Some(scope) = scope {
         if !INSIDE.with(|cell| cell.replace(true)) {
             if !text.is_null() {
-                let message = unsafe { std::ffi::CStr::from_ptr(text as *const i8) }
-                    .to_string_lossy()
+                // OutputDebugStringA carries native ANSI bytes rather than
+                // guaranteed UTF-8. Decode only after locating the C-string
+                // boundary so a legacy code page cannot become U+FFFD.
+                let bytes = unsafe { std::ffi::CStr::from_ptr(text as *const i8) }.to_bytes();
+                let message = text_encoding::decode_bytes(bytes, ByteSource::Native)
                     .trim_end()
                     .to_string();
                 if !message.trim().is_empty() {
